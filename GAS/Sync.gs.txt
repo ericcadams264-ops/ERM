@@ -1,0 +1,335 @@
+/**
+ * ERM FISIOTA BACKEND - V5.0 (MODULAR)
+ * FILE: 2_Sync.gs
+ * Deskrpsi: Fungsi Helper untuk sinkronisasi data (Read/Write Sheet).
+ */
+
+var TARGET_SHEET_ID = ""; // Global variable for dynamic targeting
+
+function getSpreadsheet() {
+    if (TARGET_SHEET_ID) {
+        try {
+            return SpreadsheetApp.openById(TARGET_SHEET_ID);
+        } catch (e) {
+            console.error("Failed to open target sheet: " + TARGET_SHEET_ID);
+            throw new Error("Gagal membuka Sheet Klien. Pastikan Sheet sudah DISHARE ke email script ini.");
+        }
+    }
+    return SHEET_ID ? SpreadsheetApp.openById(SHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+function getOrInsertSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+        sheet = ss.insertSheet(name);
+        sheet.appendRow(headers);
+        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#dbeafe");
+    }
+    return sheet;
+}
+
+function getDataFromSheet(ss, sheetName) {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return [];
+    const rows = sheet.getDataRange().getValues();
+    if (rows.length < 2) return [];
+    const headers = rows[0];
+    const data = rows.slice(1);
+    return data.map(row => {
+        let obj = {};
+        headers.forEach((h, i) => {
+            let val = row[i];
+            if (h === 'date' || h === 'dob' || h === 'paidAt') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd");
+                }
+            }
+            if (h === 'created_at' || h === 'updatedAt' || h === 'updated_at') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd HH:mm:ss");
+                }
+            }
+            if (h === 'time') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "HH:mm");
+                }
+            }
+            obj[h] = val;
+        });
+        return obj;
+    });
+}
+
+function getDeltaDataFromSheet(ss, sheetName, lastSyncStr, limit) {
+    const sheet = ss.getSheetByName(sheetName);
+    if (!sheet) return [];
+    const rows = sheet.getDataRange().getValues();
+    if (rows.length < 2) return [];
+    
+    const headers = rows[0];
+    let dataRows = rows.slice(1);
+    
+    // 1. Filter by updatedAt > lastSyncStr
+    if (lastSyncStr) {
+        const updatedIdx = headers.findIndex(h => h === 'updatedAt' || h === 'updated_at');
+        if (updatedIdx !== -1) {
+            dataRows = dataRows.filter(row => {
+                let cellVal = row[updatedIdx];
+                if (!cellVal) return true;
+                
+                let cellTime;
+                if (cellVal instanceof Date) {
+                    cellTime = cellVal.getTime();
+                } else {
+                    cellTime = new Date(String(cellVal).replace(" ", "T")).getTime();
+                }
+                
+                let syncTime = new Date(lastSyncStr).getTime();
+                if (isNaN(cellTime) || isNaN(syncTime)) return true;
+                
+                return cellTime > syncTime;
+            });
+        }
+    } else if (limit && dataRows.length > limit) {
+        // 2. Fresh pull with limit -> slice from bottom (most recent)
+        dataRows = dataRows.slice(dataRows.length - limit);
+    }
+    
+    return dataRows.map(row => {
+        let obj = {};
+        headers.forEach((h, i) => {
+            let val = row[i];
+            if (h === 'date' || h === 'dob' || h === 'paidAt') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd");
+                }
+            }
+            if (h === 'created_at' || h === 'updatedAt' || h === 'updated_at') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd HH:mm:ss");
+                }
+            }
+            if (h === 'time') {
+                if (val instanceof Date) {
+                    val = Utilities.formatDate(val, TIMEZONE, "HH:mm");
+                }
+            }
+            obj[h] = val;
+        });
+        return obj;
+    });
+}
+
+function saveDataFixed(ss, name, data, headers) {
+    let sheet = getOrInsertSheet(ss, name, headers);
+    if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
+    if (!data || data.length === 0) return;
+    const rows = data.map(item => headers.map(k => {
+        let v = item[k];
+        return (typeof v === 'object') ? JSON.stringify(v) : (v || "");
+    }));
+    sheet.getRange(2, 1, rows.length, headers.length).setNumberFormat("@").setValues(rows);
+}
+
+function updateConfigSheet(ss, configData) {
+    let sheet = getOrInsertSheet(ss, SHEET_NAMES.CONFIG, HEADERS.CONFIG);
+    const map = new Map();
+    const data = sheet.getDataRange().getValues();
+    
+    // Scan ALL rows to find existing keys (handle case where header might not be at row 1)
+    data.forEach((r, i) => {
+        const keyName = String(r[0]).trim();
+        // Ignore real header row if it exists
+        if (keyName && keyName.toLowerCase() !== 'key') {
+            map.set(keyName, i + 1); // i + 1 is the actual 1-based Row number in Google Sheets
+        }
+    });
+
+    configData.forEach(c => {
+        const time = new Date();
+        if (map.has(c.key)) {
+            const row = map.get(c.key);
+            sheet.getRange(row, 2).setValue(c.value);
+            sheet.getRange(row, 3).setValue(time);
+        } else {
+            sheet.appendRow([c.key, c.value, time]);
+            map.set(c.key, sheet.getLastRow()); // Update map in case of duplicates
+        }
+    });
+}
+
+
+function processIncrementalSync(ss, changes) {
+    const merge = (sheetName, headersArr, incomingItems) => {
+        if (!incomingItems || incomingItems.length === 0) return;
+
+        const sheet = getOrInsertSheet(ss, sheetName, headersArr);
+        if (!sheet) {
+            Logger.log(`[merge] Error: Could not get or create sheet ${sheetName}`);
+            return;
+        }
+        const values = sheet.getDataRange().getValues();
+        const sheetHeaders = values[0];
+        
+        const norm = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
+        const sheetHeadersNorm = sheetHeaders.map(norm);
+        
+        const colIdIdx = findColumnIndex(sheetHeaders, ['id', 'patientId', 'key']);
+        const idIdx = colIdIdx !== -1 ? colIdIdx : 0;
+
+        const idMap = new Map();
+        for (let i = 1; i < values.length; i++) {
+            idMap.set(String(values[i][idIdx]), i);
+        }
+
+        incomingItems.forEach(item => {
+            const id = String(item.id);
+            const rowData = sheetHeadersNorm.map((hNorm, idx) => {
+                const originalKey = headersArr.find(k => norm(k) === hNorm);
+                
+                if (originalKey && item[originalKey] !== undefined && item[originalKey] !== null) {
+                    let v = item[originalKey];
+                    
+                    // [PROTECTION]: Jika kolom rontgen_url dan data baru kosong tapi di sheet ada data, JANGAN TIMPA.
+                    if (hNorm === 'rontgenurl' && (v === "" || !v) && idMap.has(id)) {
+                        const existingVal = values[idMap.get(id)][idx];
+                        if (existingVal && String(existingVal).startsWith('http')) return existingVal;
+                    }
+
+                    if (typeof v === 'number' && v === 0) return 0;
+                    return (typeof v === 'object') ? JSON.stringify(v) : (v || "");
+                }
+                
+                if (idMap.has(id)) return values[idMap.get(id)][idx];
+                return "";
+            });
+
+            if (idMap.has(id)) {
+                values[idMap.get(id)] = rowData;
+            } else {
+                values.push(rowData);
+            }
+        });
+
+        const finalData = values.slice(1);
+        if (finalData.length > 0) {
+            sheet.getRange(2, 1, finalData.length, sheetHeaders.length).setNumberFormat("@").setValues(finalData);
+        }
+    };
+
+    if (changes.patients) merge(SHEET_NAMES.PATIENTS, HEADERS.PATIENTS, changes.patients);
+    if (changes.assessments) merge(SHEET_NAMES.ASSESSMENTS, HEADERS.ASSESSMENTS, changes.assessments);
+    if (changes.appointments) merge(SHEET_NAMES.APPOINTMENTS, HEADERS.APPOINTMENTS, changes.appointments);
+    if (changes.expenses) merge(SHEET_NAMES.EXPENSES, HEADERS.EXPENSES, changes.expenses);
+    if (changes.packages) merge(SHEET_NAMES.PACKAGES, HEADERS.PACKAGES, changes.packages);
+    if (changes.treatments) merge(SHEET_NAMES.TREATMENTS, HEADERS.TREATMENTS, changes.treatments);
+    if (changes.config) updateConfigSheet(ss, changes.config);
+    if (changes.users) merge(SHEET_NAMES.USERS, HEADERS.USERS, changes.users);
+
+    // Handle Deletions
+    if (changes.deletedIds) {
+        const del = changes.deletedIds;
+        if (del.patients && del.patients.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.PATIENTS), del.patients);
+        if (del.assessments && del.assessments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.ASSESSMENTS), del.assessments);
+        if (del.appointments && del.appointments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.APPOINTMENTS), del.appointments);
+        if (del.expenses && del.expenses.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.EXPENSES), del.expenses);
+        if (del.packages && del.packages.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.PACKAGES), del.packages);
+        if (del.treatments && del.treatments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.TREATMENTS), del.treatments);
+        if (del.protocols && del.protocols.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.PROTOCOLS), del.protocols);
+        if (del.users && del.users.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.USERS), del.users);
+    }
+}
+
+function deleteRowsById(sheet, ids) {
+    if (!sheet || !ids || ids.length === 0) return;
+    const sheetName = sheet.getName();
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return; // Only headers
+
+    const headers = data[0];
+    const colId = findColumnIndex(headers, ['id', 'patientId', 'key']);
+    const searchIdx = colId !== -1 ? colId : 0;
+
+    const targetIds = ids.map(id => String(id).trim());
+    Logger.log(`[deleteRowsById] Sheet: ${sheetName}, IDs to delete: ${targetIds.length}`);
+
+    // Create new data array excluding matches
+    const remainingData = [headers];
+    let deletedCount = 0;
+
+    for (let i = 1; i < data.length; i++) {
+        const rowId = String(data[i][searchIdx] || "").trim();
+        if (targetIds.indexOf(rowId) === -1) {
+            remainingData.push(data[i]);
+        } else {
+            deletedCount++;
+        }
+    }
+
+    if (deletedCount > 0) {
+        // PENTING: Clear and Overwrite is much faster than deleteRow() in loop
+        sheet.clearContents();
+        sheet.getRange(1, 1, remainingData.length, headers.length)
+            .setNumberFormat("@")
+            .setValues(remainingData);
+        Logger.log(`[deleteRowsById] Success: Deleted ${deletedCount} items from ${sheetName}.`);
+    }
+}
+
+function createJSONOutput(obj) { return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON); }
+
+// --- AUTO-UPDATE COLUMNS FEATURE ---
+function checkAndFixColumns(ss, isMaster = false) {
+    const allSheets = [
+        { name: SHEET_NAMES.PATIENTS, headers: HEADERS.PATIENTS },
+        { name: SHEET_NAMES.ASSESSMENTS, headers: HEADERS.ASSESSMENTS },
+        { name: SHEET_NAMES.APPOINTMENTS, headers: HEADERS.APPOINTMENTS },
+        { name: SHEET_NAMES.CONFIG, headers: HEADERS.CONFIG },
+        { name: SHEET_NAMES.EXPENSES, headers: HEADERS.EXPENSES },
+        { name: SHEET_NAMES.PACKAGES, headers: HEADERS.PACKAGES },
+        { name: SHEET_NAMES.TREATMENTS, headers: HEADERS.TREATMENTS },
+        { name: SHEET_NAMES.USERS, headers: HEADERS.USERS },
+        { name: SHEET_NAMES.LICENSES, headers: HEADERS.LICENSES },
+        { name: SHEET_NAMES.LICENSE_ARCHIVES, headers: HEADERS.LICENSE_ARCHIVES }
+    ];
+
+    // Filter: Jika isMaster, hanya proses Licenses/Archives. Jika tidak, proses semua selain Licenses/Archives.
+    const sheetsToCheck = allSheets.filter(item => {
+        if (isMaster) return item.name === SHEET_NAMES.LICENSES || item.name === SHEET_NAMES.LICENSE_ARCHIVES;
+        return item.name !== SHEET_NAMES.LICENSES && item.name !== SHEET_NAMES.LICENSE_ARCHIVES;
+    });
+
+    let logs = [];
+
+    sheetsToCheck.forEach(item => {
+        const sheet = ss.getSheetByName(item.name);
+        if (!sheet) {
+            logs.push(`[${item.name}] Tab tidak ditemukan. Menambah tab baru.`);
+            getOrInsertSheet(ss, item.name, item.headers);
+            return;
+        }
+
+        const lastCol = sheet.getLastColumn();
+        const currentHeadersRaw = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+        
+        // Normalisasi header yang ada (lowercase + hapus spasi & underscore)
+        const normalize = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
+        const currentHeadersNormalized = currentHeadersRaw.map(normalize);
+
+        const missingHeaders = item.headers.filter(h => !currentHeadersNormalized.includes(normalize(h)));
+
+        if (missingHeaders.length > 0) {
+            const startCol = lastCol + 1;
+            sheet.getRange(1, startCol, 1, missingHeaders.length)
+                .setValues([missingHeaders])
+                .setFontWeight("bold")
+                .setBackground("#dbeafe");
+            
+            logs.push(`[${item.name}] Menambah kolom: ${missingHeaders.join(', ')}`);
+        } else {
+            logs.push(`[${item.name}] Ok.`);
+        }
+    });
+
+    return logs;
+}

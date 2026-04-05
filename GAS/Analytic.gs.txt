@@ -1,0 +1,213 @@
+/**
+ * V18.9 SOLID TITAN - CLEAN DATA ENGINE (AUTO-STRIP BRACKETS)
+ * CLINICAL & BUSINESS ANALYTICS MIRROR ENGINE
+ */
+function getDemographicAnalytics(startDate, endDate) {
+    const ss = getSpreadsheet();
+    const sheetId = ss.getId();
+    
+    // Helper Pembersih Karakter Sampah ( [ ] " ' )
+    const cleanStr = (val) => {
+        if (!val) return "";
+        return String(val).replace(/[\[\]"']/g, '').trim().toUpperCase();
+    };
+
+    const fetchData = (name) => {
+        try { 
+            const data = getDataFromSheet(ss, name);
+            return Array.isArray(data) ? data : []; 
+        } catch(e) { return []; }
+    };
+    
+    const patients = fetchData("Patients");
+    const assessments = fetchData("Assessments");
+    const expenses = fetchData("Expenses");
+
+    const start = startDate ? new Date(startDate) : null;
+    const end = endDate ? new Date(endDate) : null;
+    if (start) start.setHours(0,0,0,0);
+    if (end) end.setHours(23,59,59,999);
+
+    const stats = {
+        activePatientIds: new Set(),
+        age: { total: 0, count: 0, segments: { anak: 0, dewasa: 0, lansia: 0, unknown: 0 } },
+        gender: { L: 0, P: 0 },
+        fin: { income: 0, expense: 0 },
+        risk: {}, geo: {}, dx: {}, iv: {}, loyalty: { visitCounts: {} }
+    };
+
+    // 1. SCAN ASSESSMENTS FIRST
+    const filteredApps = assessments.filter(a => {
+        try {
+            if (!a.date) return false;
+            const d = new Date(a.date);
+            const inPeriod = (!start || d >= start) && (!end || d <= end);
+            if (!inPeriod) return false;
+
+            const pId = String(a.patientId || a.patient_id);
+            if (pId) {
+                stats.activePatientIds.add(pId);
+                stats.loyalty.visitCounts[pId] = (stats.loyalty.visitCounts[pId] || 0) + 1;
+            }
+
+            stats.fin.income += Number(a.fee || a.total_bill || 0);
+
+            // [CLEAN] Diagnosis Logic
+            if (a.diagnosis && a.diagnosis !== '-') {
+                const cleanDx = cleanStr(a.diagnosis);
+                if (cleanDx) stats.dx[cleanDx] = (stats.dx[cleanDx] || 0) + 1;
+            }
+
+            // [CLEAN] Modality Logic - Splitting and Auto-Cleaning
+            if (a.intervention) {
+                const rawItems = String(a.intervention).split(',');
+                rawItems.forEach(item => {
+                    const finalItem = cleanStr(item);
+                    if (finalItem && finalItem !== '-') {
+                        stats.iv[finalItem] = (stats.iv[finalItem] || 0) + 1;
+                    }
+                });
+            }
+
+            return true;
+        } catch (e) { return false; }
+    });
+
+    // 2. SCAN PATIENTS MASTER
+    patients.forEach(p => {
+        try {
+            const pId = String(p.id);
+            const isRelevant = (!start && !end) || stats.activePatientIds.has(pId);
+            if (!isRelevant) return;
+
+            const name = String(p.name || '').trim().toUpperCase();
+            if (!pId || !name || name === 'TIDAK TERISI' || name === 'GHOST') return;
+
+            const gen = String(p.gender || '').toUpperCase();
+            if (gen === 'L') stats.gender.L++;
+            else if (gen === 'P') stats.gender.P++;
+
+            let ageVal = parseInt(p.age);
+            if (isNaN(ageVal) && p.dob) {
+                ageVal = new Date().getFullYear() - new Date(p.dob).getFullYear();
+            }
+
+            if (!isNaN(ageVal) && ageVal > 0) {
+                stats.age.total += ageVal;
+                stats.age.count++;
+                if (ageVal <= 17) stats.age.segments.anak++;
+                else if (ageVal <= 45) stats.age.segments.dewasa++;
+                else stats.age.segments.lansia++;
+            } else {
+                stats.age.segments.unknown++;
+            }
+
+            const loc = cleanStr(p.address || 'LOKASI TIDAK DIISI');
+            if (loc && loc !== '-') stats.geo[loc] = (stats.geo[loc] || 0) + 1;
+
+            // [CLEAN] Risk Tagging Logic
+            if (p.tags) {
+                const tgs = String(p.tags).split(',');
+                tgs.forEach(t => {
+                    const cleanTag = cleanStr(t);
+                    if (cleanTag && cleanTag !== '-') {
+                        stats.risk[cleanTag] = (stats.risk[cleanTag] || 0) + 1;
+                    }
+                });
+            }
+        } catch (e) { }
+    });
+
+    // 3. EXPENSES SCAN
+    expenses.forEach(ex => {
+        try {
+            if (!ex.date) return;
+            const d = new Date(ex.date);
+            if ((!start || d >= start) && (!end || d <= end)) stats.fin.expense += Number(ex.amount || 0);
+        } catch (e) {}
+    });
+
+    // 4. PREPARE RESULTS
+    const populationCount = (!start && !end) ? patients.length : stats.activePatientIds.size;
+    const returningCount = Object.values(stats.loyalty.visitCounts).filter(v => v > 1).length;
+    const getTopN = (obj, n = 10) => Object.entries(obj).sort((a,b) => b[1]-a[1]).slice(0,n).map(([k,v]) => [k,v]);
+
+    const result = {
+        id: sheetId,
+        population: populationCount,
+        averageAge: stats.age.count > 0 ? Math.round(stats.age.total / stats.age.count) : 0,
+        ageSegments: stats.age.segments,
+        gender: stats.gender,
+        financial: { 
+            income: stats.fin.income,
+            expense: stats.fin.expense,
+            profit: stats.fin.income - stats.fin.expense,
+            arpp: filteredApps.length > 0 ? (stats.fin.income / filteredApps.length) : 0
+        },
+        productivity: {
+            conversion: "0%",
+            retention: populationCount > 0 ? ((returningCount / populationCount) * 100).toFixed(1) + "%" : "0%"
+        },
+        risk: stats.risk,
+        geo: getTopN(stats.geo, 10),
+        dx: getTopN(stats.dx, 10),
+        iv: getTopN(stats.iv, 10),
+        loyalty: { new: populationCount - returningCount, returning: returningCount },
+        period: (startDate && endDate) ? `${startDate} s/d ${endDate}` : "Semua Waktu",
+        timestamp: Utilities.formatDate(new Date(), (typeof TIMEZONE !== 'undefined' ? TIMEZONE : "Asia/Jakarta"), "yyyy-MM-dd HH:mm:ss")
+    };
+
+    saveToReportSheet(ss, result);
+    return result;
+}
+
+function saveToReportSheet(ss, data) {
+    try {
+        let sheet = ss.getSheetByName("Reports") || ss.insertSheet("Reports");
+        const f = (n) => "Rp " + Number(n || 0).toLocaleString('id-ID');
+
+        const rows = [
+            ["💎 LAPORAN ANALISA BISNIS & SAFETY (V18.9 CLEAN)", "UPDATE:", data.timestamp, ""],
+            ["PERIODE ANALISA:", data.period, "ENGINE:", "TITAN SERIES"],
+            ["", "", "", ""],
+            ["📊 KPI CORE PERFORMANCE", "PARAMETER", "VALUE", "ANALISA"],
+            ["FINANSIAL", "LABA BERSIH (PROFIT)", f(data.financial.profit), data.financial.profit >= 0 ? "SURPLUS" : "DEFISIT"],
+            ["FINANSIAL", "PENDAPATAN GROSS", f(data.financial.income), "Total Kas Masuk"],
+            ["FINANSIAL", "ARPP (Avg/Visit)", f(data.financial.arpp), "Income per Sesi"],
+            ["PRODUKTIVITAS", "Conversion Rate", "0%", "Leads Effect"],
+            ["LOYALITAS", "Retention Rate", data.productivity.retention, "Pasien Balik"],
+            ["LOYALITAS", "Populasi Aktif", data.population + " Jiwa", "Unique Patients"],
+            ["", "", "", ""],
+            ["👥 ANALISA DEMOGRAFI (USIA & GENDER)", "KATEGORI / RANGE", "JUMLAH", "STATUS"],
+            ["SEGMEN USIA", "Anak & Remaja (0-17)", (data.ageSegments.anak || 0) + " Jiwa", "ANAK-ANAK"],
+            ["SEGMEN USIA", "Dewasa (18-45)", (data.ageSegments.dewasa || 0) + " Jiwa", "USIA PRODUKTIF"],
+            ["SEGMEN USIA", "Senior / Lansia (>45)", (data.ageSegments.lansia || 0) + " Jiwa", "USIA SENIOR"],
+            ["GENDER", "Pasien Laki-laki", data.gender.L + " Orang", "MALE"],
+            ["GENDER", "Pasien Perempuan", data.gender.P + " Orang", "FEMALE"],
+            ["", "", "", ""],
+            ["🚨 SAFETY & PPE PLANNING (RED-FLAG)", "JENIS RISIKO (TAG)", "JUMLAH PASIEN AKTIF", "KEBUTUHAN APD"],
+            ...Object.entries(data.risk).sort((a,b)=>b[1]-a[1]).map(([k, v]) => ["RED-FLAG", k, v + " Jiwa", "WAJIB APD"]),
+            ["", "", "", ""],
+            ["📍 TOP 10 DOMISILI", "WILAYAH", "TOTAL", "STATUS"],
+            ...data.geo.map(([k, v]) => ["GEO", k, v + " Pasien", "TARGET"]),
+            ["", "", "", ""],
+            ["🏆 TOP 10 DIAGNOSA", "DIAGNOSA", "JUMLAH", "STATUS"],
+            ...data.dx.map(([k, v]) => ["KLINIS", k, v + " Kali", "PRIORITAS"]),
+            ["", "", "", ""],
+            ["⚡ POPULARITAS MODALITAS LAKU", "MODALITAS", "TOTAL SESI", "MINAT"],
+            ...data.iv.map(([k, v]) => ["KONTEN", k, v + " Sesi", "LAKU"])
+        ];
+
+        sheet.clear();
+        sheet.getRange(1, 1, rows.length, 4).setValues(rows);
+        sheet.getRange("A1:D1").setFontWeight("bold").setFontColor("#ffffff").setBackground("#0f172a").setFontSize(11);
+        sheet.getRange("A4:D4").setFontWeight("bold").setBackground("#dcfce7").setFontColor("#166534").setFontSize(10);
+        sheet.getRange("A12:D12").setFontWeight("bold").setBackground("#f0f9ff").setFontColor("#075985").setFontSize(10);
+        sheet.getRange("A19:D19").setFontWeight("bold").setBackground("#fee2e2").setFontColor("#991b1b").setFontSize(10);
+        sheet.getRange(1, 1, rows.length, 4).setBorder(true, true, true, true, true, true, "#cbd5e1", SpreadsheetApp.BorderStyle.SOLID);
+        sheet.autoResizeColumns(1, 4);
+        sheet.setFrozenRows(1);
+    } catch (e) {
+        Logger.log("Critical Cleanup Error: " + e);
+    }
+}

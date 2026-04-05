@@ -1,0 +1,570 @@
+/**
+ * ERM FISIOTA BACKEND - V5.0 (MODULAR)
+ * FILE: 4_Notification.gs
+ * Deskrpsi: Helper untuk Telegram dan Email.
+ */
+
+function getConfigMap(ss) {
+    const sheet = ss.getSheetByName(SHEET_NAMES.CONFIG);
+    const map = new Map();
+    if (!sheet) return map;
+    const data = sheet.getDataRange().getValues();
+    
+    data.forEach(row => {
+        const key = String(row[0] || "").trim();
+        if (key && key.toLowerCase() !== 'key') {
+            map.set(key, row[1]);
+        }
+    });
+    return map;
+}
+
+// 🔑 CENTRAL BOT TOKEN (Opsional: Isi jika ingin pakai 1 Bot untuk semua klien)
+// Klien cukup input ChatID saja.
+const GLOBAL_BOT_TOKEN = "8523631937:AAHQLhf6E_9uJd4Y9hwfWmQ1xqFWkqGrHpw";
+
+function sendTelegram(token, chatId, text) {
+    // 1. DETERMINE TOKEN: Priority: Provided (Clinic) -> Master Config -> Global Bot
+    let finalToken = token;
+    let tokenSource = "Provided (Clinic)";
+    
+    if (!finalToken) {
+        try {
+            // Try to open Master Spreadsheet config
+            const ssMaster = (typeof SHEET_ID !== 'undefined' && SHEET_ID) ? SpreadsheetApp.openById(SHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+            if (ssMaster) {
+                finalToken = getConfigMap(ssMaster).get('TELEGRAM_TOKEN');
+                tokenSource = "Master Config";
+            }
+        } catch (e) {
+            Logger.log("Master Config Token Error: " + e);
+        }
+    }
+    
+    if (!finalToken) {
+        finalToken = GLOBAL_BOT_TOKEN;
+        tokenSource = "GLOBAL_BOT_TOKEN Fallback";
+    }
+
+    if (!finalToken || !chatId) {
+        Logger.log(`TG Error: Token/ChatID missing! (Token: ${finalToken ? "OK" : "MISSING"}, Chat: ${chatId || "MISSING"}) Source: ${tokenSource}`);
+        return false;
+    }
+    
+    Logger.log(`[sendTelegram] START - Source: ${tokenSource}, ChatID: ${chatId}`);
+
+    if (!text) { Logger.log("TG Error: Text is empty/null!"); return false; }
+
+    try {
+        const url = `https://api.telegram.org/bot${finalToken}/sendMessage`;
+        const MAX_LEN = 3900;
+
+        // Auto-split long messages
+        let textChunks = [];
+        if (text.length > MAX_LEN) {
+            let paragraphs = text.split('\n\n');
+            let currentChunk = '';
+            for (let p of paragraphs) {
+                if (currentChunk.length + p.length > MAX_LEN) {
+                    textChunks.push(currentChunk);
+                    currentChunk = p + '\n\n';
+                } else {
+                    currentChunk += p + '\n\n';
+                }
+            }
+            if (currentChunk.trim().length > 0) textChunks.push(currentChunk);
+        } else {
+            textChunks.push(text);
+        }
+
+        let allSuccess = true;
+
+        for (let idx = 0; idx < textChunks.length; idx++) {
+            let chunk = textChunks[idx];
+            Logger.log(`[sendTelegram] Chunk ${idx+1}/${textChunks.length} to ${chatId}. Len: ${chunk.length}`);
+
+            // 1. Escape all characters
+            let escapedText = chunk
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            // 2. Safely restore allowed tags
+            // Improved regex for <a> to handle varied link contents (like wa.me with many params)
+            escapedText = escapedText
+                .replace(/&lt;a\s+href=(.*?)&gt;/gi, (match, p1) => `<a href=${p1}>`)
+                .replace(/&lt;\/a\s*&gt;/gi, '</a>')
+                .replace(/&lt;b&gt;/gi, '<b>')
+                .replace(/&lt;\/b&gt;/gi, '</b>')
+                .replace(/&lt;i&gt;/gi, '<i>')
+                .replace(/&lt;\/i&gt;/gi, '</i>');
+
+            const payload = { chat_id: chatId.toString(), text: escapedText, parse_mode: 'HTML' };
+            const response = UrlFetchApp.fetch(url, {
+                method: 'post', contentType: 'application/json',
+                payload: JSON.stringify(payload), muteHttpExceptions: true
+            });
+            const resCode = response.getResponseCode();
+            const resBody = response.getContentText();
+            Logger.log(`[sendTelegram] Chunk ${idx+1} res: ${resCode}`);
+
+            if (resCode !== 200) {
+                Logger.log(`[sendTelegram] Error ${resCode}, retrying without parse_mode... Body: ${resBody}`);
+                const plainText = chunk.replace(/<[^>]*>?/gm, ''); // Strip tags
+                const retryPayload = { chat_id: chatId.toString(), text: plainText };
+                const retryRes = UrlFetchApp.fetch(url, {
+                    method: 'post', contentType: 'application/json',
+                    payload: JSON.stringify(retryPayload), muteHttpExceptions: true
+                });
+                if (retryRes.getResponseCode() !== 200) allSuccess = false;
+            }
+            if (idx < textChunks.length - 1) Utilities.sleep(1000); 
+        }
+        return allSuccess;
+    } catch (e) {
+        Logger.log("TG Error: " + e.toString());
+        return false;
+    }
+}
+
+function sendEmail(to, subject, body, fromAlias) {
+    try {
+        const options = {};
+        if (fromAlias) options.name = fromAlias; // Set Display Name
+
+        MailApp.sendEmail({
+            to: to,
+            subject: subject,
+            htmlBody: body, // Fixed: Use htmlBody to render HTML tags
+            name: fromAlias || "FISIOTA System"
+        });
+        return true;
+    } catch (e) {
+        Logger.log("Email Error: " + e.toString());
+        return false;
+    }
+}
+
+// ===================================================
+// HELPER: Format Tanggal Indonesia
+// ===================================================
+function formatDateIndo(dateStr) {
+    const days = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+    const months = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+    
+    // Normalize dateStr to ensure it's a valid Date object
+    let d;
+    if (dateStr instanceof Date) {
+        d = dateStr;
+    } else {
+        const norm = normalizeDate(dateStr);
+        d = new Date(norm);
+    }
+    
+    if (isNaN(d.getTime())) return dateStr;
+    return `${days[d.getDay()]}, ${d.getDate()} ${months[d.getMonth()]} ${d.getFullYear()}`;
+}
+
+/**
+ * Normalize date string to yyyy-MM-dd
+ */
+function normalizeDate(s) {
+    if (!s) return "";
+    let str = String(s).split(" ")[0]; // Take only date part
+    if (str.includes("-")) {
+        // Assume yyyy-MM-dd or dd-MM-yyyy
+        let parts = str.split("-");
+        if (parts[0].length === 4) return str; // yyyy-MM-dd
+        return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+    if (str.includes("/")) {
+        // Assume dd/MM/yyyy or MM/dd/yyyy. Standard in this app is dd/MM/yyyy
+        let parts = str.split("/");
+        if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+        if (parts[0].length === 4) return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+    }
+    return str;
+}
+
+// ===================================================
+// HELPER: Build Pesan Telegram (Jadwal + Laporan)
+// Return: { reminder: string, report: string }
+// ===================================================
+function buildReminderMessages(appointments, patientMap, dateStr, clinicInfo, config) {
+    const clinicName = config ? (config.get('CLINIC_NAME') || 'FISIOTA') : 'FISIOTA';
+    const clinicAddress = config ? (config.get('CLINIC_ADDRESS') || '') : '';
+    const clinicMaps = config ? (config.get('CLINIC_MAPS') || '') : '';
+    const clinicPhone = config ? (config.get('CLINIC_PHONE') || '') : '';
+    const dateIndo = formatDateIndo(dateStr);
+    let totalOmzet = 0;
+
+    // ===== PESAN 1: JADWAL TERAPI =====
+    let reminder = `☀️ JADWAL TERAPI HARI INI ☀️\n`;
+    reminder += `🗓️ ${dateIndo}\n`;
+    reminder += `👥 Total: ${appointments.length} Pasien\n\n`;
+
+    appointments.forEach((a, index) => {
+        const p = patientMap.get(a.patientId) || { name: 'Unknown', phone: '', category: 'Umum', diagnosis: '-' };
+        
+        // 1. FILTER: HANYA HITUNG YANG TIDAK BATAL (Sesuai Dashboard & Kasir)
+        const appStatus = String(a.status || "").toUpperCase();
+        const isCancelled = appStatus === 'CANCELLED' || appStatus === 'REJECTED';
+        
+        // 2. LOGIKA BIAYA: PRIORITAS finalAmount (Setelah Diskon) -> fee -> defaultFee
+        const rawFee = a.finalAmount || a.fee || p.defaultFee || "0";
+        const fee = parseFloat(String(rawFee).replace(/[^\d]/g, "")) || 0;
+        
+        if (!isCancelled) {
+            totalOmzet += fee;
+        }
+
+        // Emoji berdasarkan kategori
+        const categoryStr = String(p.category || 'Umum').toLowerCase();
+        const locEmoji = categoryStr.includes('home') ? '🏠' : '🏥';
+
+        // Sanitize Phone for WA
+        let phone = String(p.phone || "").replace(/[^0-9]/g, '');
+        if (phone.startsWith('0')) phone = '62' + phone.substring(1);
+        if (phone.startsWith('8')) phone = '62' + phone;
+
+        // Generate WA Link dengan pre-filled text + info klinik
+
+        let waLink = "";
+
+        if (phone) {
+            const templateData = {
+                name: p.name,
+                clinic_name: clinicName,
+                date: dateIndo,
+                time: a.time,
+                category: p.category || 'Klinik',
+                address: clinicAddress,
+                phone: clinicPhone,
+                maps_url: clinicMaps,
+                notes: a.notes || '-'
+            };
+
+            const defaultReminder = 
+                `Assalamualaikum 👋\n\n` +
+                `Mengingatkan kembali untuk jadwal Fisioterapi hari ini ya: 👇\n\n` +
+                `📅 Tanggal: {{date}}\n` +
+                `⏰ Jam: {{time}} WIB\n` +
+                `📍 Lokasi: {{category}}` +
+                (clinicAddress ? `\n🏥 Alamat: {{address}}` : "") +
+                (clinicPhone ? `\n📞 Kontak: {{phone}}` : "") +
+                (clinicMaps ? `\n🗺️ Maps: {{maps_url}}` : "") +
+                `\n📝 Catatan: {{notes}}\n\n` +
+                `Mohon konfirmasinya. Terima kasih! 🙏\n` +
+                `~ Admin {{clinic_name}}`;
+
+            const reminderTemplate = config ? (config.get('MSG_REMINDER_TEMPLATE') || defaultReminder) : defaultReminder;
+            const waText = processPlaceholders(reminderTemplate, templateData);
+
+            waLink = `<a href="https://wa.me/${phone}?text=${encodeURIComponent(waText)}">[Chat WA]</a>`;
+        }
+
+
+        reminder += `${index + 1}. ${locEmoji} (${p.category || 'Umum'}) ${p.name}  ${waLink}\n`;
+        reminder += `    ⏰ ${a.time} WIB | 🩺 ${p.diagnosis || '-'}\n`;
+        reminder += `    📝 ${a.notes || '-'}\n\n`;
+    });
+
+    reminder += `━━━━━━━━━━━━━━━━━━\n`;
+    reminder += `✨ Semangat melayani! ✨`;
+
+    // ===== PESAN 2: LAPORAN HARIAN =====
+    let fmtOmzet = totalOmzet.toString();
+    try {
+        fmtOmzet = new Intl.NumberFormat('id-ID').format(totalOmzet);
+    } catch(e) { /* Safe fallback */ }
+
+    let report = `🌙✨ LAPORAN HARIAN ✨🌙\n`;
+    report += `━━━━━━━━━━━━━━━━━━\n`;
+    report += `🗓️ ${dateIndo}\n\n`;
+    report += `📊 RINGKASAN:\n`;
+    report += `✅ Pasien Terjadwal: ${appointments.length} Orang\n`;
+    report += `💰 Estimasi Omzet:  Rp ${fmtOmzet}\n\n`;
+    report += `━━━━━━━━━━━━━━━━━━\n`;
+    report += `🤲 Alhamdulillah. Selamat istirahat!`;
+
+    return { reminder, report };
+}
+
+// ===================================================
+// HELPER: Build Email HTML
+// ===================================================
+function buildEmailHtml(appointments, patientMap, dateIndo) {
+    let htmlRows = '';
+    appointments.forEach(a => {
+        const p = patientMap.get(a.patientId) || { name: 'Unknown', category: '-', diagnosis: '-' };
+        htmlRows += `
+            <tr style="border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 12px; font-weight: bold; color: #1e293b; width: 80px;">${a.time}</td>
+                <td style="padding: 12px;">
+                    <div style="font-weight: bold; color: #0f172a;">${p.name}</div>
+                    <div style="font-size: 12px; color: #64748b;">${p.category} | ${p.diagnosis}</div>
+                </td>
+                <td style="padding: 12px; color: #475569; font-style: italic;">${a.notes || '-'}</td>
+            </tr>
+        `;
+    });
+
+    return `
+        <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; background: #ffffff;">
+            <div style="background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%); padding: 25px; text-align: center;">
+                <h2 style="color: white; margin: 0; font-size: 20px;">☀️ JADWAL TERAPI HARI INI</h2>
+                <p style="color: #dbeafe; margin: 5px 0 0; font-weight: 500;">${dateIndo}</p>
+            </div>
+            <div style="padding: 20px;">
+                <table style="width: 100%; border-collapse: collapse;">
+                    <thead>
+                        <tr>
+                            <th style="text-align: left; padding: 10px; color: #64748b; font-size: 12px; text-transform: uppercase;">Waktu</th>
+                            <th style="text-align: left; padding: 10px; color: #64748b; font-size: 12px; text-transform: uppercase;">Pasien</th>
+                            <th style="text-align: left; padding: 10px; color: #64748b; font-size: 12px; text-transform: uppercase;">Catatan</th>
+                        </tr>
+                    </thead>
+                    <tbody>${htmlRows}</tbody>
+                </table>
+                <div style="margin-top: 25px; text-align: center;">
+                    <span style="background: #f1f5f9; padding: 6px 12px; border-radius: 20px; color: #475569; font-size: 12px; font-weight: 600;">👥 Total: ${appointments.length} Pasien</span>
+                </div>
+            </div>
+            <div style="background: #f8fafc; padding: 15px; text-align: center; border-top: 1px solid #e2e8f0;">
+                <p style="margin: 0; color: #94a3b8; font-size: 11px;">✨ Semangat melayani • FISIOTA ERM System</p>
+            </div>
+        </div>
+    `;
+}
+
+// ===================================================
+// CORE: Proses kirim notifikasi untuk satu klien
+// mode: 'reminder' | 'report' | 'both'
+// ===================================================
+function processClientNotification(ssClient, clientConfig, targetDateStr, label, mode) {
+    mode = mode || 'both';
+    const tgToken = clientConfig.get('TELEGRAM_TOKEN');
+    const tgChatId = clientConfig.get('TELEGRAM_CHAT_ID');
+
+    // 1. Get Data
+    const apptData = getDataFromSheet(ssClient, SHEET_NAMES.APPOINTMENTS);
+    const patientData = getDataFromSheet(ssClient, SHEET_NAMES.PATIENTS);
+    const patientMap = new Map();
+    patientData.forEach(p => patientMap.set(p.id, p));
+
+    // 2. Filter appointments for target date
+    const normTarget = normalizeDate(targetDateStr);
+    const targetAppts = apptData.filter(a => {
+        const normA = normalizeDate(a.date);
+        return normA === normTarget;
+    });
+
+    Logger.log(`   📊 Total appointments: ${apptData.length} | ${label}: ${targetAppts.length}`);
+
+    if (targetAppts.length === 0) return { sent: false, reason: 'no_appointments' };
+
+    // 3. Get clinic info from config
+    let clinicInfo = { name: clientConfig.get('CLINIC_NAME') || 'FISIOTA' };
+    Logger.log(`   🏥 Klinik: ${clinicInfo.name}`);
+
+    // 4. Build messages
+    const messages = buildReminderMessages(targetAppts, patientMap, targetDateStr, clinicInfo, clientConfig);
+    const dateIndo = formatDateIndo(targetDateStr);
+
+    // 5. Send Telegram berdasarkan mode
+    let tgSent = false;
+    if (tgChatId) {
+        if (mode === 'reminder' || mode === 'both') {
+            const res1 = sendTelegram(tgToken, tgChatId, messages.reminder);
+            Logger.log(`   📤 Reminder sent? ${res1}`);
+            tgSent = tgSent || res1;
+        }
+        if (mode === 'report' || mode === 'both') {
+            const res2 = sendTelegram(tgToken, tgChatId, messages.report);
+            Logger.log(`   📤 Report sent? ${res2}`);
+            tgSent = tgSent || res2;
+        }
+    } else {
+        Logger.log("   -> Skipped Telegram: No Chat ID");
+    }
+
+    // 6. Send Email (hanya saat mode reminder atau both)
+    if (mode === 'reminder' || mode === 'both') {
+        const emailReceiver = clientConfig.get('EMAIL_RECEIVER');
+        const emailSender = clientConfig.get('EMAIL_SENDER');
+        if (emailReceiver) {
+            const htmlBody = buildEmailHtml(targetAppts, patientMap, dateIndo);
+            const resEmail = sendEmail(emailReceiver, `☀️ Jadwal Terapi - ${dateIndo}`, htmlBody, emailSender);
+            Logger.log(`   📧 Email sent to ${emailReceiver}? ${resEmail}`);
+        }
+    }
+
+    return { sent: tgSent, count: targetAppts.length };
+}
+
+// ===================================================
+// ☀️ CRON PAGI: Kirim Jadwal Hari Ini (REMINDER ONLY)
+// Setup Trigger: Time-driven > Day timer > 05:00-06:00
+// ===================================================
+function sendDailyReminders() {
+    Logger.log("🚀 START: Sending Daily Reminders (Jadwal Hari Ini)...");
+    const ssAdmin = SpreadsheetApp.getActiveSpreadsheet();
+    const licenseSheet = ssAdmin.getSheetByName(SHEET_NAMES.LICENSES);
+    if (!licenseSheet) { Logger.log("❌ Error: License Sheet not found"); return; }
+
+    const data = licenseSheet.getDataRange().getValues();
+    const headers = data[0];
+    const licenses = data.slice(1);
+    
+    const colKey = findColumnIndex(headers, ['key']);
+    const colName = findColumnIndex(headers, ['client_name', 'nama_klien']);
+    const colStatus = findColumnIndex(headers, ['status']);
+    const colSheetId = findColumnIndex(headers, ['sheet_id', 'id_sheet']);
+
+    const today = new Date();
+    const todayStr = Utilities.formatDate(today, TIMEZONE, "yyyy-MM-dd");
+    Logger.log(`📅 Target: ${todayStr} | Total lisensi: ${licenses.length}`);
+
+    let totalSent = 0;
+
+    licenses.forEach(lic => {
+        const clientName = colName !== -1 ? lic[colName] : "Unknown";
+        const status = colStatus !== -1 ? lic[colStatus] : "";
+        const sheetId = colSheetId !== -1 ? String(lic[colSheetId] || "").trim() : "";
+
+        const statusStr = String(status || "").trim().toUpperCase();
+        if (statusStr !== 'ACTIVE' || !sheetId) return;
+
+        try {
+            const ssClient = SpreadsheetApp.openById(sheetId);
+            const clientConfig = getConfigMap(ssClient);
+            const result = processClientNotification(ssClient, clientConfig, todayStr, 'Hari ini', 'reminder');
+            if (result.sent) totalSent++;
+            Logger.log(`   ✅ ${clientName}: ${result.sent ? 'Terkirim' : (result.reason || 'Gagal')}`);
+        } catch (e) {
+            Logger.log(`   ❌ ${clientName}: ${e.toString()}`);
+        }
+    });
+
+    Logger.log(`✅ FINISHED Reminders. Total terkirim: ${totalSent}`);
+}
+
+// ===================================================
+// 🌙 CRON MALAM: Kirim Laporan Harian (REPORT ONLY)
+// Setup Trigger: Time-driven > Day timer > 20:00-21:00
+// ===================================================
+function sendDailyReport() {
+    Logger.log("🚀 START: Sending Daily Report (Laporan Harian)...");
+    const ssAdmin = SpreadsheetApp.getActiveSpreadsheet();
+    const licenseSheet = ssAdmin.getSheetByName(SHEET_NAMES.LICENSES);
+    if (!licenseSheet) { Logger.log("❌ Error: License Sheet not found"); return; }
+
+    const data = licenseSheet.getDataRange().getValues();
+    const headers = data[0];
+    const licenses = data.slice(1);
+    
+    const colName = findColumnIndex(headers, ['client_name', 'nama_klien']);
+    const colStatus = findColumnIndex(headers, ['status']);
+    const colSheetId = findColumnIndex(headers, ['sheet_id', 'id_sheet']);
+
+    const today = new Date();
+    const todayStr = Utilities.formatDate(today, TIMEZONE, "yyyy-MM-dd");
+    Logger.log(`📅 Target: ${todayStr} | Total lisensi: ${licenses.length}`);
+
+    let totalSent = 0;
+
+    licenses.forEach(lic => {
+        const clientName = colName !== -1 ? lic[colName] : "Unknown";
+        const status = colStatus !== -1 ? lic[colStatus] : "";
+        const sheetId = colSheetId !== -1 ? String(lic[colSheetId] || "").trim() : "";
+
+        const statusStr = String(status || "").trim().toUpperCase();
+        if (statusStr !== 'ACTIVE' || !sheetId) return;
+
+        try {
+            const ssClient = SpreadsheetApp.openById(sheetId);
+            const clientConfig = getConfigMap(ssClient);
+            const result = processClientNotification(ssClient, clientConfig, todayStr, 'Hari ini', 'report');
+            if (result.sent) totalSent++;
+            Logger.log(`   ✅ ${clientName}: ${result.sent ? 'Terkirim' : (result.reason || 'Gagal')}`);
+        } catch (e) {
+            Logger.log(`   ❌ ${clientName}: ${e.toString()}`);
+        }
+    });
+
+    Logger.log(`✅ FINISHED Report. Total terkirim: ${totalSent}`);
+}
+
+// ===================================================
+// ⚠️ JALANKAN INI SEKALI UNTUK MUNCULKAN POPUP IZIN
+// ===================================================
+function forceAuth() {
+    UrlFetchApp.fetch("https://www.google.com");
+    MailApp.getRemainingDailyQuota();
+    Logger.log("Izin Berhasil Diberikan!");
+}
+
+// ===================================================
+// 🧪 TEST: Kirim notifikasi ke SEMUA klien SEKARANG
+// Pakai tanggal HARI INI (bukan besok)
+// ===================================================
+function testDailyReminderNow() {
+    Logger.log("🧪 === TEST MODE: Checking ALL Clients NOW ===");
+    const ssAdmin = SpreadsheetApp.getActiveSpreadsheet();
+    const licenseSheet = ssAdmin.getSheetByName(SHEET_NAMES.LICENSES);
+    if (!licenseSheet) { Logger.log("❌ Tab Licenses tidak ditemukan!"); return; }
+
+    const licenses = licenseSheet.getDataRange().getValues().slice(1);
+    Logger.log(`📋 Total lisensi: ${licenses.length}`);
+
+    const today = new Date();
+    const todayStr = Utilities.formatDate(today, TIMEZONE, "yyyy-MM-dd");
+    Logger.log(`📅 Tanggal hari ini: ${todayStr}`);
+
+    let totalSent = 0;
+
+    licenses.forEach((lic, idx) => {
+        const key = lic[0];
+        const clientName = lic[2];
+        const status = lic[5];
+        const sheetId = lic[6];
+
+        Logger.log(`\n--- [${idx + 1}] Klien: ${clientName} | Key: ${key} ---`);
+        Logger.log(`   Status: ${status} | SheetID: ${sheetId || 'KOSONG'}`);
+
+        const statusStr = String(status || "").trim().toUpperCase();
+        if (statusStr !== 'ACTIVE') { Logger.log("   ⏭️ Skip: Status bukan ACTIVE"); return; }
+        if (!sheetId) { Logger.log("   ⏭️ Skip: Sheet ID kosong"); return; }
+
+        try {
+            const ssClient = SpreadsheetApp.openById(sheetId);
+            Logger.log(`   ✅ Sheet berhasil dibuka: ${ssClient.getName()}`);
+
+            const clientConfig = getConfigMap(ssClient);
+            const tgToken = clientConfig.get('TELEGRAM_TOKEN');
+            const tgChatId = clientConfig.get('TELEGRAM_CHAT_ID');
+            Logger.log(`   🔑 Token: ${tgToken ? 'ADA' : 'Global'} | 💬 ChatID: ${tgChatId || 'KOSONG'}`);
+
+            if (!tgChatId) { Logger.log("   ⏭️ Skip: Chat ID tidak diset"); return; }
+
+            // Proses notifikasi hari ini
+            const result = processClientNotification(ssClient, clientConfig, todayStr, 'Hari ini');
+
+            if (result.sent) {
+                totalSent++;
+            } else if (result.reason === 'no_appointments') {
+                // Tetap kirim test message walau tidak ada jadwal
+                Logger.log("   ℹ️ Tidak ada jadwal. Mengirim TEST message...");
+                const testMsg = `🧪 TEST NOTIFIKASI\n\nHalo ${clientName}!\nKoneksi Telegram BERHASIL!\nWaktu: ${Utilities.formatDate(new Date(), TIMEZONE, "dd MMM yyyy HH:mm:ss")}\n\nTidak ada jadwal hari ini, tapi notifikasi berfungsi dengan baik. ✅`;
+                const res = sendTelegram(tgToken, tgChatId, testMsg);
+                Logger.log(`   📤 Test message sent? ${res}`);
+                if (res) totalSent++;
+            }
+        } catch (e) {
+            Logger.log(`   ❌ ERROR: ${e.toString()}`);
+        }
+    });
+
+    Logger.log(`\n🏁 === SELESAI === Total terkirim: ${totalSent}/${licenses.length}`);
+}
+

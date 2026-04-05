@@ -1,0 +1,157 @@
+/**
+ * ERM FISIOTA BACKEND - ARCHIVE MANAGER
+ * Handles CRUD operations for the License_Archives table.
+ */
+
+function addArchiveMapping(licenseKey, year, sheetId, clientNameParam) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.LICENSE_ARCHIVES);
+    if (!sheet) throw new Error("Tab License_Archives tidak ditemukan di Master.");
+
+    // --- 1. Cari Nama Klinik (Client Name) ---
+    let clientName = clientNameParam || "";
+    
+    // Jika clientName belum ada (misal panggilang lama), coba cari dari License Key
+    if (!clientName) {
+        const licSheet = ss.getSheetByName(SHEET_NAMES.LICENSES);
+        if (licSheet) {
+            const licData = licSheet.getDataRange().getValues();
+            const h = licData[0];
+            const colLicKey = findColumnIndex(h, ['key', 'license_key']);
+            const colLicClient = findColumnIndex(h, ['client_name', 'nama_klien']);
+            
+            if (colLicKey !== -1 && colLicClient !== -1) {
+                for (let i = 1; i < licData.length; i++) {
+                    if (String(licData[i][colLicKey]).trim() === String(licenseKey).trim()) {
+                        clientName = String(licData[i][colLicClient]).trim();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Jika masih tidak ketemu, cek apakah clinicNameParam (jika ada) terdaftar di Licenses
+    // Ini menangani kasus License Key sudah berubah tapi Nama Klinik tetap sama.
+    if (!clientName) {
+        throw new Error("Gagal mengidentifikasi Nama Klinik. Pastikan lisensi sudah terdaftar di tab Licenses.");
+    }
+
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0];
+    
+    // Normalisasi headers untuk pencarian robust
+    const normalize = (s) => String(s || "").toLowerCase().replace(/[\s_]/g, "");
+    const hNorm = headers.map(normalize);
+
+    let colClient = hNorm.indexOf("clientname");
+    let colKey = hNorm.indexOf("licensekey");
+    let colYear = hNorm.indexOf("year");
+    let colSheetId = hNorm.indexOf("sheetid");
+    let colUpdate = hNorm.indexOf("updatedat");
+
+    if (colYear === -1 || colSheetId === -1) {
+        throw new Error("Struktur kolom License_Archives tidak valid (Wajib ada year dan sheet_id).");
+    }
+
+    // --- 2. Cek Unik berdasarkan Nama Klinik + Tahun ---
+    let foundRow = -1;
+    // Hanya bisa cek unik kalau kolom Client Name ada
+    if (colClient !== -1) {
+        for (let i = 1; i < data.length; i++) {
+            const rowClient = String(data[i][colClient] || "").toLowerCase().trim();
+            const rowYear = String(data[i][colYear] || "").trim();
+            
+            if (rowClient === clientName.toLowerCase() && rowYear === String(year).trim()) {
+                foundRow = i + 1;
+                break;
+            }
+        }
+    }
+
+    const timestamp = new Date();
+
+    if (foundRow !== -1) {
+        // Update existing
+        if (colSheetId !== -1) sheet.getRange(foundRow, colSheetId + 1).setValue(sheetId);
+        if (colKey !== -1) sheet.getRange(foundRow, colKey + 1).setValue(licenseKey);
+        if (colUpdate !== -1) sheet.getRange(foundRow, colUpdate + 1).setValue(timestamp);
+        if (colClient !== -1) sheet.getRange(foundRow, colClient + 1).setValue(clientName);
+    } else {
+        // Add new row (Gunakan array sepanjang headers asli agar tidak geser)
+        const newRow = new Array(headers.length).fill("");
+        if (colClient !== -1) newRow[colClient] = clientName;
+        if (colYear !== -1) newRow[colYear] = year;
+        if (colSheetId !== -1) newRow[colSheetId] = sheetId;
+        if (colUpdate !== -1) newRow[colUpdate] = timestamp;
+        
+        sheet.appendRow(newRow);
+    }
+
+    // --- 3. Sort supaya rapi per Klinik ---
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+        const sortRange = sheet.getRange(2, 1, lastRow - 1, headers.length);
+        const sortCols = [
+            { column: colClient + 1, ascending: true }, // Urut Nama Klinik A-Z
+            { column: colYear + 1, ascending: false }   // Tahun terbaru di atas
+        ];
+        sortRange.sort(sortCols);
+    }
+
+    return { status: 'success', message: 'Mapping arsip untuk ' + clientName + ' berhasil disimpan.' };
+}
+
+function deleteArchiveMapping(licenseKey, year, clientNameParam) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.LICENSE_ARCHIVES);
+    if (!sheet) throw new Error("Tab License_Archives tidak ditemukan.");
+
+    // --- 1. Cari Nama Klinik ---
+    let clientName = clientNameParam || "";
+    
+    // Jika clientNameParam kosong, baru cari dari License Key
+    if (!clientName) {
+        const licSheet = ss.getSheetByName(SHEET_NAMES.LICENSES);
+        if (licSheet) {
+            const licData = licSheet.getDataRange().getValues();
+            const h = licData[0];
+            const colLicKey = findColumnIndex(h, ['key', 'license_key']);
+            const colLicClient = findColumnIndex(h, ['client_name', 'nama_klien']);
+            
+            if (colLicKey !== -1 && colLicClient !== -1) {
+                for (let i = 1; i < licData.length; i++) {
+                    if (String(licData[i][colLicKey]).trim() === String(licenseKey).trim()) {
+                        clientName = String(licData[i][colLicClient]).trim();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!clientName) throw new Error("Gagal mengidentifikasi Nama Klinik untuk penghapusan.");
+
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0];
+    const colClient = findColumnIndex(headers, ['client_name', 'nama_klien']);
+    const colYear = findColumnIndex(headers, ['year', 'tahun']);
+
+    if (colClient === -1 || colYear === -1) throw new Error("Kolom pencarian arsip tidak ditemukan.");
+
+    let deleted = false;
+    for (let i = data.length - 1; i >= 1; i--) {
+        // Hapus berdasarkan Nama Klinik + Tahun (lebih stabil daripada rely on Key)
+        if (String(data[i][colClient]).toLowerCase().trim() === clientName.toLowerCase() && 
+            String(data[i][colYear]).trim() === String(year).trim()) {
+            sheet.deleteRow(i + 1);
+            deleted = true;
+        }
+    }
+
+    if (deleted) {
+        return { status: 'success', message: 'Arsip ' + year + ' berhasil dihapus.' };
+    } else {
+        throw new Error("Data arsip tidak ditemukan.");
+    }
+}
