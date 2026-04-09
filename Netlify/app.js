@@ -551,15 +551,20 @@ async function checkLicense(silent = false) {
         state.scriptUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
         state.sheetId = state.sheetId || localStorage.getItem('erm_sheet_id') || getSheetIdFromUrl(state.scriptUrl);
         
-        // [FIX] Ensure booking config is loaded from storage during cache hit
-        state.bookingConfig.alias = localStorage.getItem('erm_booking_alias') || "";
-        state.bookingConfig.availableHours = localStorage.getItem('erm_booking_hours') || "";
-        state.bookingConfig.offDays = localStorage.getItem('erm_booking_off_days') || "";
-        state.bookingConfig.customHolidays = localStorage.getItem('erm_booking_holidays') || "";
+        // [FIX] Only overwrite state if value actually exists in localStorage
+        const lAlias = localStorage.getItem('erm_booking_alias');
+        const lHours = localStorage.getItem('erm_booking_hours');
+        const lOff = localStorage.getItem('erm_booking_off_days');
+        const lHol = localStorage.getItem('erm_booking_holidays');
+        const lDayCfg = localStorage.getItem('erm_booking_day_config');
+
+        if (lAlias) state.bookingConfig.alias = lAlias;
+        if (lHours) state.bookingConfig.availableHours = lHours;
+        if (lOff) state.bookingConfig.offDays = lOff;
+        if (lHol) state.bookingConfig.customHolidays = lHol;
         
-        const dayCfgStr = localStorage.getItem('erm_booking_day_config');
-        if (dayCfgStr) {
-            try { state.bookingConfig.dayConfig = JSON.parse(dayCfgStr); } catch(e) {}
+        if (lDayCfg) {
+            try { state.bookingConfig.dayConfig = JSON.parse(lDayCfg); } catch(e) {}
         }
         
         return { valid: true };
@@ -7841,7 +7846,9 @@ function populateBookingFieldsFromState() {
 
     // [ROBUST] Default Hours (Checkboxes)
     const DEFAULT_HOURS = '08:00,09:00,10:00,11:00,13:00,14:00,15:00,16:00';
-    const savedHours = (state.bookingConfig.availableHours || DEFAULT_HOURS).split(',').map(h => h.trim());
+    const rawHours = state.bookingConfig.availableHours || DEFAULT_HOURS;
+    const savedHours = rawHours.split(',').map(h => h.trim());
+    
     document.querySelectorAll('.booking-hour-check').forEach(chk => {
         chk.checked = savedHours.includes(chk.value.trim());
     });
@@ -7860,7 +7867,11 @@ function populateBookingFieldsFromState() {
         const slt = document.getElementById(`adv-day-slots-${i}`);
         
         if (chk) chk.checked = dayCfg.active !== false;
-        if (hrs) hrs.value = dayCfg.hours || '';
+        if (hrs) {
+            // Clean up potentially messy space-separated hours from Master Sheet
+            const cleanedHrs = (dayCfg.hours || '').split(',').map(h => h.trim()).filter(h => h).join(', ');
+            hrs.value = cleanedHrs;
+        }
         if (slt) slt.value = dayCfg.slots || 1;
     }
     
