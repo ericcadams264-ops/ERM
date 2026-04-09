@@ -2499,7 +2499,12 @@ async function backgroundAutoSync() {
                 state.appointments = deduplicateAppointments(mergeArr(state.appointments || [], data.appointments, 'appointments'));
                 if (data.expenses) state.expenses = mergeArr(state.expenses || [], data.expenses, 'expenses');
                 if (data.packages) state.packages = mergeArr(state.packages || [], data.packages, 'packages');
-                if (data.treatments) state.treatments = mergeArr(state.treatments || [], data.treatments, 'treatments');
+                
+                if (data.treatments) {
+                    // Filter out empty-named treatments from server
+                    const cleanTreatments = (data.treatments || []).filter(t => t && t.name && t.name.trim() !== "");
+                    state.treatments = mergeArr(state.treatments || [], cleanTreatments, 'treatments');
+                }
                 if (data.protocols) state.protocols = mergeArr(state.protocols || [], data.protocols, 'protocols');
                 if (data.users) state.users = mergeArr(state.users || [], data.users, 'users');
             }
@@ -5039,8 +5044,10 @@ function renderModalitySuggestions() {
 function renderModalitySuggestionsOnly() {
     if (!state.treatments || state.treatments.length === 0) return '';
     
-    // Sort so common ones like IR/US appear first if short names
-    const list = [...state.treatments].sort((a,b) => a.name.length - b.name.length);
+    // Clean & Sort so common ones like IR/US appear first if short names
+    const list = [...state.treatments]
+        .filter(t => t && t.name && t.name.trim() !== "")
+        .sort((a,b) => a.name.length - b.name.length);
     const selected = window.tempFormData.intervention || [];
 
     const buttons = list.map(t => {
@@ -11469,10 +11476,17 @@ async function saveTreatment() {
     const name = form.querySelector('[name="name"]').value.trim();
     const price = parseInt(form.querySelector('[name="price"]').value) || 0;
 
-    if (!name) { alert('Nama tindakan harus diisi!'); return; }
+    if (!name) { 
+        updateSyncStatusUI(false); 
+        alert('Nama tindakan harus diisi!'); 
+        return; 
+    }
 
     const item = { id: id || 'TND-' + Date.now(), name, price, updatedAt: getServerTimeISO(), _dirty: true };
     if (!state.treatments) state.treatments = [];
+    
+    // Clean existing state from any accidentally saved empties
+    state.treatments = (state.treatments || []).filter(t => t && t.name && t.name.trim() !== "");
 
     if (id) {
         const idx = state.treatments.findIndex(x => x.id === id);
