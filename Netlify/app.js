@@ -676,10 +676,23 @@ async function checkLicense(silent = false) {
                     
                     if (bDayCfg) {
                         try {
-                            const parsed = typeof bDayCfg === 'string' ? JSON.parse(bDayCfg) : bDayCfg;
+                            // [BULLETPROOF] Sanitize string before parsing
+                            let cleanJson = typeof bDayCfg === 'string' ? bDayCfg.trim() : JSON.stringify(bDayCfg);
+                            // Handle cases where Excel might have double-escaped or added weird quotes
+                            if (cleanJson.startsWith('"') && cleanJson.endsWith('"') && cleanJson.length > 2) {
+                                cleanJson = cleanJson.substring(1, cleanJson.length - 1).replace(/\\"/g, '"');
+                            }
+                            const parsed = JSON.parse(cleanJson);
                             state.bookingConfig.dayConfig = parsed;
                             localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
-                        } catch (e) { console.error("DayConfig Parse Error", e); }
+                        } catch (e) { 
+                            console.error("DayConfig Parse Error from Master:", e); 
+                            // Try one last attempt at raw assignment if it's already an object
+                            if (typeof bDayCfg === 'object' && bDayCfg !== null) {
+                                state.bookingConfig.dayConfig = bDayCfg;
+                                localStorage.setItem('erm_booking_day_config', JSON.stringify(bDayCfg));
+                            }
+                        }
                     }
                 }
 
@@ -2475,10 +2488,18 @@ async function backgroundAutoSync() {
                     }
                     if (isDayConfig && v) {
                         try {
-                            const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+                            let cleanJson = typeof v === 'string' ? v.trim() : JSON.stringify(v);
+                            if (cleanJson.startsWith('"') && cleanJson.endsWith('"') && cleanJson.length > 2) {
+                                cleanJson = cleanJson.substring(1, cleanJson.length - 1).replace(/\\"/g, '"');
+                            }
+                            const parsed = JSON.parse(cleanJson);
                             state.bookingConfig.dayConfig = parsed;
                             localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
-                        } catch (e) { }
+                        } catch (e) { 
+                             if (typeof v === 'object' && v !== null) {
+                                state.bookingConfig.dayConfig = v;
+                             }
+                        }
                     }
 
                     // Notif
@@ -7863,24 +7884,30 @@ function populateBookingFieldsFromState() {
         chk.checked = savedOff.includes(chk.value.trim());
     });
 
+    // [ROBUST] Ensure dayConfig is an object before loop
+    let dCfg = state.bookingConfig.dayConfig;
+    if (typeof dCfg === 'string') {
+        try { dCfg = JSON.parse(dCfg); } catch(e) { dCfg = {}; }
+    }
+    if (!dCfg || typeof dCfg !== 'object') dCfg = {};
+
     // [FIXED] Update Advanced Table - Support both string and number keys
     for (let i = 0; i < 7; i++) {
         // Try to get data with both number i and string i
-        const dayCfg = (state.bookingConfig.dayConfig && (state.bookingConfig.dayConfig[i] || state.bookingConfig.dayConfig[String(i)])) 
-                       || { active: true, hours: '', slots: 1 };
+        const dayData = dCfg[i] || dCfg[String(i)] || { active: true, hours: '', slots: 1 };
                        
         const chk = document.getElementById(`adv-day-active-${i}`);
         const hrs = document.getElementById(`adv-day-hours-${i}`);
         const slt = document.getElementById(`adv-day-slots-${i}`);
         
-        if (chk) chk.checked = dayCfg.active !== false;
+        if (chk) chk.checked = dayData.active !== false;
         if (hrs) {
             // Clean up potentially messy space-separated hours from Master Sheet
-            const raw = dayCfg.hours || '';
+            const raw = dayData.hours || '';
             const cleanedHrs = raw.split(',').map(h => h.trim()).filter(h => h).join(', ');
             hrs.value = cleanedHrs;
         }
-        if (slt) slt.value = dayCfg.slots || 1;
+        if (slt) slt.value = dayData.slots || 1;
     }
     
     // Update Holidays
