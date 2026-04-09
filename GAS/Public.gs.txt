@@ -27,27 +27,32 @@ function handlePublicBooking(e, data) {
             const licData = licSheet.getDataRange().getValues();
             const licHeaders = licData[0].map(h => String(h).toLowerCase().replace(/\s/g,''));
             const colSheetId = licHeaders.indexOf('sheetid');
-            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config', 'jadwal']);
+            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config', 'jadwal', 'advancedaturjam', 'konfigurasijam', 'slot']);
             
             let rowIdx = -1;
             for(let i=1; i<licData.length; i++) {
-                if(String(licData[i][colSheetId]).trim() === currentSheetId) { rowIdx = i; break; }
+                // Match by checking if the sheet_id column contains our ID
+                if(String(licData[i][colSheetId] || "").trim().includes(currentSheetId)) { rowIdx = i; break; }
             }
             
             if (rowIdx !== -1 && colDayConfig !== -1) {
                 const rawCfg = licData[rowIdx][colDayConfig];
-                const dayConfig = typeof rawCfg === 'string' ? JSON.parse(rawCfg) : rawCfg;
-                
-                // [FIX] Robust Date Parsing
-                const dateParts = data.date.split('-');
-                const d = new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0); 
-                const dayIdx = d.getDay();
-                
-                const configItem = dayConfig[String(dayIdx)] || dayConfig[Number(dayIdx)];
-                if (configItem && (configItem.slots || configItem.slots === 0)) {
-                    slotsPerTime = Number(configItem.slots) || 1;
-                    Logger.log(`[handlePublicBooking] Advanced Slots found for day ${dayIdx}: ${slotsPerTime}`);
+                if (rawCfg) {
+                    const dayConfig = typeof rawCfg === 'string' ? JSON.parse(rawCfg) : rawCfg;
+                    
+                    // [FIX] Robust Date Parsing
+                    const dateParts = data.date.split('-');
+                    const d = new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0); 
+                    const dayIdx = d.getDay();
+                    
+                    const configItem = dayConfig[String(dayIdx)] || dayConfig[Number(dayIdx)];
+                    if (configItem && (configItem.slots || configItem.slots === 0)) {
+                        slotsPerTime = Number(configItem.slots) || 1;
+                        Logger.log(`[handlePublicBooking] Advanced Slots found for day ${dayIdx}: ${slotsPerTime}`);
+                    }
                 }
+            } else {
+                Logger.log(`[handlePublicBooking] DEBUG: rowIdx=${rowIdx}, colDayConfig=${colDayConfig}`);
             }
         }
     } catch(e) { Logger.log("Error checking master slots: " + e); }
@@ -76,7 +81,11 @@ function handlePublicBooking(e, data) {
         }
 
         if (filledSlots >= slotsPerTime) {
-            return createJSONOutput({ status: "error", message: `Maaf, kuota untuk jam ${data.time} (${slotsPerTime} slot) sudah penuh.` });
+            return createJSONOutput({ 
+                status: "error", 
+                message: `Maaf, kuota untuk jam ${data.time} (${slotsPerTime} slot) sudah penuh.`,
+                debug: `Slots: ${slotsPerTime}, Filled: ${filledSlots}, RowIdx: ${rowIdx || -1}`
+            });
         }
     }
 
