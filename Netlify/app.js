@@ -7891,14 +7891,24 @@ function populateBookingFieldsFromState() {
 async function switchConfigTab(tabName) {
     state.activeConfigTab = tabName;
     
-    // [AUTO-SYNC] Tarik data Master terbaru saat buka tab booking/license
+    // [BACKGROUND SYNC] Trigger Master sync without blocking the UI
     if (tabName === 'booking' || tabName === 'license') {
         if (typeof checkLicense === 'function') {
-            await checkLicense();
-            // [FORCE RE-RENDER] After Master sync, we MUST refresh the UI content
-            if (state.currentView === 'config') {
-                renderConfigView(document.getElementById('main-content'), tabName);
-            }
+            // Kick off the sync in background
+            checkLicense().then(result => {
+                // Once data is ready, surgically update UI if we are STILL on the same tab
+                if (state.currentView === 'config' && state.activeConfigTab === tabName) {
+                    if (tabName === 'booking') {
+                        populateBookingFieldsFromState();
+                    }
+                    if (tabName === 'license') {
+                        const expiryText = document.getElementById('license-expiry-text');
+                        const savedExpiry = localStorage.getItem('erm_license_expiry');
+                        if (expiryText && savedExpiry) expiryText.innerText = savedExpiry;
+                        updateLicenseCountdown(); 
+                    }
+                }
+            }).catch(e => console.error("Background Sync Error:", e));
         }
     }
 
