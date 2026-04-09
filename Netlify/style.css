@@ -1,4 +1,11 @@
 /* --- UTILITIES & ANIMATION --- */
+
+/* Smooth sidebar push transition for main content wrapper */
+#main-wrapper {
+  transition: margin-left 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+
 .modal-scroll::-webkit-scrollbar {
   width: 6px;
 }
@@ -123,6 +130,31 @@ body.is-bg-refresh .fade-in {
 
 .calendar-day.today {
   background-color: #eff6ff;
+  border: 1px solid #3b82f6;
+}
+
+/* Responsive Grid for Calendar */
+@media screen and (max-width: 640px) {
+  .calendar-day-cell {
+    min-height: 80px !important;
+    padding: 4px !important;
+  }
+  .calendar-day-cell span.text-sm {
+    font-size: 10px !important;
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: NONE;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.horizontal-scroll-container {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* =========================================
@@ -497,4 +529,12 @@ body.print-relaxed .gap-6 {
   50% {
     opacity: .7;
   }
+}
+/* --- MOBILE RESPONSIVE FIXES --- */
+@media screen and (max-width: 640px) {
+    #page-title { font-size: 1rem !important; line-height: 1.2; max-width: 180px; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+    .qualifier-group { display: flex !important; flex-wrap: wrap !important; gap: 4px !important; }
+    .qualifier-btn { padding: 4px 8px !important; font-size: 10px !important; min-width: 32px; }
+    .advanced-table-container { overflow-x: auto !important; -webkit-overflow-scrolling: touch; }
+    .advanced-table-container table { min-width: 450px; }
 }

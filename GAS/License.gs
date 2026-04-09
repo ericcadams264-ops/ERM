@@ -113,10 +113,12 @@ function verifyLicense(keyInput, clientSheetId) {
     const colClient = findColumnIndex(headers, ['client_name', 'nama_klien', 'klien']);
     const colExpiry = findColumnIndex(headers, ['expires_at', 'expired_at', 'berlaku_sampai']);
     const colStatus = findColumnIndex(headers, ['status', 'status_lisensi']);
-    const colSheetId = findColumnIndex(headers, ['sheet_id', 'id_sheet']);
-    const colAlias = findColumnIndex(headers, ['alias', 'alias_klinik']);
-    const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'aviliasi']);
-    const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur']);
+    const colSheetId = findColumnIndex(headers, ['sheet_id', 'id_sheet', 'sheetid']);
+    const colAlias = findColumnIndex(headers, ['alias', 'alias_klinik', 'booking_id', 'id_booking']);
+    const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'aviliasi', 'hours']);
+    const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur', 'libur']);
+    const colCustomHolidays = findColumnIndex(headers, ['custom_holidays', 'libur_kustom', 'tanggal_libur', 'holiday']);
+    const colDayConfig = findColumnIndex(headers, ['day_config', 'day config', 'config_hari']);
 
     if (colKey === -1 || colStatus === -1) {
         return { valid: false, message: "Struktur kolom Master License tidak valid (Key/Status tidak ditemukan)." };
@@ -134,9 +136,11 @@ function verifyLicense(keyInput, clientSheetId) {
                 expires: colExpiry !== -1 ? data[i][colExpiry] : "",
                 status: data[i][colStatus],
                 sheetId: colSheetId !== -1 ? data[i][colSheetId] : "",
-                alias: colAlias !== -1 ? data[i][colAlias] : "",
-                available_hours: colHours !== -1 ? data[i][colHours] : "",
-                off_days: colOffDays !== -1 ? data[i][colOffDays] : ""
+                alias: colAlias !== -1 ? String(data[i][colAlias]).trim() : "",
+                available_hours: colHours !== -1 ? String(data[i][colHours]).trim() : "",
+                off_days: colOffDays !== -1 ? data[i][colOffDays] : "",
+                custom_holidays: colCustomHolidays !== -1 ? data[i][colCustomHolidays] : "",
+                day_config: colDayConfig !== -1 ? data[i][colDayConfig] : "{}"
             };
             foundRow = i + 1;
             break;
@@ -197,6 +201,7 @@ function verifyLicense(keyInput, clientSheetId) {
         available_hours: (found.available_hours === 0 || found.available_hours) ? String(found.available_hours) : "",
         off_days: (found.off_days === 0 || found.off_days) ? String(found.off_days) : "",
         custom_holidays: (found.custom_holidays === 0 || found.custom_holidays) ? String(found.custom_holidays) : "",
+        day_config: found.day_config || "{}",
         archives: myArchives
     };
 }

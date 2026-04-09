@@ -204,14 +204,14 @@ function buildReminderMessages(appointments, patientMap, dateStr, clinicInfo, co
     reminder += `👥 Total: ${appointments.length} Pasien\n\n`;
 
     appointments.forEach((a, index) => {
-        const p = patientMap.get(a.patientId) || { name: 'Unknown', phone: '', category: 'Umum', diagnosis: '-' };
+        const p = patientMap.get(a.patientid) || { name: 'Unknown', phone: '', category: 'Umum', diagnosis: '-' };
         
         // 1. FILTER: HANYA HITUNG YANG TIDAK BATAL (Sesuai Dashboard & Kasir)
         const appStatus = String(a.status || "").toUpperCase();
         const isCancelled = appStatus === 'CANCELLED' || appStatus === 'REJECTED';
         
         // 2. LOGIKA BIAYA: PRIORITAS finalAmount (Setelah Diskon) -> fee -> defaultFee
-        const rawFee = a.finalAmount || a.fee || p.defaultFee || "0";
+        const rawFee = a.finalamount || a.fee || p.defaultfee || "0";
         const fee = parseFloat(String(rawFee).replace(/[^\d]/g, "")) || 0;
         
         if (!isCancelled) {
@@ -296,7 +296,7 @@ function buildReminderMessages(appointments, patientMap, dateStr, clinicInfo, co
 function buildEmailHtml(appointments, patientMap, dateIndo) {
     let htmlRows = '';
     appointments.forEach(a => {
-        const p = patientMap.get(a.patientId) || { name: 'Unknown', category: '-', diagnosis: '-' };
+        const p = patientMap.get(a.patientid) || { name: 'Unknown', category: '-', diagnosis: '-' };
         htmlRows += `
             <tr style="border-bottom: 1px solid #e2e8f0;">
                 <td style="padding: 12px; font-weight: bold; color: #1e293b; width: 80px;">${a.time}</td>
@@ -566,5 +566,166 @@ function testDailyReminderNow() {
     });
 
     Logger.log(`\n🏁 === SELESAI === Total terkirim: ${totalSent}/${licenses.length}`);
+}
+
+// --- HASIL INTEGRASI GOOGLE CALENDAR ---
+function syncEventToGoogleCalendar(configMap, apptObj, patientObj, therapistName, statusStr) {
+    const refreshToken = configMap.get('GOOGLE_CALENDAR_REFRESH_TOKEN');
+    if (!refreshToken) return;
+    try {
+        const tokenUrl = 'https://oauth2.googleapis.com/token';
+        const options = {
+            method: 'post',
+            payload: {
+                client_id: OAUTH_CLIENT_ID,
+                client_secret: OAUTH_CLIENT_SECRET,
+                refresh_token: refreshToken,
+                grant_type: 'refresh_token'
+            },
+            muteHttpExceptions: true
+        };
+        const res = UrlFetchApp.fetch(tokenUrl, options);
+        const data = JSON.parse(res.getContentText());
+        
+        if (!data.access_token) {
+            Logger.log('Gagal refresh token Calendar: ' + JSON.stringify(data));
+            return;
+        }
+        
+        // 1. Tentukan Event Data
+        const dateArr = String(apptObj.date).split('-');
+        if (dateArr.length < 3) return;
+        const d = String(dateArr[2]).padStart(2, '0');
+        const m = String(dateArr[1]).padStart(2, '0');
+        const y = dateArr[0];
+        
+        const tStr = String(apptObj.time || "00:00").replace('.', ':');
+        const startTimeStr = `${y}-${m}-${d}T${tStr}:00+07:00`;
+        
+        let startT = new Date(y, Number(m)-1, d, Number(tStr.split(':')[0]), Number(tStr.split(':')[1]), 0);
+        let endT = new Date(startT.getTime() + 60 * 60 * 1000); // 1 Hour Default
+        let endTimeStr = Utilities.formatDate(endT, TIMEZONE, "yyyy-MM-dd'T'HH:mm:ssXXX");
+
+        let colorId = '9'; // Default: Blue
+        let summary = 'Sesi Terapi: ' + (patientObj.name || "Pasien");
+        statusStr = String(statusStr || 'PENDING').toUpperCase();
+
+        if(statusStr === 'CANCELLED' || statusStr === 'BATAL') { 
+            summary = '[BATAL] ' + summary; 
+            colorId = '11'; // Red
+        } else if(statusStr === 'COMPLETED' || statusStr === 'SELESAI') { 
+            summary = '[SELESAI] ' + summary; 
+            colorId = '2'; // Green
+        } else if(statusStr === 'CONFIRMED' || statusStr === 'PENDING') {
+            colorId = '9'; // Blue
+        }
+
+        // 2. DEDUPLICATION KEY: Use Appointment ID
+        // Format: apt_ID@fisiota.local (must be globally unique for the user's primary calendar)
+        const iCalUID = `apt_${apptObj.id}@fisiota.local`;
+
+        const evPayload = {
+            summary: summary,
+            description: 'Terapis: ' + therapistName + '\nHp: ' + (patientObj.phone || '-') + '\nID: ' + apptObj.id,
+            start: { dateTime: startTimeStr, timeZone: TIMEZONE },
+            end: { dateTime: endTimeStr, timeZone: TIMEZONE },
+            colorId: colorId,
+            iCalUID: iCalUID // <--- This prevents duplicate insertions
+        };
+
+        // 3. Panggil API IMPORT (which effectively does an UPSERT based on iCalUID)
+        const calUrl = 'https://www.googleapis.com/calendar/v3/calendars/primary/events/import';
+        const calOptions = {
+            method: 'post',
+            headers: { Authorization: 'Bearer ' + data.access_token },
+            contentType: 'application/json',
+            payload: JSON.stringify(evPayload),
+            muteHttpExceptions: true
+        };
+        const calRes = UrlFetchApp.fetch(calUrl, calOptions);
+        const calData = JSON.parse(calRes.getContentText());
+        
+        Logger.log('Event Calendar Sync: ' + (calData.htmlLink || 'OK - ' + iCalUID));
+    } catch (e) {
+        Logger.log('Gagal sync ke kalender: ' + e);
+    }
+}
+
+/**
+ * MENGHAPUS EVENT DARI GOOGLE CALENDAR (saat Jadwal dihapus di PWA)
+ */
+function deleteEventFromGoogleCalendar(configMap, apptId) {
+    const refreshToken = configMap.get('GOOGLE_CALENDAR_REFRESH_TOKEN');
+    if (!refreshToken) return;
+    try {
+        const tokenUrl = 'https://oauth2.googleapis.com/token';
+        const options = {
+            method: 'post',
+            payload: {
+                client_id: OAUTH_CLIENT_ID,
+                client_secret: OAUTH_CLIENT_SECRET,
+                refresh_token: refreshToken,
+                grant_type: 'refresh_token'
+            },
+            muteHttpExceptions: true
+        };
+        const res = UrlFetchApp.fetch(tokenUrl, options);
+        const data = JSON.parse(res.getContentText());
+        
+        if (!data.access_token) {
+            Logger.log('Gagal refresh token Calendar (Delete): ' + JSON.stringify(data));
+            return;
+        }
+
+        // 1. DEDUPLICATION KEY (iCalUID format)
+        const iCalUID = `apt_${apptId}@fisiota.local`;
+        Logger.log(`[DeleteCalendar] Attempting delete for UID: ${iCalUID} (ID: ${apptId})`);
+
+        // 2. PRIMARY SEARCH: Using exact iCalUID
+        const searchUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events?iCalUID=${iCalUID}`;
+        const searchOptions = {
+            method: 'get',
+            headers: { Authorization: 'Bearer ' + data.access_token },
+            muteHttpExceptions: true
+        };
+        const searchRes = UrlFetchApp.fetch(searchUrl, searchOptions);
+        let searchData = JSON.parse(searchRes.getContentText());
+
+        let eventsToDelete = searchData.items || [];
+
+        // 3. FALLBACK SEARCH: If not found via iCalUID, search by Query (Appointment ID in description)
+        if (eventsToDelete.length === 0) {
+            Logger.log(`[DeleteCalendar] iCalUID search returned 0 items. Trying query-based fallback for ID: ${apptId}`);
+            const queryUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events?q=${apptId}`;
+            const queryRes = UrlFetchApp.fetch(queryUrl, searchOptions);
+            searchData = JSON.parse(queryRes.getContentText());
+            eventsToDelete = searchData.items || [];
+        }
+
+        // 4. ACTION: Delete found events
+        if (eventsToDelete.length > 0) {
+            eventsToDelete.forEach(event => {
+                const eventId = event.id;
+                const desc = String(event.description || "");
+                // CRITICAL SAFETY: Ensure the specific ID exists in the description to prevent accidental deletion
+                if (desc.indexOf(apptId) > -1 || (event.iCalUID && event.iCalUID === iCalUID)) {
+                    const deleteUrl = `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`;
+                    const deleteOptions = {
+                        method: 'delete',
+                        headers: { Authorization: 'Bearer ' + data.access_token },
+                        muteHttpExceptions: true
+                    };
+                    const delRes = UrlFetchApp.fetch(deleteUrl, deleteOptions);
+                    Logger.log(`[DeleteCalendar] Event ID: ${eventId} (UID: ${iCalUID}) deleted. Code: ${delRes.getResponseCode()}`);
+                } else {
+                    Logger.log(`[DeleteCalendar] Event ID: ${eventId} found via query but ID ${apptId} not verified in description. Skipping.`);
+                }
+            });
+        } else {
+            Logger.log(`[DeleteCalendar] No matching calendar event found for Appointment ID: ${apptId}`);
+        }
+    } catch (e) {
+        Logger.log('[DeleteCalendar] Gagal hapus event kalender: ' + e);
+    }
 }
 

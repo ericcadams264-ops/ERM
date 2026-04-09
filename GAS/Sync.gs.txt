@@ -18,8 +18,14 @@ function getSpreadsheet() {
     return SHEET_ID ? SpreadsheetApp.openById(SHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
 }
 
+function findSheetByName(ss, name) {
+    const sheets = ss.getSheets();
+    const target = String(name).toLowerCase().trim();
+    return sheets.find(s => s.getName().toLowerCase().trim() === target);
+}
+
 function getOrInsertSheet(ss, name, headers) {
-    let sheet = ss.getSheetByName(name);
+    let sheet = findSheetByName(ss, name);
     if (!sheet) {
         sheet = ss.insertSheet(name);
         sheet.appendRow(headers);
@@ -29,9 +35,13 @@ function getOrInsertSheet(ss, name, headers) {
 }
 
 function getDataFromSheet(ss, sheetName) {
-    const sheet = ss.getSheetByName(sheetName);
-    if (!sheet) return [];
+    const sheet = findSheetByName(ss, sheetName);
+    if (!sheet) {
+        Logger.log(`[getDataFromSheet] MISSING SHEET: ${sheetName}`);
+        return [];
+    }
     const rows = sheet.getDataRange().getValues();
+    Logger.log(`[getDataFromSheet] ${sheetName} found, rows: ${rows.length}`);
     if (rows.length < 2) return [];
     const headers = rows[0];
     const data = rows.slice(1);
@@ -39,29 +49,30 @@ function getDataFromSheet(ss, sheetName) {
         let obj = {};
         headers.forEach((h, i) => {
             let val = row[i];
-            if (h === 'date' || h === 'dob' || h === 'paidAt') {
+            const cleanKey = String(h || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (cleanKey === 'date' || cleanKey === 'dob' || cleanKey === 'paidat') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd");
                 }
             }
-            if (h === 'created_at' || h === 'updatedAt' || h === 'updated_at') {
+            if (cleanKey === 'createdat' || cleanKey === 'updatedat' || cleanKey === 'updated_at') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd HH:mm:ss");
                 }
             }
-            if (h === 'time') {
+            if (cleanKey === 'time') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "HH:mm");
                 }
             }
-            obj[h] = val;
+            obj[cleanKey] = val;
         });
         return obj;
     });
 }
 
 function getDeltaDataFromSheet(ss, sheetName, lastSyncStr, limit) {
-    const sheet = ss.getSheetByName(sheetName);
+    const sheet = findSheetByName(ss, sheetName);
     if (!sheet) return [];
     const rows = sheet.getDataRange().getValues();
     if (rows.length < 2) return [];
@@ -95,40 +106,47 @@ function getDeltaDataFromSheet(ss, sheetName, lastSyncStr, limit) {
         dataRows = dataRows.slice(dataRows.length - limit);
     }
     
+    const sheetHeaders = rows[0];
+    const norm = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
+    const sheetHeadersNorm = sheetHeaders.map(norm);
+    
     return dataRows.map(row => {
         let obj = {};
-        headers.forEach((h, i) => {
-            let val = row[i];
-            if (h === 'date' || h === 'dob' || h === 'paidAt') {
+        // If headers argument is provided (our expected headers), use it to map columns correctly
+        const targetHeaders = (typeof headers !== 'undefined' && Array.isArray(headers)) ? headers : sheetHeaders;
+        
+        targetHeaders.forEach((h) => {
+            const hNorm = norm(h);
+            const colIdx = sheetHeadersNorm.indexOf(hNorm);
+            if (colIdx === -1) return; // Skip if header not in sheet
+
+            let val = row[colIdx];
+            
+            if (hNorm === 'date' || hNorm === 'dob' || hNorm === 'paidat') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd");
                 }
             }
-            if (h === 'created_at' || h === 'updatedAt' || h === 'updated_at') {
+            if (hNorm === 'createdat' || hNorm === 'updatedat') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "yyyy-MM-dd HH:mm:ss");
                 }
             }
-            if (h === 'time') {
+            if (hNorm === 'time') {
                 if (val instanceof Date) {
                     val = Utilities.formatDate(val, TIMEZONE, "HH:mm");
                 }
             }
-            obj[h] = val;
+            obj[hNorm] = val;
         });
         return obj;
     });
 }
 
 function saveDataFixed(ss, name, data, headers) {
-    let sheet = getOrInsertSheet(ss, name, headers);
-    if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
-    if (!data || data.length === 0) return;
-    const rows = data.map(item => headers.map(k => {
-        let v = item[k];
-        return (typeof v === 'object') ? JSON.stringify(v) : (v || "");
-    }));
-    sheet.getRange(2, 1, rows.length, headers.length).setNumberFormat("@").setValues(rows);
+    // Use the smarter merge logic for assessments and other critical sheets
+    // This prevents clearing the entire sheet and respects existing columns
+    processIncrementalSync(ss, { [name.toLowerCase()]: data });
 }
 
 function updateConfigSheet(ss, configData) {
@@ -158,68 +176,179 @@ function updateConfigSheet(ss, configData) {
     });
 }
 
-
 function processIncrementalSync(ss, changes) {
     const merge = (sheetName, headersArr, incomingItems) => {
         if (!incomingItems || incomingItems.length === 0) return;
 
-        const sheet = getOrInsertSheet(ss, sheetName, headersArr);
-        if (!sheet) {
-            Logger.log(`[merge] Error: Could not get or create sheet ${sheetName}`);
-            return;
-        }
-        const values = sheet.getDataRange().getValues();
-        const sheetHeaders = values[0];
+        let sheet = getOrInsertSheet(ss, sheetName, headersArr);
+        if (!sheet) return;
+
+        // 1. Mandatory Header Alignment: Ensure ALL items in headersArr are present in the sheet
+        let lastCol = Math.max(1, sheet.getLastColumn());
+        let currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+        const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+        let currentHeadersNorm = currentHeaders.map(norm);
         
-        const norm = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
-        const sheetHeadersNorm = sheetHeaders.map(norm);
-        
-        const colIdIdx = findColumnIndex(sheetHeaders, ['id', 'patientId', 'key']);
-        const idIdx = colIdIdx !== -1 ? colIdIdx : 0;
-
-        const idMap = new Map();
-        for (let i = 1; i < values.length; i++) {
-            idMap.set(String(values[i][idIdx]), i);
-        }
-
-        incomingItems.forEach(item => {
-            const id = String(item.id);
-            const rowData = sheetHeadersNorm.map((hNorm, idx) => {
-                const originalKey = headersArr.find(k => norm(k) === hNorm);
-                
-                if (originalKey && item[originalKey] !== undefined && item[originalKey] !== null) {
-                    let v = item[originalKey];
-                    
-                    // [PROTECTION]: Jika kolom rontgen_url dan data baru kosong tapi di sheet ada data, JANGAN TIMPA.
-                    if (hNorm === 'rontgenurl' && (v === "" || !v) && idMap.has(id)) {
-                        const existingVal = values[idMap.get(id)][idx];
-                        if (existingVal && String(existingVal).startsWith('http')) return existingVal;
-                    }
-
-                    if (typeof v === 'number' && v === 0) return 0;
-                    return (typeof v === 'object') ? JSON.stringify(v) : (v || "");
+        let missingHeaders = headersArr.filter(h => !currentHeadersNorm.includes(norm(h)));
+        if (missingHeaders.length > 0) {
+            try {
+                sheet.getRange(1, lastCol + 1, 1, missingHeaders.length)
+                     .setValues([missingHeaders])
+                     .setFontWeight("bold")
+                     .setBackground("#dbeafe");
+                SpreadsheetApp.flush();
+                // Refresh headers after addition
+                lastCol = sheet.getLastColumn();
+                currentHeaders = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+                currentHeadersNorm = currentHeaders.map(norm);
+                Logger.log(`[${sheetName}] Kolom Baru Ditambahkan: ${missingHeaders.join(", ")}`);
+            } catch (e) {
+                const errStr = e.toString();
+                if (errStr.includes("protected")) {
+                    throw new Error(`GAGAL UPDATE DATABASE: Tab '${sheetName}' diproteksi (terkunci). Silahkan buka proteksi di Google Sheet agar sistem bisa menambah kolom baru (${missingHeaders.join(", ")}).`);
                 }
-                
-                if (idMap.has(id)) return values[idMap.get(id)][idx];
-                return "";
-            });
-
-            if (idMap.has(id)) {
-                values[idMap.get(id)] = rowData;
-            } else {
-                values.push(rowData);
+                throw e;
             }
-        });
+        }
 
-        const finalData = values.slice(1);
-        if (finalData.length > 0) {
-            sheet.getRange(2, 1, finalData.length, sheetHeaders.length).setNumberFormat("@").setValues(finalData);
+        // 2. Optimized ID Mapping: Fetch ONLY the ID column
+        const lastRow = Math.max(1, sheet.getLastRow());
+        const colIdIdx = findColumnIndex(currentHeaders, ['id', 'patientId', 'key']);
+        const idIdx = colIdIdx !== -1 ? colIdIdx : 0;
+        const lockIdx = findColumnIndex(currentHeaders, ['is_locked', 'locked']);
+        
+        const idMap = new Map();
+        if (lastRow > 1) {
+            const idValues = sheet.getRange(2, idIdx + 1, lastRow - 1, 1).getValues();
+            for (let i = 0; i < idValues.length; i++) {
+                const idVal = String(idValues[i][0]).trim();
+                if (idVal && idVal !== "undefined" && idVal !== "null") idMap.set(idVal, i + 2);
+            }
+        }
+
+        // 3. Process Incoming Items
+        // [HYBRID STRATEGY] If few items, use targeted row updates (Fastest). If many, use batch.
+        if (incomingItems.length <= 50) {
+            incomingItems.forEach(item => {
+                const id = String(item.id || "").trim();
+                let targetRow = idMap.get(id) || -1;
+                
+                // Fallback for appointments
+                if (targetRow === -1 && sheetName === SHEET_NAMES.APPOINTMENTS && item.patientId && item.date) {
+                    const searchDate = normalizeDate(item.date);
+                    const searchTime = normalizeTime(item.time);
+                    const sRange = sheet.getRange(Math.max(2, lastRow - 500), 1, Math.min(lastRow, 501), lastCol).getValues();
+                    const cP = findColumnIndex(currentHeaders, ['patientId']), cD = findColumnIndex(currentHeaders, ['date']), cT = findColumnIndex(currentHeaders, ['time']);
+                    for (let j = 0; j < sRange.length; j++) {
+                        if (String(sRange[j][cP]) === String(item.patientId) && normalizeDate(sRange[j][cD]) === searchDate && normalizeTime(sRange[j][cT]) === searchTime) {
+                            targetRow = Math.max(2, lastRow - 500) + j; break;
+                        }
+                    }
+                }
+
+                let existingRow = targetRow !== -1 ? sheet.getRange(targetRow, 1, 1, lastCol).getValues()[0] : [];
+                if (targetRow !== -1 && lockIdx !== -1 && (existingRow[lockIdx] === true || String(existingRow[lockIdx]).toLowerCase() === "true")) {
+                    // [FIX BACKDATE] Allow update for locked appointments only if performing a PAYMENT action
+                    const isPaying = (item.paymentStatus === 'PAID' || item.paymentstatus === 'PAID');
+                    if (!isPaying) return;
+                    
+                    // Specific security: if it's already PAID on sheet, don't allow changing anything but maybe the notes?
+                    // Actually, cashier should be able to correct mistakes too if they have access.
+                }
+
+                const rowData = currentHeadersNorm.map((hNorm, idx) => {
+                    if (hNorm === 'nik') return (item.nik || item.NIK) ? String(item.nik || item.NIK) : (existingRow[idx] || "");
+                    if (hNorm === 'date' && item.date) item.date = normalizeDate(item.date);
+                    if (hNorm === 'time' && item.time) item.time = normalizeTime(item.time);
+                    
+                    const keys = Object.keys(item);
+                    const originalKey = keys.find(k => norm(k) === hNorm && item[k] !== undefined && item[k] !== null && item[k] !== "") 
+                                     || keys.find(k => norm(k) === hNorm)
+                                     || keys.find(k => norm(k) === norm(headersArr[idx] || ""));
+                    if (originalKey !== undefined) {
+                      let v = item[originalKey];
+                      // Preserve existing rontgenUrl if incoming is empty
+                      if (hNorm === 'rontgenurl' && !v && existingRow[idx]) v = existingRow[idx];
+                      
+                      // Proper Serialization: Only stringify if it's genuinely an object/array
+                      if (v !== null && typeof v === 'object') {
+                        v = JSON.stringify(v);
+                      }
+                      return (v === null || v === undefined) ? "" : v;
+                    }
+                    return existingRow[idx] || "";
+                });
+
+                if (targetRow !== -1) sheet.getRange(targetRow, 1, 1, lastCol).setValues([rowData]);
+                else sheet.appendRow(rowData);
+            });
+        } else {
+            // [BATCH MODE] For large updates to avoid timeout
+            const allValues = sheet.getDataRange().getValues();
+            incomingItems.forEach(item => {
+                const id = String(item.id || "").trim();
+                let rIdx = idMap.has(id) ? idMap.get(id) - 1 : -1;
+
+                // [FIX] Batch mode MUST respect lockIdx too!
+                if (rIdx !== -1 && lockIdx !== -1) {
+                  const existingRow = allValues[rIdx];
+                  if (existingRow[lockIdx] === true || String(existingRow[lockIdx]).toLowerCase() === "true") {
+                    const isPaying = (item.paymentStatus === 'PAID' || item.paymentstatus === 'PAID');
+                    if (!isPaying) return; // Skip update for locked rows unless paying
+                  }
+                }
+
+                const rowData = currentHeadersNorm.map((hNorm, idx) => {
+                    const keys = Object.keys(item);
+                    const originalKey = keys.find(k => norm(k) === hNorm && item[k] !== undefined && item[k] !== null && item[k] !== "") 
+                                     || keys.find(k => norm(k) === hNorm)
+                                     || keys.find(k => norm(k) === norm(headersArr[idx] || ""));
+                    if (originalKey !== undefined) {
+                      let v = item[originalKey];
+                      if (v !== null && typeof v === 'object') v = JSON.stringify(v);
+                      return (v === null || v === undefined) ? "" : v;
+                    }
+                    return rIdx !== -1 ? allValues[rIdx][idx] : "";
+                });
+                if (rIdx !== -1) allValues[rIdx] = rowData; else allValues.push(rowData);
+            });
+            sheet.getRange(1, 1, allValues.length, currentHeaders.length).setValues(allValues);
         }
     };
 
     if (changes.patients) merge(SHEET_NAMES.PATIENTS, HEADERS.PATIENTS, changes.patients);
     if (changes.assessments) merge(SHEET_NAMES.ASSESSMENTS, HEADERS.ASSESSMENTS, changes.assessments);
-    if (changes.appointments) merge(SHEET_NAMES.APPOINTMENTS, HEADERS.APPOINTMENTS, changes.appointments);
+    if (changes.appointments) {
+        merge(SHEET_NAMES.APPOINTMENTS, HEADERS.APPOINTMENTS, changes.appointments);
+        // -- FIRE GOOGLE CALENDAR SYNC FOR NEW/MODIFIED APPOINTMENTS --
+        try {
+            const configMap = getConfigMap(ss);
+            const refreshToken = configMap.get('GOOGLE_CALENDAR_REFRESH_TOKEN');
+            if (refreshToken && typeof syncEventToGoogleCalendar === 'function') {
+                const patientsList = getDataFromSheet(ss, SHEET_NAMES.PATIENTS) || [];
+                const usersList = getDataFromSheet(ss, SHEET_NAMES.USERS) || [];
+
+                changes.appointments.forEach(appt => {
+                    // [SPEED OPTIMIZATION] Skip Calendar Sync for past/backdated items
+                    const apptDate = new Date(appt.date);
+                    const now = new Date();
+                    now.setHours(0,0,0,0);
+                    if (apptDate < now) return; // Don't waste time on past events
+
+                    const pItem = patientsList.find(p => String(p.id) === String(appt.patientId || appt.patientid));
+                    const uItem = usersList.find(u => String(u.id) === String(appt.therapistId || appt.therapistid));
+                    
+                    const pName = pItem ? pItem.name : "Pasien Baru";
+                    const tName = uItem ? uItem.name : (appt.therapistId || appt.therapistid || "-");
+                    const st = String(appt.status || 'PENDING').toUpperCase();
+                    
+                    syncEventToGoogleCalendar(configMap, appt, pItem || {name: pName}, tName, st);
+                });
+            }
+        } catch(calErr) {
+            Logger.log("Calendar Bulk Sync Error: " + calErr);
+        }
+    }
     if (changes.expenses) merge(SHEET_NAMES.EXPENSES, HEADERS.EXPENSES, changes.expenses);
     if (changes.packages) merge(SHEET_NAMES.PACKAGES, HEADERS.PACKAGES, changes.packages);
     if (changes.treatments) merge(SHEET_NAMES.TREATMENTS, HEADERS.TREATMENTS, changes.treatments);
@@ -231,7 +360,18 @@ function processIncrementalSync(ss, changes) {
         const del = changes.deletedIds;
         if (del.patients && del.patients.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.PATIENTS), del.patients);
         if (del.assessments && del.assessments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.ASSESSMENTS), del.assessments);
-        if (del.appointments && del.appointments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.APPOINTMENTS), del.appointments);
+        if (del.appointments && del.appointments.length > 0) {
+            // [NEW] DELETE FROM GOOGLE CALENDAR
+            try {
+                const configMap = getConfigMap(ss);
+                del.appointments.forEach(id => {
+                    deleteEventFromGoogleCalendar(configMap, id);
+                });
+            } catch(calErr) {
+                Logger.log("Calendar Delete Error: " + calErr);
+            }
+            deleteRowsById(ss.getSheetByName(SHEET_NAMES.APPOINTMENTS), del.appointments);
+        }
         if (del.expenses && del.expenses.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.EXPENSES), del.expenses);
         if (del.packages && del.packages.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.PACKAGES), del.packages);
         if (del.treatments && del.treatments.length > 0) deleteRowsById(ss.getSheetByName(SHEET_NAMES.TREATMENTS), del.treatments);
@@ -302,34 +442,116 @@ function checkAndFixColumns(ss, isMaster = false) {
     let logs = [];
 
     sheetsToCheck.forEach(item => {
-        const sheet = ss.getSheetByName(item.name);
-        if (!sheet) {
-            logs.push(`[${item.name}] Tab tidak ditemukan. Menambah tab baru.`);
-            getOrInsertSheet(ss, item.name, item.headers);
-            return;
-        }
-
-        const lastCol = sheet.getLastColumn();
-        const currentHeadersRaw = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
-        
-        // Normalisasi header yang ada (lowercase + hapus spasi & underscore)
-        const normalize = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
-        const currentHeadersNormalized = currentHeadersRaw.map(normalize);
-
-        const missingHeaders = item.headers.filter(h => !currentHeadersNormalized.includes(normalize(h)));
-
-        if (missingHeaders.length > 0) {
-            const startCol = lastCol + 1;
-            sheet.getRange(1, startCol, 1, missingHeaders.length)
-                .setValues([missingHeaders])
-                .setFontWeight("bold")
-                .setBackground("#dbeafe");
+        try {
+            let sheet = findSheetByName(ss, item.name);
+            if (!sheet) {
+                sheet = getOrInsertSheet(ss, item.name, item.headers);
+                logs.push(`[${item.name}] Created tab.`); return;
+            }
             
-            logs.push(`[${item.name}] Menambah kolom: ${missingHeaders.join(', ')}`);
-        } else {
-            logs.push(`[${item.name}] Ok.`);
+            const lastCol = sheet.getLastColumn();
+            const curRaw = lastCol > 0 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : [];
+            const normalize = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+            const curNorm = curRaw.map(normalize);
+
+            const missing = item.headers.filter(h => !curNorm.includes(normalize(h)));
+            if (missing.length > 0) {
+                sheet.getRange(1, lastCol + 1, 1, missing.length)
+                    .setValues([missing]).setFontWeight("bold").setBackground("#dbeafe");
+                logs.push(`[${item.name}] Added missing: ${missing.join(", ")}`);
+            } else logs.push(`[${item.name}] Status OK.`);
+        } catch (e) {
+            logs.push(`[${item.name}] Error: ${e.message}`);
         }
     });
 
     return logs;
+}
+
+/**
+ * REORGANIZE TOOL: Merapikan urutan kolom sesuai standar tanpa menghapus data.
+ */
+function reorganizeSheetByHeaders(sheet, targetHeaders) {
+    if (!sheet) return;
+    const lastCol = sheet.getLastColumn();
+    const lastRow = sheet.getLastRow();
+    if (lastCol === 0 || lastRow === 0) {
+        sheet.appendRow(targetHeaders);
+        return;
+    }
+
+    const currentData = sheet.getDataRange().getValues();
+    const currentHeaders = currentData[0];
+    const rows = currentData.slice(1);
+    
+    const normalize = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+    const currentHeadersNorm = currentHeaders.map(normalize);
+
+    const reorganizedRows = rows.map(row => {
+        return targetHeaders.map(th => {
+            const idx = currentHeadersNorm.indexOf(normalize(th));
+            return idx !== -1 ? row[idx] : "";
+        });
+    });
+
+    // Overwrite sheet dengan urutan baru
+    sheet.clearContents();
+    sheet.getRange(1, 1, 1, targetHeaders.length)
+        .setValues([targetHeaders])
+        .setFontWeight("bold")
+        .setBackground("#dbeafe");
+
+    if (reorganizedRows.length > 0) {
+        try {
+            sheet.getRange(2, 1, reorganizedRows.length, targetHeaders.length)
+                .setNumberFormat("@")
+                .setValues(reorganizedRows);
+        } catch (e) {
+            const errStr = e.toString();
+            if (errStr.includes("protected")) {
+                throw new Error(`GAGAL REORGANISASI: Data '${sheet.getName()}' gagal dipindah karena ada sel yang TERKUNCI (Protected). Silahkan buka proteksi sheet agar kolom bisa diatur ulang.`);
+            }
+            throw e;
+        }
+    }
+    
+    Logger.log(`[Reorganize] Sheet ${sheet.getName()} finished.`);
+}
+
+/**
+ * Normalisasi Waktu agar seragam 09:00 (bukan 9:00 atau objek)
+ */
+function normalizeTime(t) {
+    if (!t) return "";
+    if (t instanceof Date) {
+        return Utilities.formatDate(t, TIMEZONE || "GMT+7", "HH:mm");
+    }
+    let res = String(t).trim().replace('.', ':');
+    if (res.includes(':')) {
+        let parts = res.split(':');
+        let h = parts[0].padStart(2, '0');
+        let m = parts[1].padStart(2, '0');
+        return `${h}:${m}`;
+    }
+    return res;
+}
+
+/**
+ * Normalisasi Tanggal agar seragam YYYY-MM-DD
+ */
+function normalizeDate(s) {
+    if (!s) return "";
+    if (s instanceof Date) return Utilities.formatDate(s, TIMEZONE || "GMT+7", "yyyy-MM-dd");
+    let str = String(s).split(" ")[0]; // Ambil bagian tanggal saja
+    if (str.includes("-")) {
+        let parts = str.split("-");
+        if (parts[0].length === 4) return str; // yyyy-MM-dd
+        return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    }
+    if (str.includes("/")) {
+        let parts = str.split("/");
+        if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+        if (parts[0].length === 4) return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+    }
+    return str;
 }

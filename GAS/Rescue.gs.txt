@@ -1,0 +1,174 @@
+/**
+ * ULTIMATE RESCUE SCRIPT V4.1
+ * Gabungan logika Heuristik (Tebak Data) + Header-Aware (Nama Kolom)
+ * Targeted to specific Clinic ID
+ */
+function fixDataAlignment() {
+  // ID Klinik yang ingin di-test sesuai permintaan
+  const TARGET_SS_ID = "1QaB6fHP1gi9J09Txcr-kwluA5x3MfCvpEm4vm1Lfz5w";
+  
+  const ss = SpreadsheetApp.openById(TARGET_SS_ID);
+  const sheet = ss.getSheetByName(SHEET_NAMES.ASSESSMENTS) || ss.getSheetByName("Assessments");
+  
+  if (!sheet) {
+    Logger.log("Sheet Assessments tidak ditemukan di SS tersebut.");
+    return "Gagal: Sheet tidak ditemukan.";
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return "Sheet kosong atau tidak ada data.";
+  
+  const currentHeaders = data[0];
+  const rows = data.slice(1);
+  
+  // Ambil Ground Truth dari Main.gs
+  const targetHeaders = HEADERS.ASSESSMENTS;
+  const norm = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
+  const currentHeadersNorm = currentHeaders.map(norm);
+
+  Logger.log("=== MEMULAI PENYELAMATAN DATA KLINIK: " + ss.getName() + " ===");
+
+  const fixedRows = rows.map((row, rowIdx) => {
+    let objRow = {};
+
+    // LANGKAH 1: Mapping berdasarkan Nama Kolom (Jika Header masih ada)
+    currentHeadersNorm.forEach((hNorm, colIdx) => {
+      if (!hNorm) return;
+      const originalKey = targetHeaders.find(k => norm(k) === hNorm);
+      if (originalKey) {
+        objRow[originalKey] = row[colIdx];
+      }
+    });
+
+    // LANGKAH 2: Logika Heuristik (Tebak Data) - Menambal jika kolom bergeser/salah nama
+    row.forEach(val => {
+      const s = String(val).trim();
+      if (!s || s === "undefined" || s === "null") return;
+
+      // Deteksi ID (contoh: A177...)
+      if (s.startsWith("A1") && s.length > 10 && !objRow.id) objRow.id = s;
+      
+      // Deteksi Patient ID (PX-...)
+      else if (s.startsWith("PX-") && !objRow.patientId) objRow.patientId = s;
+      
+      // Deteksi Tanggal (YYYY-MM-DD)
+      else if (s.match(/^\d{4}-\d{2}-\d{2}$/) && !objRow.date) objRow.date = s;
+      
+      // Deteksi ICD Code (Satu huruf + angka)
+      else if (s.match(/^[A-Z]\d{2}(\.\d+)?$/) && !objRow.icd) objRow.icd = s;
+      
+      // Deteksi Pain Points (Array koordinat x,y)
+      else if (s.startsWith("[") && s.includes("x") && s.includes("y") && s.includes("32.00")) objRow.pain_points = s;
+      
+      // Deteksi Physical Exam (Obj/S) - Jika mengandung rom/mmt
+      else if (s.toLowerCase().includes("rom") || s.toLowerCase().includes("mmt")) {
+         let cleaned = s;
+         if (s.startsWith('["{') && s.endsWith('}"]')) {
+            try { cleaned = JSON.parse(s)[0]; } catch(e) {}
+         }
+         // Jika obj sudah terisi, masukkan ke s (subyektif) sebagai fallback
+         if (!objRow.obj) objRow.obj = cleaned; else if (!objRow.s) objRow.s = cleaned;
+      }
+      
+      // Deteksi ICF (b/s/d)
+      else if ((s.includes("d4101") || s.includes("d4502")) && !objRow.b) objRow.b = s;
+      else if ((s.includes("d9201") || s.includes("d640")) && !objRow.d_act) objRow.d_act = s;
+      
+      // Deteksi Intervensi
+      else if ((s.includes("Ultrasound") || s.includes("TENS") || s.includes("Infra Red")) && !objRow.intervention) objRow.intervention = s;
+      
+      // Deteksi Special Tests (JSON object berisi data pemeriksaan spesifik)
+      else if (s.startsWith("{") && (s.includes("slr") || s.includes("mcmurray") || s.includes("spurling") || s.includes("+") || s.includes("-")) && !objRow.special_tests) {
+         objRow.special_tests = s;
+      }
+      
+      // Deteksi VAS (Angka kecil 0-10) - Hanya jika belum ada atau VAS saat ini berupa JSON
+      else if (s.match(/^\d+$/) && s.length <= 2 && (!objRow.vas || String(objRow.vas).includes("{"))) {
+         objRow.vas = s;
+      }
+      
+      // Deteksi Biaya/Fee
+      else if (s.match(/^\d+$/) && s.length > 3 && !objRow.fee) objRow.fee = s;
+    });
+
+    // LANGKAH 3: Final Cleaning & EXTRACTION (Membongkar data yang nyangkut di OBJ)
+    targetHeaders.forEach(key => {
+      let val = objRow[key];
+      if (val === undefined || val === null) return;
+      
+      const sVal = String(val);
+
+      // --- LOGIKA EKSTRAKSI BERLAPIS ---
+      // Jika mendeteksi data nyangkut di dalam 'obj'
+      if (key === 'obj' && sVal.includes("special_tests")) {
+          try {
+              let parsedObj = JSON.parse(sVal);
+              // Jika di dalam obj ada special_tests, tarik ke luar
+              if (parsedObj.special_tests && (!objRow.special_tests || objRow.special_tests === "{}")) {
+                  objRow.special_tests = parsedObj.special_tests;
+                  delete parsedObj.special_tests;
+              }
+              // Jika di dalam obj ada special_tests_note, tarik ke luar
+              if (parsedObj.special_tests_note && (!objRow.special_tests_note || objRow.special_tests_note === "")) {
+                  objRow.special_tests_note = parsedObj.special_tests_note;
+                  delete parsedObj.special_tests_note;
+              }
+              // Simpan kembali obj yang sudah bersih
+              objRow.obj = parsedObj;
+          } catch(e) {
+              Logger.log("Gagal bongkar nested obj: " + e.message);
+          }
+      }
+
+      // Fix JSON ganda ["{...}"]
+      if (typeof objRow[key] === 'string' && objRow[key].startsWith('["{') && objRow[key].endsWith('}"]')) {
+        try { objRow[key] = JSON.parse(objRow[key])[0]; } catch(e) {}
+      }
+      
+      // Fix VAS yang isinya objek sampah
+      if (key === 'vas' && (String(objRow[key]).includes("{") || String(objRow[key]).includes("["))) {
+          objRow[key] = "0";
+      }
+    });
+
+    // LANGKAH 4: Kembalikan ke Array sesuai urutan Target
+    return targetHeaders.map(th => {
+      let v = objRow[th];
+      
+      // Daftar kolom yang wajib berupa TEXT JSON jika isinya adalah objek/array
+      const objectFields = ['obj', 'templateDefault', 'hms_notes', 'bodyChart', 'special_tests', 'pain_points'];
+      const normField = norm(th);
+      
+      // Special Tests Note is a string, not an object, so we don't JSON.stringify it to avoid double quotes
+      if (normField === 'specialtestsnote') {
+          return (v === undefined || v === null) ? "" : v;
+      }
+
+      // Pastikan data object di-stringify dengan benar agar tidak muncul [object Object]
+      if ((objectFields.includes(th) || normField.includes('specialtest')) && v && typeof v === 'object') {
+        return JSON.stringify(Array.isArray(v) ? (v[0] || {}) : v);
+      }
+      return (v === undefined || v === null) ? "" : v;
+    });
+  });
+
+  // WRITING BACK (Safety check: Jangan clear jika data hasil rescue kosong)
+  if (fixedRows.length > 0) {
+    sheet.clearContents();
+    SpreadsheetApp.flush();
+    
+    sheet.getRange(1, 1, 1, targetHeaders.length)
+      .setValues([targetHeaders])
+      .setFontWeight("bold")
+      .setBackground("#cbd5e1");
+    
+    sheet.getRange(2, 1, fixedRows.length, targetHeaders.length)
+      .setNumberFormat("@")
+      .setValues(fixedRows);
+      
+    Logger.log("=== SUKSES: " + ss.getName() + " BERHASIL DIRAPIKAN ===");
+    return "Data ID " + TARGET_SS_ID + " berhasil disusun ulang.";
+  } else {
+    return "Gagal: Tidak ada data yang bisa diproses.";
+  }
+}

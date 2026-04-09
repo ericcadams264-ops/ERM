@@ -12,6 +12,8 @@
 
    <link rel="stylesheet" href="style.css">
    <link rel="manifest" href="manifest.json">
+   <link rel="icon" id="dynamic-favicon" href="data:image/x-icon;,">
+   <link rel="apple-touch-icon" id="dynamic-apple-icon" href="">
    <script src="https://unpkg.com/signature_pad@4.1.7/dist/signature_pad.umd.js"></script>
    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
@@ -127,9 +129,9 @@
          class="fixed top-0 left-0 h-1 bg-blue-500 z-[1000000] w-0 transition-all duration-300 shadow-[0_0_10px_rgba(59,130,246,0.5)]">
       </div>
       <div id="sidebar-overlay" onclick="toggleSidebar()"
-         class="fixed inset-0 bg-black/50 z-20 hidden md:hidden glass transition-opacity"></div>
+         class="fixed inset-0 bg-black/50 z-20 hidden transition-opacity"></div>
       <aside id="app-sidebar"
-         class="fixed md:relative w-64 h-full bg-slate-900 text-white flex flex-col shadow-2xl z-30 transition-transform duration-300 transform -translate-x-full md:translate-x-0">
+         class="fixed w-64 h-full bg-slate-900 text-white flex flex-col shadow-2xl z-30 transition-transform duration-300 transform -translate-x-full">
           <div class="p-6 border-b border-slate-700 flex justify-between items-center">
              <div class="flex items-center gap-3">
                 <div id="sidebar-logo-container" class="hidden">
@@ -141,17 +143,17 @@
                    </p>
                 </div>
              </div>
-            <button type="button" onclick="toggleSidebar()" class="md:hidden text-slate-400 hover:text-white">
+            <button type="button" onclick="toggleSidebar()" class="text-slate-400 hover:text-white">
                <i data-lucide="x" width="24"></i>
             </button>
          </div>
          <nav class="flex-1 p-4 space-y-2 overflow-y-auto">
-            <button type="button" onclick="navigate('dashboard'); toggleSidebar()"
+            <button type="button" onclick="navigate('dashboard'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
                id="nav-dashboard">
                <i data-lucide="layout-dashboard" width="20"></i> <span class="font-medium">Dashboard</span>
             </button>
-            <button type="button" onclick="navigate('schedule'); toggleSidebar()"
+            <button type="button" onclick="navigate('schedule'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white relative"
                id="nav-schedule">
                <i data-lucide="calendar" width="20"></i> <span class="font-medium">Jadwal Terapi</span>
@@ -161,12 +163,12 @@
                   <span class="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
                </span>
             </button>
-            <button type="button" onclick="navigate('patients'); toggleSidebar()"
+            <button type="button" onclick="navigate('patients'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
                id="nav-patients">
                <i data-lucide="users" width="20"></i> <span class="font-medium">Data Pasien</span>
             </button>
-            <button type="button" onclick="navigate('assessments'); toggleSidebar()"
+            <button type="button" onclick="navigate('assessments'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
                id="nav-assessments">
                <i data-lucide="file-text" width="20"></i>
@@ -175,15 +177,10 @@
                   <i data-lucide="loader-2" class="animate-spin text-blue-400" width="16"></i>
                </span>
             </button>
-            <button type="button" onclick="navigate('kasir'); toggleSidebar()"
+            <button type="button" onclick="navigate('kasir'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
                id="nav-kasir">
                <i data-lucide="receipt" width="20"></i> <span class="font-medium">Kasir</span>
-            </button>
-            <button type="button" onclick="navigate('analytics'); toggleSidebar()"
-               class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
-               id="nav-analytics">
-               <i data-lucide="bar-chart-3" width="20"></i> <span class="font-medium font-semibold">Analisis Klinis</span>
             </button>
 
             <button type="button" disabled
@@ -195,7 +192,7 @@
                <span class="text-[9px] font-black bg-amber-500 text-slate-900 px-1.5 py-0.5 rounded uppercase tracking-tighter">On Going</span>
             </button>
 
-            <button type="button" onclick="navigate('config'); toggleSidebar()"
+            <button type="button" onclick="navigate('config'); closeSidebarOnMobile()"
                class="w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press text-slate-300 hover:bg-slate-800 hover:text-white"
                id="nav-config">
                <i data-lucide="settings" width="20"></i> <span class="font-medium">Konfigurasi Data</span>
@@ -222,8 +219,8 @@
          <div
             class="bg-white h-16 border-b border-slate-200 flex items-center px-4 md:px-8 justify-between shrink-0 shadow-sm z-10">
             <div class="flex items-center gap-3">
-               <button type="button" onclick="toggleSidebar()"
-                  class="md:hidden p-2 text-slate-600 hover:bg-slate-100 rounded-lg">
+               <button type="button" onclick="toggleSidebar()" id="btn-toggle-sidebar"
+                  class="p-2 text-slate-600 hover:bg-slate-100 rounded-lg transition-all" title="Toggle Sidebar">
                   <i data-lucide="menu" width="24"></i>
                </button>
                <h2 class="text-lg md:text-xl font-bold text-slate-800" id="page-title">Dashboard</h2>

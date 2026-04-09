@@ -30,7 +30,7 @@ function getDemographicAnalytics(startDate, endDate) {
 
     const stats = {
         activePatientIds: new Set(),
-        age: { total: 0, count: 0, segments: { anak: 0, dewasa: 0, lansia: 0, unknown: 0 } },
+        age: { total: 0, count: 0, segments: { anak: 0, remaja: 0, dewasa: 0, lansia: 0, unknown: 0 } },
         gender: { L: 0, P: 0 },
         fin: { income: 0, expense: 0 },
         risk: {}, geo: {}, dx: {}, iv: {}, loyalty: { visitCounts: {} }
@@ -44,13 +44,13 @@ function getDemographicAnalytics(startDate, endDate) {
             const inPeriod = (!start || d >= start) && (!end || d <= end);
             if (!inPeriod) return false;
 
-            const pId = String(a.patientId || a.patient_id);
+            const pId = String(a.patientid || a.patientId || a.patient_id);
             if (pId) {
                 stats.activePatientIds.add(pId);
                 stats.loyalty.visitCounts[pId] = (stats.loyalty.visitCounts[pId] || 0) + 1;
             }
 
-            stats.fin.income += Number(a.fee || a.total_bill || 0);
+            stats.fin.income += Number(a.fee || a.totalbill || a.total_bill || 0);
 
             // [CLEAN] Diagnosis Logic
             if (a.diagnosis && a.diagnosis !== '-') {
@@ -95,8 +95,9 @@ function getDemographicAnalytics(startDate, endDate) {
             if (!isNaN(ageVal) && ageVal > 0) {
                 stats.age.total += ageVal;
                 stats.age.count++;
-                if (ageVal <= 17) stats.age.segments.anak++;
-                else if (ageVal <= 45) stats.age.segments.dewasa++;
+                if (ageVal <= 11) stats.age.segments.anak++;
+                else if (ageVal <= 18) stats.age.segments.remaja++;
+                else if (ageVal <= 59) stats.age.segments.dewasa++;
                 else stats.age.segments.lansia++;
             } else {
                 stats.age.segments.unknown++;
@@ -179,9 +180,10 @@ function saveToReportSheet(ss, data) {
             ["LOYALITAS", "Populasi Aktif", data.population + " Jiwa", "Unique Patients"],
             ["", "", "", ""],
             ["👥 ANALISA DEMOGRAFI (USIA & GENDER)", "KATEGORI / RANGE", "JUMLAH", "STATUS"],
-            ["SEGMEN USIA", "Anak & Remaja (0-17)", (data.ageSegments.anak || 0) + " Jiwa", "ANAK-ANAK"],
-            ["SEGMEN USIA", "Dewasa (18-45)", (data.ageSegments.dewasa || 0) + " Jiwa", "USIA PRODUKTIF"],
-            ["SEGMEN USIA", "Senior / Lansia (>45)", (data.ageSegments.lansia || 0) + " Jiwa", "USIA SENIOR"],
+            ["SEGMEN USIA", "Anak (0-11)", (data.ageSegments.anak || 0) + " Jiwa", "ANAK-ANAK"],
+            ["SEGMEN USIA", "Remaja (12-18)", (data.ageSegments.remaja || 0) + " Jiwa", "REMAJA"],
+            ["SEGMEN USIA", "Dewasa (19-59)", (data.ageSegments.dewasa || 0) + " Jiwa", "USIA PRODUKTIF"],
+            ["SEGMEN USIA", "Senior / Lansia (>60)", (data.ageSegments.lansia || 0) + " Jiwa", "USIA SENIOR"],
             ["GENDER", "Pasien Laki-laki", data.gender.L + " Orang", "MALE"],
             ["GENDER", "Pasien Perempuan", data.gender.P + " Orang", "FEMALE"],
             ["", "", "", ""],

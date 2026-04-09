@@ -9,6 +9,11 @@ const SHEET_ID = ""; // IKLASKAN KOSONG
 const TIMEZONE = "Asia/Jakarta";
 const NETLIFY_URL = "https://appfisio.netlify.app"; // Ganti dengan URL produksi jika sudah live
 
+// --- OAUTH 2.0 GOOGLE CALENDAR CONFIGURATION ---
+// ISI DENGAN CREDENTIALS DARI GOOGLE CLOUD CONSOLE ANDA:
+const OAUTH_CLIENT_ID = "462432839977-2qlsr1tpluiqvi6obpdmpeb5kfdfomn5.apps.googleusercontent.com";
+const OAUTH_CLIENT_SECRET = "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";
+
 const SHEET_NAMES = {
     PATIENTS: "Patients",
     ASSESSMENTS: "Assessments",
@@ -24,15 +29,15 @@ const SHEET_NAMES = {
 };
 
 const HEADERS = {
-    PATIENTS: ['id', 'name', 'category', 'gender', 'dob', 'phone', 'job', 'address', 'diagnosis', 'quota', 'defaultFee', 'tags', 'updatedAt'],
-    ASSESSMENTS: ['id', 'patientId', 'date', 'diagnosis', 'icd', 'icf_codes', 'custom_assessment', 'prenatal', 'natal', 'postnatal', 'vas', 'fee', 'b', 's', 'd_act', 'd_part', 'obj', 'special_tests', 'special_tests_note', 'intervention', 'eval', 'plan', 'templateDefault', 'bodyChart', 'pain_points', 'hms_diagnosis', 'hms_notes', 'is_consented', 'consent_timestamp', 'patient_signature', 'rontgen_url', 'updatedAt'],
+    PATIENTS: ['id', 'name', 'category', 'gender', 'dob', 'phone', 'job', 'address', 'diagnosis', 'quota', 'defaultFee', 'updatedAt', 'tags', 'nik', 'is_locked'],
+    ASSESSMENTS: ['id', 'patientId', 'date', 'diagnosis', 'icd', 'icf_codes', 'custom_assessment', 'prenatal', 'natal', 'postnatal', 'vas', 'fee', 'b', 's', 'd_act', 'd_part', 'obj', 'special_tests', 'special_tests_note', 'intervention', 'eval', 'plan', 'templateDefault', 'bodyChart', 'pain_points', 'hms_diagnosis', 'hms_notes', 'is_consented', 'consent_timestamp', 'patient_signature', 'rontgen_url', 'updatedAt', 'is_locked', 'ttv_td', 'ttv_hr', 'ttv_rr', 'ttv_temp', 'ttv_spo2', 'rom_d', 'rom_s', 'mmt_d', 'mmt_s'],
     APPOINTMENTS: ['id', 'patientId', 'date', 'time', 'therapistId', 'notes', 'groupId', 'fee', 'status', 'patientType', 'visitor_name', 'visitor_contact', 'updatedAt', 'paymentStatus', 'paymentMethod', 'discount', 'finalAmount', 'paidAt'],
     CONFIG: ['key', 'value', 'updated_at'],
-    LICENSES: ['key', 'plan_name', 'client_name', 'created_at', 'expires_at', 'status', 'sheet_id', 'alias', 'available_hours', 'off_days', 'custom_holidays', 'whatsapp', 'email', 'updated_at'],
-    EXPENSES: ['id', 'date', 'category', 'amount', 'notes', 'updatedAt'],
-    PACKAGES: ['id', 'name', 'sessions', 'price', 'description', 'updatedAt'],
+    LICENSES: ['key', 'plan_name', 'client_name', 'created_at', 'expires_at', 'status', 'sheet_id', 'alias', 'available_hours', 'off_days', 'custom_holidays', 'day_config', 'whatsapp', 'email', 'updated_at'],
+    EXPENSES: ['id', 'date', 'category', 'amount', 'notes', 'updatedAt', 'is_locked'],
+    PACKAGES: ['id', 'name', 'sessions', 'price', 'description', 'updatedAt', 'is_locked'],
     PROTOCOLS: ['id', 'title', 'category', 'description', 'summary', 'ebook_url', 'updated_at'],
-    TREATMENTS: ['id', 'name', 'price', 'updatedAt'],
+    TREATMENTS: ['id', 'name', 'price', 'updatedAt', 'is_locked'],
     USERS: ['id', 'name', 'username', 'password', 'role', 'updatedAt'],
     LICENSE_ARCHIVES: ['license_key', 'client_name', 'year', 'sheet_id', 'updated_at']
 };
@@ -70,6 +75,7 @@ function onOpen() {
         .createMenu('FISIOTA Admin')
         .addItem('🔐 Open License Manager', 'showLicenseSidebar')
         .addSeparator()
+        .addItem('🔄 Sinkronisasi Header Tab', 'syncHeadersManual')
         .addItem('🛠️ Update ALL Client Databases', 'updateAllConnectedClients')
         .addToUi();
 }
@@ -79,6 +85,42 @@ function showLicenseSidebar() {
         .setTitle('License Manager')
         .setWidth(300);
     SpreadsheetApp.getUi().showSidebar(html);
+}
+
+/**
+ * Helper: Force sync headers for the current spreadsheet.
+ */
+function syncHeadersManual() {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const logs = checkAndFixColumns(ss, false);
+    SpreadsheetApp.getUi().alert('SINKRONISASI SELESAI:\n' + logs.map(l => '• ' + l).join('\n'));
+}
+
+// --- OAUTH HELPERS ---
+function saveConfigToSheet(ss, key, value) {
+    const sheet = ss.getSheetByName(SHEET_NAMES.CONFIG);
+    if (!sheet) return;
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0];
+    const keyCol = findColumnIndex(headers, ['key', 'kunci']);
+    const valCol = findColumnIndex(headers, ['value', 'nilai']);
+    const updatedCol = findColumnIndex(headers, ['updated_at', 'updatedAt']);
+    
+    if (keyCol === -1 || valCol === -1) return;
+    
+    for (let i = 1; i < data.length; i++) {
+        if (String(data[i][keyCol]).trim() === key) {
+            sheet.getRange(i + 1, valCol + 1).setValue(value);
+            if (updatedCol !== -1) sheet.getRange(i + 1, updatedCol + 1).setValue(new Date().toISOString());
+            return;
+        }
+    }
+    
+    const newRow = Array(headers.length).fill("");
+    newRow[keyCol] = key;
+    newRow[valCol] = value;
+    if (updatedCol !== -1) newRow[updatedCol] = new Date().toISOString();
+    sheet.appendRow(newRow);
 }
 
 // --- 3. WEB APP HANDLERS (API) ---
@@ -95,12 +137,68 @@ function doGet(e) {
             if (match) rawId = match[1];
         }
         if (rawId) TARGET_SHEET_ID = rawId;
-        // --------------------
 
+        // ACTION: OAUTH START (Returns the Auth URL to the PWA)
+        if (action === "start_oauth") {
+            const redirectUri = ScriptApp.getService().getUrl();
+            const authUrl = "https://accounts.google.com/o/oauth2/v2/auth?" +
+                "client_id=" + encodeURIComponent(OAUTH_CLIENT_ID) +
+                "&redirect_uri=" + encodeURIComponent(redirectUri) +
+                "&response_type=code" +
+                "&scope=" + encodeURIComponent("https://www.googleapis.com/auth/calendar.events") +
+                "&access_type=offline" +
+                "&prompt=consent" +
+                "&state=" + encodeURIComponent(TARGET_SHEET_ID);
+            
+            // Return plain text URL to bypass 403 HtmlService errors
+            return ContentService.createTextOutput(authUrl).setMimeType(ContentService.MimeType.TEXT);
+        }
+
+        // ACTION: OAUTH CALLBACK (Receives Auth Code, gets Refresh Token, saves to CONFIG)
+        if (action === "oauth_callback" || (e.parameter.code && !e.parameter.action)) {
+            const code = e.parameter.code;
+            const stateSheetId = e.parameter.state; 
+            if (!code || !stateSheetId) return HtmlService.createHtmlOutput("<b>OAuth Gagal:</b> Kode atau ID Klinik tidak valid.");
+            
+            TARGET_SHEET_ID = stateSheetId;
+            const clinicSs = getSpreadsheet();
+            const redirectUri = ScriptApp.getService().getUrl();
+
+            const tokenUrl = "https://oauth2.googleapis.com/token";
+            const payload = {
+                client_id: OAUTH_CLIENT_ID,
+                client_secret: OAUTH_CLIENT_SECRET,
+                code: code,
+                redirect_uri: redirectUri,
+                grant_type: "authorization_code"
+            };
+
+            const options = {
+                method: "post",
+                payload: payload,
+                muteHttpExceptions: true
+            };
+
+            const response = UrlFetchApp.fetch(tokenUrl, options);
+            const data = JSON.parse(response.getContentText());
+
+            if (data.error) {
+                return HtmlService.createHtmlOutput("<b>Google OAuth Error:</b> " + data.error_description + "<br><br>Pastikan Anda mendaftarkan Authorized Redirect URIs di GCP Console dengan alamat yang benar.");
+            }
+
+            if (data.refresh_token) {
+                saveConfigToSheet(clinicSs, "GOOGLE_CALENDAR_REFRESH_TOKEN", data.refresh_token);
+                return HtmlService.createHtmlOutput("<b>Berhasil!</b> Google Calendar telah terhubung dengan Fisiota. Silakan tutup tab browser ini.");
+            } else {
+                return HtmlService.createHtmlOutput("<b>Info:</b> Akun Google Anda sudah pernah dikaitkan. Hapus izin 'Fisiota' di Security Google Account jika ingin mendapatkan Refresh Token baru.");
+            }
+        }
+
+        // --- ACTIONS THAT REQUIRE SPREADSHEET ---
         const ss = getSpreadsheet();
 
-    // ACTION: CHECK LICENSE (GET Method - CORS Friendly)
-    if (action === "check_license") {
+        // [ACTION: PULL, DELTA_PULL, etc... Continue as before]
+        if (action === "check_license") {
         const ssMaster = SpreadsheetApp.getActiveSpreadsheet();
         checkAndFixColumns(ssMaster, true); // Pastikan tab License di Master OK
         const key = e.parameter.key;
@@ -131,6 +229,7 @@ function doGet(e) {
         const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'jam tersedia', 'aviliasi']);
         const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur', 'hari libur']);
         const colCustomHolidays = findColumnIndex(headers, ['custom_holidays', 'libur_kustom', 'tanggal_libur']);
+        const colDayConfig = findColumnIndex(headers, ['day_config', 'konfigurasi_harian', 'day config']);
         
         if (colAlias === -1) return createJSONOutput({ status: 'error', message: 'Kolom Alias tidak ditemukan di tab Licenses.' });
         if (colStatus === -1) return createJSONOutput({ status: 'error', message: 'Kolom Status tidak ditemukan di tab Licenses.' });
@@ -148,10 +247,10 @@ function doGet(e) {
                     const dateParts = selectedDate.split('-');
                     // Create date at noon to avoid edge-case shifts
                     const reqDate = new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0); 
-                    const dayOfWeek = Utilities.formatDate(reqDate, TIMEZONE, "u"); // 1 (Mon) - 7 (Sun)
+                    const dayOfWeek = Utilities.formatDate(reqDate, TIMEZONE, "e"); // 1 (Sun), 2 (Mon) ... 7 (Sat)
                     
-                    // Convert back to 0-6 (0=Sun, 1=Mon, etc) to match frontend checkboxes
-                    const currentDay = dayOfWeek === "7" ? "0" : dayOfWeek; 
+                    // Convert to 0-6 (0=Sun, 1=Mon, etc) to match frontend checkboxes
+                    const currentDay = String(Number(dayOfWeek) - 1); 
                     
                     if (offDays.includes(currentDay)) {
                         return createJSONOutput({ status: 'closed', message: 'Maaf, klinik libur di hari ini.' });
@@ -172,9 +271,35 @@ function doGet(e) {
             }
 
             const defaultHours = ['08:00','09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00','22:00'];
-            const valHours = colHours !== -1 ? row[colHours] : "";
-            let hoursRaw = (valHours === 0 || valHours) ? String(valHours).trim() : "";
-            // Handle multiple separators just in case
+            let slotsPerTime = 1;
+
+            // Day Mapping: 0=Sun, 1=Mon, ..., 6=Sat
+            const dateParts = (selectedDate || "").split('-');
+            const reqDate = selectedDate ? new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0) : null;
+            const dayIdx = reqDate ? String(reqDate.getDay()) : null;
+
+            // ADVANCED CONFIG (day_config)
+            let dayConfig = {};
+            if (colDayConfig !== -1 && row[colDayConfig]) {
+                try {
+                    dayConfig = JSON.parse(row[colDayConfig]);
+                } catch(e) { Logger.log("Error parsing dayConfig: " + e); }
+            }
+
+            // Determine Hours and Slots based on Day Config
+            let hoursRaw = "";
+            let globalHours = (colHours !== -1 && (row[colHours] === 0 || row[colHours])) ? String(row[colHours]).trim() : "";
+            
+            if (dayIdx !== null && dayConfig[dayIdx]) {
+                const configItem = dayConfig[dayIdx];
+                if (configItem.active === false) return createJSONOutput({ status: 'closed', message: 'Maaf, klinik libur di hari ini.' });
+                // Fallback to globalHours ONLY if configItem.hours is empty/missing
+                hoursRaw = (configItem.hours && configItem.hours.trim() !== "") ? configItem.hours : globalHours;
+                slotsPerTime = configItem.slots || 1;
+            } else {
+                hoursRaw = globalHours;
+            }
+
             let hours = hoursRaw ? hoursRaw.split(/[,\s;]+/).map(h => normalizeTime(h)).filter(h => h) : defaultHours.map(h => normalizeTime(h));
             let sheetId = colSheetId !== -1 ? String(row[colSheetId] || "").trim() : '';
             
@@ -229,8 +354,17 @@ function doGet(e) {
                         debugInfo.booked_count = bookedHours.length;
                         debugInfo.booked_hours = bookedHours;
 
-                        // Filter jam yang sudah terisi
-                        hours = hours.filter(h => !bookedHours.includes(normalizeTime(h)));
+                        // Filter jam yang sudah terisi (Respect Slots Count)
+                        const hourlyCounts = {};
+                        bookedHours.forEach(bh => {
+                            hourlyCounts[bh] = (hourlyCounts[bh] || 0) + 1;
+                        });
+
+                        hours = hours.filter(h => {
+                            const normalizedH = normalizeTime(h);
+                            const currentBooked = hourlyCounts[normalizedH] || 0;
+                            return currentBooked < slotsPerTime;
+                        });
                     }
                 } catch (e) { debugInfo.filter_error = e.toString(); }
             }
@@ -242,6 +376,7 @@ function doGet(e) {
                 available_hours: hours,
                 off_days: (colOffDays !== -1 && (row[colOffDays] === 0 || row[colOffDays])) ? String(row[colOffDays]) : "",
                 custom_holidays: (colCustomHolidays !== -1 && (row[colCustomHolidays] === 0 || row[colCustomHolidays])) ? String(row[colCustomHolidays]) : "",
+                day_config: dayConfig,
                 debug: debugInfo
             });
         } else {
@@ -252,6 +387,11 @@ function doGet(e) {
     // ACTION: PING (TEST)
     if (action === "ping") {
         return createJSONOutput({ status: 'success', message: 'Koneksi ke Google Sheets OK!' });
+    }
+
+    // ACTION: VERSION CHECK
+    if (action === "check_backend_version") {
+        return createJSONOutput({ status: 'success', version: '5.5_NIK_FIXED' });
     }
 
     // ACTION: GET DEMOGRAPHIC ANALYTICS
@@ -298,6 +438,7 @@ function doGet(e) {
         checkAndFixPackagesSheet(ss);  // Ensure Packages & Protocols exist
         const limit = e.parameter.limit ? parseInt(e.parameter.limit, 10) : null;
         return createJSONOutput({
+            status: "success",
             server_time: Utilities.formatDate(new Date(), TIMEZONE, "yyyy-MM-dd HH:mm:ss"),
             patients: limit ? getDeltaDataFromSheet(ss, SHEET_NAMES.PATIENTS, null, limit) : getDataFromSheet(ss, SHEET_NAMES.PATIENTS),
             assessments: limit ? getDeltaDataFromSheet(ss, SHEET_NAMES.ASSESSMENTS, null, limit) : getDataFromSheet(ss, SHEET_NAMES.ASSESSMENTS),
@@ -318,6 +459,7 @@ function doGet(e) {
         const lastSync = e.parameter.last_sync;
         const limit = e.parameter.limit ? parseInt(e.parameter.limit, 10) : 2000;
         return createJSONOutput({
+            status: "success",
             server_time: Utilities.formatDate(new Date(), TIMEZONE, "yyyy-MM-dd HH:mm:ss"),
             patients: getDeltaDataFromSheet(ss, SHEET_NAMES.PATIENTS, lastSync, limit),
             assessments: getDeltaDataFromSheet(ss, SHEET_NAMES.ASSESSMENTS, lastSync, limit),
@@ -458,6 +600,7 @@ function doPost(e) {
                 const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'jam tersedia', 'aviliasi']);
                 const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur', 'hari libur']);
                 const colCustomHolidays = findColumnIndex(headers, ['custom_holidays', 'libur_kustom', 'tanggal_libur']);
+                const colDayConfig = findColumnIndex(headers, ['day_config', 'day config']);
                 
                 if (colSheetId === -1 || colAlias === -1 || colHours === -1) {
                    return createJSONOutput({ status: 'error', message: 'Kolom database Master tidak lengkap (Cek Sheet id/Alias/Hours).' });
@@ -502,6 +645,9 @@ function doPost(e) {
                     }
                     if (colCustomHolidays !== -1) {
                         licSheet.getRange(foundIndex + 1, colCustomHolidays + 1).setValue(customHolidaysToSave);
+                    }
+                    if (colDayConfig !== -1 && data.day_config) {
+                        licSheet.getRange(foundIndex + 1, colDayConfig + 1).setValue(JSON.stringify(data.day_config));
                     }
                     return createJSONOutput({ status: 'success', message: 'Update berhasil di baris ' + (foundIndex + 1) });
                 }
@@ -565,7 +711,10 @@ function doPost(e) {
                     Logger.log(`[Sync] Deleting Ids: Patients(${d.patients?.length||0}), Appts(${d.appointments?.length||0}), Assessments(${d.assessments?.length||0})`);
                 }
                 processIncrementalSync(ss, data);
-                return createJSONOutput({ status: "success" });
+                return createJSONOutput({ 
+                    status: "success", 
+                    server_time: Utilities.formatDate(new Date(), TIMEZONE, "yyyy-MM-dd HH:mm:ss") 
+                });
             }
 
             // ACTION: SEND NOTIFICATION
@@ -859,13 +1008,13 @@ function processPlaceholders(template, data) {
  * Helper: Find column index by multiple possible names (normalized).
  */
 function findColumnIndex(headers, targets) {
-    const normalize = (s) => String(s).toLowerCase().replace(/[\s_]/g, "");
-    const normalizedHeaders = headers.map(normalize);
-    for (const target of targets) {
-        const idx = normalizedHeaders.indexOf(normalize(target));
-        if (idx !== -1) return idx;
-    }
-    return -1;
+    return headers.findIndex(h => {
+        const normalized = String(h || "").toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+        return targets.some(t => {
+            const targetNorm = t.toLowerCase().trim().replace(/[^a-z0-9]/g, '');
+            return normalized === targetNorm; // HARUS PERSIS (Exact Match)
+        });
+    });
 }
 
 /**

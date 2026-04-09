@@ -125,7 +125,7 @@ function renderArchiveTab() {
         <div class="flex flex-col md:flex-row justify-between items-center gap-4 mb-6">
             <div>
                 <h3 class="text-lg font-bold text-slate-800">Manajemen Database Arsip</h3>
-                <p class="text-xs text-slate-400">Hubungkan Sheet ID tahun sebelumnya untuk diakses sebagai arsip.</p>
+                <p class="text-xs text-slate-400">Hubungkan ID tahun sebelumnya untuk diakses sebagai arsip.</p>
             </div>
             <button onclick="openAddArchiveModal()" class="w-full md:w-auto bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg transition-all active:scale-95">
                 <i data-lucide="plus-circle" width="18"></i> Hubungkan Arsip Baru
@@ -135,7 +135,7 @@ function renderArchiveTab() {
         <div class="bg-amber-50 border border-amber-200 p-4 rounded-xl mb-6 flex gap-3 items-start">
             <i data-lucide="info" class="text-amber-600 shrink-0" width="20"></i>
             <div class="text-xs text-amber-800 leading-relaxed">
-                Gunakan Sheet ID yang diberikan oleh Admin via WA untuk menambah backup data terbaru. (data lama tetap bisa dibuka melalui menu ini. Backup data dilakukan minimal tiap 1 tahun sekal)
+                Gunakan ID yang diberikan oleh Admin via WA untuk menambah backup data terbaru. (data lama tetap bisa dibuka melalui menu ini. Backup data dilakukan minimal tiap 1 tahun sekali)
             </div>
         </div>
         </div>
@@ -145,7 +145,7 @@ function renderArchiveTab() {
                 <thead>
                     <tr class="bg-slate-50 text-slate-500 uppercase text-[10px] font-black tracking-widest border-b border-slate-100">
                         <th class="px-4 py-3">Tahun</th>
-                        <th class="px-4 py-3">Sheet ID</th>
+                        <th class="px-4 py-3">ID</th>
                         <th class="px-4 py-3 text-right">Aksi</th>
                     </tr>
                 </thead>
@@ -157,8 +157,8 @@ function renderArchiveTab() {
                             <td class="px-4 py-3 font-bold text-slate-700">${arc.year}</td>
                             <td class="px-4 py-3 font-mono text-[11px] text-slate-500">${arc.sheet_id}</td>
                             <td class="px-4 py-3 text-right">
-                                <button onclick="deleteArchiveConfirm('${arc.year}', '${arc.sheet_id}')" class="text-red-500 hover:text-red-700 p-1" title="Hapus Mapping">
-                                    <i data-lucide="trash-2" width="16"></i>
+                                <button onclick="deleteArchiveConfirm('${arc.year}', '${arc.sheet_id}')" class="text-red-500 hover:text-red-700 p-1" title="Putus Koneksi">
+                                    <i data-lucide="log-out" width="16"></i>
                                 </button>
                             </td>
                         </tr>
@@ -177,7 +177,7 @@ function openAddArchiveModal() {
             <i data-lucide="x" width="20"></i>
         </button>
         <h3 class="text-xl font-black text-slate-800 mb-1">Hubungkan Arsip</h3>
-        <p class="text-xs text-slate-500 mb-6">Masukkan data Sheet ID yang diberikan oleh Admin.</p>
+        <p class="text-xs text-slate-500 mb-6">Masukkan data ID yang diberikan oleh Admin.</p>
         
         <div class="space-y-4">
             <div>
@@ -185,7 +185,7 @@ function openAddArchiveModal() {
                 <input type="number" id="new-arc-year" placeholder="Contoh: 2025" value="${new Date().getFullYear() - 1}" class="w-full border-2 border-slate-100 p-3 rounded-xl focus:border-blue-500 outline-none font-bold">
             </div>
             <div>
-                <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">Sheet ID (Dari WA Admin)</label>
+                <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">ID (Dari WA Admin)</label>
                 <input type="text" id="new-arc-id" placeholder="1abc...xyz" class="w-full border-2 border-slate-100 p-3 rounded-xl focus:border-blue-500 outline-none font-mono text-xs">
             </div>
             
@@ -205,7 +205,7 @@ async function submitNewArchive() {
     const btn = document.getElementById('btn-submit-arc');
 
     if (!year || !sheetId) {
-        alert("Harap isi Tahun dan Sheet ID!");
+        alert("Harap isi Tahun dan ID!");
         return;
     }
 

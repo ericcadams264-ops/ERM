@@ -67,7 +67,8 @@ let state = {
         alias: '',
         availableHours: '',
         offDays: '',
-        customHolidays: ''
+        customHolidays: '',
+        dayConfig: {} // Per-day: { "1": { active: true, hours: "...", slots: 1 }, ... }
     },
     deletedIds: {
         patients: [],
@@ -84,7 +85,8 @@ let state = {
     currentYear: new Date().getFullYear(),
     clinicName: '',
     configUpdatedAt: null,
-    serverTimeOffset: 0 // Offset in ms: ServerTime - LocalTime
+    serverTimeOffset: 0, // Offset in ms: ServerTime - LocalTime
+    dashboardTab: 'main' // 'main' or 'analytics'
 };
 
 let currentTemplateCategory = 'Semua';
@@ -223,7 +225,7 @@ function isSafeToRefresh() {
     if (modal && !modal.classList.contains('hidden')) return false;
 
     // 2. Don't refresh if user is in a view that has active input fields
-    const sensitiveViews = ['assessment_form', 'kasir', 'config', 'patient_form'];
+    const sensitiveViews = ['assessment_form', 'config', 'patient_form'];
     if (sensitiveViews.includes(state.currentView)) return false;
 
     // 3. Don't refresh if the user is currently typing in any input or textarea
@@ -234,6 +236,8 @@ function isSafeToRefresh() {
 
     return true;
 }
+
+
 
 function debounce(func, wait) {
     let timeout;
@@ -326,14 +330,16 @@ async function loadData() {
         state.licenseKey = localStorage.getItem('erm_license_key') || '';
         state.clinicName = localStorage.getItem('erm_clinic_name') || '';
 
-        let [patients, assessments, appointments, expenses, users, configs, packages] = await Promise.all([
+        let [patients, assessments, appointments, expenses, users, configs, packages, treatments, protocols] = await Promise.all([
             window.fisiotaDB.getAll('patients'),
             window.fisiotaDB.getAll('assessments'),
             window.fisiotaDB.getAll('appointments'),
             window.fisiotaDB.getAll('expenses'),
             window.fisiotaDB.getAll('users'),
             window.fisiotaDB.getAll('config'),
-            window.fisiotaDB.getAll('packages')
+            window.fisiotaDB.getAll('packages'),
+            window.fisiotaDB.getAll('treatments'),
+            window.fisiotaDB.getAll('protocols')
         ]);
 
         // 3. LOGIKA MIGRASI: Jika IndexedDB kosong tapi LocalStorage ada data
@@ -345,6 +351,8 @@ async function loadData() {
             state.expenses = JSON.parse(localStorage.getItem('erm_expenses')) || [];
             state.users = JSON.parse(localStorage.getItem('erm_users')) || [];
             state.packages = JSON.parse(localStorage.getItem('erm_packages')) || [];
+            state.treatments = JSON.parse(localStorage.getItem('erm_treatments')) || [];
+            state.protocols = JSON.parse(localStorage.getItem('erm_protocols')) || [];
 
             // Simpan hasil migrasi ke IndexedDB
             await saveData();
@@ -358,6 +366,8 @@ async function loadData() {
             state.expenses = expenses;
             state.users = users;
             state.packages = packages;
+            state.treatments = treatments || [];
+            state.protocols = protocols || [];
 
             // Load Global Configs dari store 'config'
             const globalCfg = configs.find(c => c.id === 'global');
@@ -411,9 +421,36 @@ async function loadData() {
         ensureTs(state.expenses);
         ensureTs(state.packages);
 
-        const sanitized = sanitizeAssessments(state.assessments);
-        if (JSON.stringify(sanitized) !== JSON.stringify(state.assessments)) {
-            state.assessments = sanitized;
+        state.appointments = deduplicateAppointments(state.appointments);
+
+        // Universal Sanitization
+        const sanitizeAll = (list, type) => {
+            if (!list) return [];
+            let changed = false;
+            const sanitized = list.map(item => {
+                let fixed = { ...item };
+                if (fixed.islocked !== undefined && fixed.is_locked === undefined) { fixed.is_locked = fixed.islocked; changed = true; }
+                if (fixed.defaultfee !== undefined && fixed.defaultFee === undefined) { fixed.defaultFee = fixed.defaultfee; changed = true; }
+                if (fixed.ebookurl && !fixed.ebook_url) { fixed.ebook_url = fixed.ebookurl; changed = true; }
+                if (fixed.visitorname && !fixed.visitor_name) { fixed.visitor_name = fixed.visitorname; changed = true; }
+                if (fixed.visitorcontact && !fixed.visitor_contact) { fixed.visitor_contact = fixed.visitorcontact; changed = true; }
+                if (fixed.patientid && !fixed.patientId) { fixed.patientId = fixed.patientid; changed = true; }
+                if (fixed.is_locked === undefined) { fixed.is_locked = false; changed = true; }
+                return fixed;
+            });
+            if (changed) mig = true;
+            return sanitized;
+        };
+
+        state.patients = sanitizeAll(state.patients, 'patients');
+        state.expenses = sanitizeAll(state.expenses, 'expenses');
+        state.packages = sanitizeAll(state.packages, 'packages');
+        state.treatments = sanitizeAll(state.treatments, 'treatments');
+        state.protocols = sanitizeAll(state.protocols, 'protocols');
+
+        const sanitizedAss = sanitizeAssessments(state.assessments);
+        if (JSON.stringify(sanitizedAss) !== JSON.stringify(state.assessments)) {
+            state.assessments = sanitizedAss;
             mig = true;
         }
 
@@ -574,13 +611,30 @@ async function checkLicense(silent = false) {
                 }
 
                 // SYNC BOOKING CONFIG FROM MASTER
-                if (result.alias) {
-                    state.bookingConfig.alias = result.alias;
+                if (result.alias || result.available_hours) {
+                    if (result.alias) state.bookingConfig.alias = result.alias;
                     state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : "";
                     if (result.off_days !== undefined) state.bookingConfig.offDays = String(result.off_days);
                     if (result.custom_holidays !== undefined) state.bookingConfig.customHolidays = String(result.custom_holidays);
+                    if (result.day_config) {
+                        try {
+                            state.bookingConfig.dayConfig = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                        } catch (e) { state.bookingConfig.dayConfig = {}; }
+                    }
+                    // FINAL FALLBACK: Jika alias masih kosong dari server, paksa ambil dari client_name jika ada
+                    if (!state.bookingConfig.alias && result.client_name) {
+                        state.bookingConfig.alias = result.client_name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                    }
+
                     saveData(); // Persist to IndexedDB
                 }
+            }
+
+            // Expose globally to fix underscore/camelCase mismatch
+            window.check_license = checkLicense;
+            
+            // FORCE UI REFRESH IF IN CONFIG
+            if (state.currentView === 'config') renderConfigView();
 
                 // SYNC ARCHIVES
                 if (result.archives) {
@@ -746,6 +800,11 @@ async function refreshLicenseStatus() {
                 state.bookingConfig.alias = result.alias;
                 state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : "";
                 state.bookingConfig.offDays = (result.off_days === 0 || result.off_days) ? String(result.off_days) : "";
+                if (result.day_config) {
+                    try {
+                        state.bookingConfig.dayConfig = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                    } catch (e) { state.bookingConfig.dayConfig = {}; }
+                }
                 saveData();
             }
 
@@ -776,6 +835,7 @@ async function saveData() {
             window.fisiotaDB.save('expenses', state.expenses || []),
             window.fisiotaDB.save('packages', state.packages || []),
             window.fisiotaDB.save('treatments', state.treatments || []),
+            window.fisiotaDB.save('protocols', state.protocols || []),
 
             window.fisiotaDB.save('users', state.users),
             window.fisiotaDB.save('config', [
@@ -803,24 +863,84 @@ function sanitizeAssessments(assessments) {
     return (assessments || []).map(a => {
         const fixed = { ...a };
 
-        // Handle Arrays
+        // [AUTO-FIX] Normalize keys that might be destroyed by Google Apps Script `norm()`
+        if (fixed.patientid && !fixed.patientId) fixed.patientId = fixed.patientid;
+        if (fixed.specialtests && !fixed.special_tests) fixed.special_tests = fixed.specialtests;
+        if (fixed.specialtestsnote && !fixed.special_tests_note) fixed.special_tests_note = fixed.specialtestsnote;
+        if (fixed.hmsnotes && !fixed.hms_notes) fixed.hms_notes = fixed.hmsnotes;
+        if (fixed.hmsdiagnosis && !fixed.hms_diagnosis) fixed.hms_diagnosis = fixed.hmsdiagnosis;
+        if (fixed.bodychart && !fixed.bodyChart) fixed.bodyChart = fixed.bodychart;
+        if (fixed.templatedefault && !fixed.templateDefault) fixed.templateDefault = fixed.templatedefault;
+        if (fixed.painpoints && !fixed.pain_points) fixed.pain_points = fixed.painpoints;
+        if (fixed.dact && !fixed.d_act) fixed.d_act = fixed.dact;
+        if (fixed.dpart && !fixed.d_part) fixed.d_part = fixed.dpart;
+        if (fixed.categoryid && !fixed.categoryID) fixed.categoryID = fixed.categoryid;
+        if (fixed.diseaseid && !fixed.diseaseID) fixed.diseaseID = fixed.diseaseid;
+        if (fixed.isconsented && !fixed.is_consented) fixed.is_consented = fixed.isconsented;
+        if (fixed.consenttimestamp && !fixed.consent_timestamp) fixed.consent_timestamp = fixed.consenttimestamp;
+        if (fixed.patientsignature && !fixed.patient_signature) fixed.patient_signature = fixed.patientsignature;
+        if (fixed.rontgenurl && !fixed.rontgen_url) fixed.rontgen_url = fixed.rontgenurl;
+
+        // [AUTO-FIX] New TTV & D/S Normalization
+        if (fixed.ttvtd && !fixed.ttv_td) fixed.ttv_td = fixed.ttvtd;
+        if (fixed.ttvhr && !fixed.ttv_hr) fixed.ttv_hr = fixed.ttvhr;
+        if (fixed.ttvrr && !fixed.ttv_rr) fixed.ttv_rr = fixed.ttvrr;
+        if (fixed.ttvtemp && !fixed.ttv_temp) fixed.ttv_temp = fixed.ttvtemp;
+        if (fixed.ttvspo2 && !fixed.ttv_spo2) fixed.ttv_spo2 = fixed.ttvspo2;
+        if (fixed.romd && !fixed.rom_d) fixed.rom_d = fixed.romd;
+        if (fixed.roms && !fixed.rom_s) fixed.rom_s = fixed.roms;
+        if (fixed.mmtd && !fixed.mmt_d) fixed.mmt_d = fixed.mmtd;
+        if (fixed.mmts && !fixed.mmt_s) fixed.mmt_s = fixed.mmts;
+
+        // 1. Handle Array Fields
         ARRAY_FIELDS.forEach(field => {
-            if (!Array.isArray(fixed[field])) {
-                if (typeof fixed[field] === 'string' && fixed[field].trim().startsWith('[')) {
-                    try { fixed[field] = JSON.parse(fixed[field]); } catch (e) { fixed[field] = []; }
-                } else if (typeof fixed[field] === 'string' && fixed[field].trim() !== '') {
-                    fixed[field] = [fixed[field]];
-                } else {
-                    fixed[field] = [];
-                }
+            let val = fixed[field];
+
+            // Jika isinya string JSON array
+            if (typeof val === 'string' && val.trim().startsWith('[')) {
+                try { val = JSON.parse(val); } catch (e) { val = []; }
             }
+
+            // Jika masuk sebagai object tapi bukan array (biasanya karena salah penempatan/sync)
+            if (val && typeof val === 'object' && !Array.isArray(val)) {
+                val = [val];
+            }
+
+            // Pastikan akhirnya adalah array
+            let finalArr = [];
+            if (Array.isArray(val)) {
+                finalArr = val;
+            } else if (typeof val === 'string' && val.trim() !== '') {
+                finalArr = [val];
+            }
+
+            // [CRITICAL FIX] Clean each element from redundant quotes/slashes
+            fixed[field] = finalArr.map(item => {
+                if (typeof item === 'string') {
+                    // Hilangkan karakter kutip yang menempel di awal/akhir string (hasil double stringify)
+                    let cleaned = item.trim();
+                    if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+                        cleaned = cleaned.substring(1, cleaned.length - 1);
+                    }
+                    // Ganti literal backslash-quote dengan quote biasa
+                    return cleaned.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+                }
+                return item;
+            });
         });
 
-        // Handle Objects
+        // 2. Handle Object Fields
         OBJECT_FIELDS.forEach(field => {
+            // Jika isinya string JSON object
             if (typeof fixed[field] === 'string' && fixed[field].trim().startsWith('{')) {
                 try { fixed[field] = JSON.parse(fixed[field]); } catch (e) { fixed[field] = {}; }
-            } else if (!fixed[field] || typeof fixed[field] !== 'object') {
+            }
+            // CRITICAL: Jika masuk sebagai array padahal harusnya object (misal: [{"rom":...}])
+            if (Array.isArray(fixed[field])) {
+                fixed[field] = fixed[field][0] || (field === 'obj' ? { rom: '-', rom_side: '-', rom_part: '-', mmt: '0', mmt_side: '-', mmt_part: '-', balance: 'Baik' } : {});
+            }
+            // Pastikan akhirnya adalah object
+            if (!fixed[field] || typeof fixed[field] !== 'object' || Array.isArray(fixed[field])) {
                 if (field === 'obj') {
                     fixed[field] = { rom: '-', rom_side: '-', rom_part: '-', mmt: '0', mmt_side: '-', mmt_part: '-', balance: 'Baik' };
                 } else {
@@ -831,13 +951,21 @@ function sanitizeAssessments(assessments) {
 
         // Migration: Move special_tests from obj to root if missing
         if (fixed.obj && typeof fixed.obj === 'object') {
-            if (fixed.obj.special_tests && (!fixed.special_tests || Object.keys(fixed.special_tests).length === 0)) {
-                fixed.special_tests = fixed.obj.special_tests;
-                delete fixed.obj.special_tests;
-            }
-            if (fixed.obj.special_tests_note && (!fixed.special_tests_note || fixed.special_tests_note === "")) {
-                fixed.special_tests_note = fixed.obj.special_tests_note;
-                delete fixed.obj.special_tests_note;
+            if (fixed.obj) {
+                // FORCE MOVE: special_tests and special_tests_note MUST be top-level
+                if (fixed.obj.special_tests) {
+                    // Only overwrite if top-level is empty OR we are doing a fresh extraction
+                    if (!fixed.special_tests || Object.keys(fixed.special_tests).length === 0) {
+                        fixed.special_tests = fixed.obj.special_tests;
+                    }
+                    delete fixed.obj.special_tests;
+                }
+                if (fixed.obj.special_tests_note) {
+                    if (!fixed.special_tests_note || fixed.special_tests_note === "") {
+                        fixed.special_tests_note = fixed.obj.special_tests_note;
+                    }
+                    delete fixed.obj.special_tests_note;
+                }
             }
         }
 
@@ -852,7 +980,24 @@ function sanitizeAssessments(assessments) {
         if (fixed.consent_timestamp === undefined) fixed.consent_timestamp = "";
         if (fixed.patient_signature === undefined) fixed.patient_signature = "";
         if (fixed.rontgen_url === undefined) fixed.rontgen_url = "";
+        if (fixed.is_locked === undefined) fixed.is_locked = false;
         if (fixed.updatedAt === undefined) fixed.updatedAt = getServerTimeISO();
+
+        // Auto-Lock Logic: If synced and older than 7 days, mark as locked to prevent backend corruption
+        const lastSyncStr = localStorage.getItem('erm_last_sync');
+        if (lastSyncStr && !fixed.is_locked) {
+            const lastSync = new Date(lastSyncStr);
+            const assessDate = new Date(fixed.date);
+            const diffDays = Math.floor((lastSync - assessDate) / (1000 * 60 * 60 * 24));
+            if (diffDays >= 7) {
+                fixed.is_locked = true;
+            }
+        }
+
+        // 3. Last Line Defense for VAS (Anti-Corruption)
+        if (typeof fixed.vas === 'string' && (fixed.vas.includes('{') || fixed.vas.includes('['))) {
+            fixed.vas = "0";
+        }
 
         return fixed;
     });
@@ -869,13 +1014,15 @@ function applyBranding() {
         const id = state.clinicInfo.logoUrl.split('id=')[1];
         if (id) state.clinicInfo.logoUrl = `https://lh3.googleusercontent.com/d/${id}`;
     }
-    
+
     // Sidebar Logo
     const sbLogoContainer = document.getElementById('sidebar-logo-container');
     const sbLogoImg = document.getElementById('sidebar-logo');
     if (sbLogoContainer && sbLogoImg) {
-        if (state.clinicInfo.logoUrl) {
-            sbLogoImg.src = convertDriveUrl(state.clinicInfo.logoUrl);
+        // Priority: window.IMG_ASSETS.logo (User Choice) -> state.clinicInfo.logoUrl (Cloud Config)
+        const activeLogo = window.IMG_ASSETS.logo || convertDriveUrl(state.clinicInfo.logoUrl);
+        if (activeLogo) {
+            sbLogoImg.src = activeLogo;
             sbLogoImg.onerror = () => { sbLogoContainer.classList.add('hidden'); };
             sbLogoContainer.classList.remove('hidden');
         } else {
@@ -892,13 +1039,22 @@ function applyBranding() {
     const loginLogoContainer = document.getElementById('login-logo-container');
     const loginLogoImg = document.getElementById('login-logo');
     if (loginLogoContainer && loginLogoImg) {
-        if (state.clinicInfo.logoUrl) {
-            loginLogoImg.src = convertDriveUrl(state.clinicInfo.logoUrl);
+        const activeLogo = window.IMG_ASSETS.logo || convertDriveUrl(state.clinicInfo.logoUrl);
+        if (activeLogo) {
+            loginLogoImg.src = activeLogo;
             loginLogoImg.onerror = () => { loginLogoContainer.classList.add('hidden'); };
             loginLogoContainer.classList.remove('hidden');
         } else {
             loginLogoContainer.classList.add('hidden');
         }
+    }
+
+    // Dynamic Favicon & Apple Icons (Uses window.IMG_ASSETS.logo)
+    if (window.IMG_ASSETS.logo) {
+        const favEl = document.getElementById('dynamic-favicon');
+        if (favEl) favEl.href = window.IMG_ASSETS.logo;
+        const appleEl = document.getElementById('dynamic-apple-icon');
+        if (appleEl) appleEl.href = window.IMG_ASSETS.logo;
     }
 
     // Apply Dynamic Accent Color
@@ -1250,7 +1406,11 @@ async function _pushDelta(sheetId) {
             console.log('AutoSync: Push berhasil ✅ | Server Time:', finalSyncTime);
             return pushedDeleteIds;
         } else {
-            console.warn('AutoSync: Push gagal –', res.message || 'Unknown error');
+            const errorMsg = res.message || 'Unknown error';
+            console.warn('AutoSync: Push gagal –', errorMsg);
+            if (errorMsg.toLowerCase().includes('protected') || errorMsg.toLowerCase().includes('fail')) {
+                showToast(`Sinkronisasi Gagal: Baris 1 di Google Sheet mungkin Terkunci (Protected).`, 'error');
+            }
         }
     } catch (e) {
         console.warn('AutoSync: Push error (offline?) –', e.message);
@@ -1267,29 +1427,36 @@ async function syncDelta(blocking = false) {
         return;
     }
 
+    // [FIX] Stuck sync lock protection (Auto-recovery after 60s)
+    if (state._syncing && (Date.now() - (state._lastSyncStart || 0)) > 60000) {
+        console.warn("Sync lock timeout detected, forcing recovery...");
+        state._syncing = false;
+    }
+
     if (state._syncing) {
         console.log("SyncDelta: System busy, rescheduling in 2s...");
         setTimeout(() => syncDelta(blocking), 2000);
         return;
     }
     state._syncing = true;
+    state._lastSyncStart = Date.now();
     updateSyncStatusUI('syncing', blocking);
 
     const lastSyncStr = localStorage.getItem('erm_last_sync');
     const lastSync = parseDateSafe(lastSyncStr);
+    const lastSyncTime = lastSync.getTime();
 
-    let latestPushedTime = lastSync.getTime();
+    let latestPushedTime = lastSyncTime;
 
     const filterDelta = (list) => {
         if (!list || !Array.isArray(list)) return [];
         return list.filter(item => {
-            const up = parseDateSafe(item.updatedAt || item.updated_at);
-            const t = up.getTime();
-            if (t > lastSync.getTime()) {
-                if (t > latestPushedTime) latestPushedTime = t;
-                return true;
-            }
-            return false;
+            // Primary: _dirty flag = instant push
+            if (item._dirty === true) return true;
+
+            // Fallback: clock skew protection
+            const itemTime = parseDateSafe(item.updatedAt || item.updated_at).getTime();
+            return itemTime > (lastSyncTime - 60000);
         });
     };
 
@@ -1300,17 +1467,20 @@ async function syncDelta(blocking = false) {
     const deltaPackages = filterDelta(state.packages);
     const deltaProtocols = filterDelta(state.protocols);
     const deltaUsers = filterDelta(state.users);
+    const deltaTreatments = filterDelta(state.treatments);
 
     const hasDelta = deltaPatients.length > 0 || deltaAssessments.length > 0 ||
         deltaAppointments.length > 0 || deltaExpenses.length > 0 ||
-        deltaPackages.length > 0 || deltaProtocols.length > 0 || deltaUsers.length > 0;
+        deltaPackages.length > 0 || deltaProtocols.length > 0 ||
+        deltaUsers.length > 0 || deltaTreatments.length > 0;
 
     // Check for deletes
     const hasDeletes = Object.values(state.deletedIds || {}).some(arr => Array.isArray(arr) && arr.length > 0);
 
     if (!hasDelta && !hasDeletes) {
         state._syncing = false;
-        updateSyncStatusUI('success'); // Show green checkmark
+        // If we came here from a manual sync request, still show success
+        updateSyncStatusUI('success');
         return;
     }
 
@@ -1331,6 +1501,7 @@ async function syncDelta(blocking = false) {
                 packages: deltaPackages,
                 protocols: deltaProtocols,
                 users: deltaUsers,
+                treatments: deltaTreatments,
                 deletedIds: state.deletedIds
             })
         });
@@ -1338,23 +1509,40 @@ async function syncDelta(blocking = false) {
         const res = await response.json();
         if (response.ok && res.status === 'success') {
             // Success
-            const finalSyncTime = new Date(latestPushedTime).toISOString();
+            const finalSyncTime = res.server_time || getServerTimeISO();
             localStorage.setItem('erm_last_sync', finalSyncTime);
 
+            // [CRITICAL] Clear Dirty Flags only for items that were in the delta (Selective Clearing)
+            const clearSelected = (deltaList) => { (deltaList || []).forEach(x => { if (x._dirty) delete x._dirty; }); };
+            clearSelected(deltaPatients);
+            clearSelected(deltaAssessments);
+            clearSelected(deltaAppointments);
+            clearSelected(deltaExpenses);
+            clearSelected(deltaPackages);
+            clearSelected(deltaProtocols);
+            clearSelected(deltaUsers);
+            clearSelected(deltaTreatments);
+
             // Clear deletes that were sent
-            state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], protocols: [] };
+            state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], protocols: [], treatments: [] };
 
             updateSyncStatusUI('success');
             console.log("Sync Delta: Success ✅");
         } else {
             updateSyncStatusUI('error');
-            console.warn("Sync Delta: Failed –", res.message || "Unknown error");
+            console.warn("Sync Delta: Failed –", res?.message || "Unknown error");
         }
     } catch (e) {
         updateSyncStatusUI('error');
         console.error("Sync Delta: Error –", e);
     } finally {
         state._syncing = false;
+        // Ensure blocking overlay is removed
+        if (window._isBlockingSync) {
+            window._isBlockingSync = false;
+            const syncLoading = document.getElementById('sync-loading');
+            if (syncLoading) syncLoading.classList.add('hidden');
+        }
     }
 }
 
@@ -1454,6 +1642,7 @@ function checkConfigDelta(lastSync) {
         { key: 'CLINIC_NAME', value: state.clinicInfo.name },
         { key: 'CLINIC_SUBNAME', value: state.clinicInfo.subname },
         { key: 'CLINIC_CITY', value: state.clinicInfo.city },
+        { key: 'CLINIC_LOGO', value: state.clinicInfo.logoUrl || '' },
         { key: 'CLINIC_THERAPIST', value: state.clinicInfo.therapist },
         { key: 'CLINIC_SIPF', value: state.clinicInfo.sipf },
         { key: 'CLINIC_ADDRESS', value: state.clinicInfo.address },
@@ -1528,45 +1717,57 @@ async function pullDataFromSheet() {
             if (data.protocols) state.protocols = cleanup(data.protocols, 'protocols');
             if (data.users) state.users = cleanup(data.users, 'users');
 
-            // Sync Config
+            // [FIXED] Single Unified Config Sync Loop (Prevents Overwriting)
             if (data.config && Array.isArray(data.config)) {
                 data.config.forEach(c => {
-                    if (c.key === 'CLINIC_NAME') state.clinicInfo.name = c.value;
-                    if (c.key === 'CLINIC_SUBNAME') state.clinicInfo.subname = c.value;
-                    if (c.key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = c.value;
-                    if (c.key === 'CLINIC_SIPF') state.clinicInfo.sipf = c.value;
-                    if (c.key === 'CLINIC_ADDRESS') state.clinicInfo.address = c.value;
-                    if (c.key === 'CLINIC_NPWP') state.clinicInfo.npwp = c.value;
-                    if (c.key === 'CLINIC_PHONE') state.clinicInfo.phone = c.value;
-                    if (c.key === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = c.value;
-                    if (c.key === 'BOOKING_HOURS') state.bookingConfig.availableHours = c.value;
-                    if (c.key === 'BOOKING_OFFDAYS') state.bookingConfig.offDays = c.value;
-                    if (c.key === 'BOOKING_ALIAS') state.bookingConfig.alias = c.value;
-                });
-            }
-            if (data.packages) state.packages = cleanup(data.packages, 'packages');
+                    const key = c.key ? c.key.toUpperCase() : '';
+                    const val = c.value;
 
-            // Sync Config if available
-            if (data.config && Array.isArray(data.config)) {
-                data.config.forEach(c => {
-                    if (c.key === 'CLINIC_NAME') state.clinicInfo.name = c.value;
-                    if (c.key === 'CLINIC_SUBNAME') state.clinicInfo.subname = c.value;
-                    if (c.key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = c.value;
-                    if (c.key === 'CLINIC_SIPF') state.clinicInfo.sipf = c.value;
-                    if (c.key === 'CLINIC_ADDRESS') state.clinicInfo.address = c.value;
-                    if (c.key === 'CLINIC_NPWP') state.clinicInfo.npwp = c.value;
-                    if (c.key === 'CLINIC_PHONE') state.clinicInfo.phone = c.value;
-                    if (c.key === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = c.value;
-                    if (c.key === 'TELEGRAM_TOKEN') state.notificationConfig.telegramToken = c.value;
-                    if (c.key === 'TELEGRAM_CHAT_ID') state.notificationConfig.telegramChatId = c.value;
-                    if (c.key === 'EMAIL_RECEIVER') state.notificationConfig.targetEmail = c.value;
-                    if (c.key === 'EMAIL_SENDER') state.notificationConfig.senderEmail = c.value;
-                    if (c.key === 'MSG_CONFIRM_TEMPLATE') state.notificationConfig.msgConfirm = c.value;
-                    if (c.key === 'MSG_REJECT_TEMPLATE') state.notificationConfig.msgReject = c.value;
-                    if (c.key === 'MSG_REMINDER_TEMPLATE') state.notificationConfig.msgReminder = c.value;
+                    // 1. Individual Clinic Info
+                    if (key === 'CLINIC_NAME') state.clinicInfo.name = val;
+                    if (key === 'CLINIC_SUBNAME') state.clinicInfo.subname = val;
+                    if (key === 'CLINIC_CITY') state.clinicInfo.city = val;
+                    if (key === 'CLINIC_LOGO') state.clinicInfo.logoUrl = val;
+                    if (key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = val;
+                    if (key === 'CLINIC_SIPF') state.clinicInfo.sipf = val;
+                    if (key === 'CLINIC_ADDRESS') state.clinicInfo.address = val;
+                    if (key === 'CLINIC_NPWP') state.clinicInfo.npwp = val;
+                    if (key === 'CLINIC_PHONE') state.clinicInfo.phone = val;
+                    if (key === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = val;
+
+                    // 2. Notification Config
+                    if (key === 'TELEGRAM_TOKEN') state.notificationConfig.telegramToken = val;
+                    if (key === 'TELEGRAM_CHAT_ID') state.notificationConfig.telegramChatId = val;
+                    if (key === 'EMAIL_RECEIVER') state.notificationConfig.targetEmail = val;
+                    if (key === 'EMAIL_SENDER') state.notificationConfig.senderEmail = val;
+                    if (key === 'MSG_CONFIRM_TEMPLATE') state.notificationConfig.msgConfirm = val;
+                    if (key === 'MSG_REJECT_TEMPLATE') state.notificationConfig.msgReject = val;
+                    if (key === 'MSG_REMINDER_TEMPLATE') state.notificationConfig.msgReminder = val;
+
+                    // 3. Booking & PDF Config
+                    if (key === 'BOOKING_HOURS') state.bookingConfig.availableHours = val;
+                    if (key === 'BOOKING_OFFDAYS') state.bookingConfig.offDays = val;
+                    if (key === 'BOOKING_ALIAS') state.bookingConfig.alias = val;
+                    if (key === 'BOOKING_HOLIDAYS') state.bookingConfig.customHolidays = val;
+
+                    if (key === 'PDF_IC_TEXT') state.pdfConfig.informedConsentText = val;
+                    if (key === 'PDF_LAYOUT') state.pdfConfig.layoutMode = val;
+                    if (key === 'PDF_ACCENT') state.pdfConfig.accentColor = val;
+                    if (key === 'PDF_FONT_SIZE') state.pdfConfig.fontSize = val;
+
+                    // 4. Fallback Support (Legacy CLINIC_INFO JSON)
+                    if (key === 'CLINIC_INFO' || key === 'clinic_info') {
+                        try {
+                            const info = JSON.parse(val);
+                            Object.assign(state.clinicInfo, info);
+                        } catch (e) { }
+                    }
                 });
+
+                // Persistence
                 localStorage.setItem('erm_clinic_config', JSON.stringify(state.clinicInfo));
                 localStorage.setItem('erm_notif_config', JSON.stringify(state.notificationConfig));
+                localStorage.setItem('erm_pdf_config', JSON.stringify(state.pdfConfig));
             }
 
             saveData();
@@ -1603,11 +1804,14 @@ async function silentPullRefresh(clean = false) {
         const response = await fetch(`${LICENSE_API_URL}?action=pull&sheet_id=${sheetId}&t=${Date.now()}`);
         const data = await response.json();
 
-        if (data.status === 'success' && data.patients) {
+        if ((data.status === 'success' || data.patients) && (data.patients || data.appointments)) {
             // [NEW] AUTHORITATIVE RECONCILIATION: 
             // If it's a 'pull' action (full data), we treat the server as the MASTER.
             // Items missing from the server pull that are OLD (not just created locally) must be PURGED.
             const reconcileAuthoritative = (localList, serverList, cat) => {
+                if (clean && cat === 'treatments' && (!serverList || serverList.length === 0)) {
+                    console.warn("DEBUG: Server response for TREATMENTS is empty or missing!");
+                }
                 const serverIds = new Set((serverList || []).map(s => String(s.id)));
                 const deletedList = state.deletedIds[cat] || [];
 
@@ -1622,8 +1826,8 @@ async function silentPullRefresh(clean = false) {
                     if (deletedList.includes(item.id)) return false;
 
                     // [NEW] CONFIG PROTECTION: If switching to a NEW empty year, 
-                    // PROTECT config categories (packages, protocols, users) from being wiped.
-                    const isConfigCat = ['packages', 'protocols', 'users'].includes(cat);
+                    // PROTECT config categories (packages, protocols, users, treatments) from being wiped.
+                    const isConfigCat = ['packages', 'protocols', 'users', 'treatments'].includes(cat);
                     if (isConfigCat && serverIds.size === 0 && (localList || []).length > 0) {
                         return true; // Stay locally (Will sync/push to the new sheet later)
                     }
@@ -1650,14 +1854,32 @@ async function silentPullRefresh(clean = false) {
                 return (list || []).filter(item => !deletedList.includes(item.id) && !window._recentDeletes.has(String(item.id)));
             };
 
-            // Process Authoritative Reconciliation first
-            state.patients = reconcileAuthoritative(state.patients, data.patients, 'patients');
-            state.assessments = reconcileAuthoritative(state.assessments, data.assessments, 'assessments');
-            state.appointments = reconcileAuthoritative(state.appointments, data.appointments, 'appointments');
-            state.expenses = reconcileAuthoritative(state.expenses, data.expenses, 'expenses');
-            state.packages = reconcileAuthoritative(state.packages, data.packages, 'packages');
-            state.protocols = reconcileAuthoritative(state.protocols, data.protocols, 'protocols');
-            state.users = reconcileAuthoritative(state.users, data.users, 'users');
+            // [NEW] NORMALIZE KEYS FROM SERVER (GAS returns lowercase keys)
+            const normKeys = (list) => (list || []).map(item => {
+                const norm = { ...item };
+                if (item.updatedat && !item.updatedAt) norm.updatedAt = item.updatedat;
+                if (item.islocked !== undefined && item.is_locked === undefined) norm.is_locked = item.islocked;
+                if (item.patientid && !item.patientId) norm.patientId = item.patientid;
+                return norm;
+            });
+
+            if (data.treatments) {
+                console.log("DEBUG: Treatments received from server:", data.treatments.length, "items");
+                data.treatments = normKeys(data.treatments);
+            }
+            if (data.packages) data.packages = normKeys(data.packages);
+            if (data.protocols) data.protocols = normKeys(data.protocols);
+            if (data.users) data.users = normKeys(data.users);
+
+            // Process Authoritative Reconciliation (ONLY for keys present in the response)
+            if (data.patients) state.patients = reconcileAuthoritative(state.patients, data.patients, 'patients');
+            if (data.assessments) state.assessments = reconcileAuthoritative(state.assessments, data.assessments, 'assessments');
+            if (data.appointments) state.appointments = reconcileAuthoritative(state.appointments, data.appointments, 'appointments');
+            if (data.expenses) state.expenses = reconcileAuthoritative(state.expenses, data.expenses, 'expenses');
+            if (data.packages) state.packages = reconcileAuthoritative(state.packages, data.packages, 'packages');
+            if (data.treatments) state.treatments = reconcileAuthoritative(state.treatments, data.treatments, 'treatments');
+            if (data.protocols) state.protocols = reconcileAuthoritative(state.protocols, data.protocols, 'protocols');
+            if (data.users) state.users = reconcileAuthoritative(state.users, data.users, 'users');
 
             // Then Merge/Update with server data
             const mergeOverwrite = (localArr, serverArr) => {
@@ -1671,6 +1893,7 @@ async function silentPullRefresh(clean = false) {
             state.appointments = deduplicateAppointments(cleanup(mergeOverwrite(state.appointments, data.appointments), 'appointments'));
             if (data.expenses) state.expenses = cleanup(mergeOverwrite(state.expenses, data.expenses), 'expenses');
             if (data.packages) state.packages = cleanup(mergeOverwrite(state.packages, data.packages), 'packages');
+            if (data.treatments) state.treatments = cleanup(mergeOverwrite(state.treatments, data.treatments), 'treatments');
             if (data.protocols) state.protocols = cleanup(mergeOverwrite(state.protocols, data.protocols), 'protocols');
             if (data.users) {
                 const rawUsers = cleanup(mergeOverwrite(state.users, data.users), 'users');
@@ -1684,24 +1907,59 @@ async function silentPullRefresh(clean = false) {
                 });
                 state.users = Array.from(usernameMap.values());
                 // [KEY FIX] Once users are synced from server, permanently disable admin/123 fallback
-                if (state.users.length > 0) {
-                    localStorage.setItem('erm_users_initialized', 'true');
+            }
+
+            // [NEW] POST-SYNC UI UPDATE & DIAGNOSTICS
+            if (clean) {
+                if (!data.treatments || data.treatments.length === 0) {
+                    console.warn("Server tidak mengirim data tindakan.");
+                } else {
+                    console.log(`Berhasil menarik ${data.treatments.length} data tindakan.`);
                 }
+            }
+
+            // Auto-refresh view if user is currently on the Config/Treatment tab
+            if (state.activeConfigTab === 'treatments') {
+                const container = document.getElementById('treatment-list-container');
+                if (container) { container.innerHTML = renderTreatmentTable(); renderIcons(); }
+            } else if (state.activeConfigTab === 'packages') {
+                const container = document.getElementById('package-list-container');
+                if (container) { container.innerHTML = renderPackageTable(); renderIcons(); }
+            }
+
+            if (state.users.length > 0) {
+                localStorage.setItem('erm_users_initialized', 'true');
             }
             if (data.config) state.configUpdated = true; // Flag for config update
 
             if (data.config && Array.isArray(data.config)) {
                 data.config.forEach(c => {
-                    if (c.key === 'CLINIC_NAME') state.clinicInfo.name = c.value;
-                    if (c.key === 'CLINIC_SUBNAME') state.clinicInfo.subname = c.value;
-                    if (c.key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = c.value;
-                    if (c.key === 'CLINIC_SIPF') state.clinicInfo.sipf = c.value;
-                    if (c.key === 'CLINIC_ADDRESS') state.clinicInfo.address = c.value;
-                    if (c.key === 'CLINIC_NPWP') state.clinicInfo.npwp = c.value;
-                    if (c.key === 'CLINIC_PHONE') state.clinicInfo.phone = c.value;
-                    if (c.key === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = c.value;
+                    const key = c.key ? c.key.toUpperCase() : '';
+                    const val = c.value;
+                    if (key === 'CLINIC_NAME') state.clinicInfo.name = val;
+                    if (key === 'CLINIC_SUBNAME') state.clinicInfo.subname = val;
+                    if (key === 'CLINIC_CITY') state.clinicInfo.city = val;
+                    if (key === 'CLINIC_LOGO') state.clinicInfo.logoUrl = val;
+                    if (key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = val;
+                    if (key === 'CLINIC_SIPF') state.clinicInfo.sipf = val;
+                    if (key === 'CLINIC_ADDRESS') state.clinicInfo.address = val;
+                    if (key === 'CLINIC_NPWP') state.clinicInfo.npwp = val;
+                    if (key === 'CLINIC_PHONE') state.clinicInfo.phone = val;
+                    if (key === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = val;
+
+                    if (key === 'TELEGRAM_TOKEN') state.notificationConfig.telegramToken = val;
+                    if (key === 'TELEGRAM_CHAT_ID') state.notificationConfig.telegramChatId = val;
+                    if (key === 'EMAIL_RECEIVER') state.notificationConfig.targetEmail = val;
+
+                    if (key === 'CLINIC_INFO' || key === 'clinic_info') {
+                        try {
+                            const info = JSON.parse(val);
+                            Object.assign(state.clinicInfo, info);
+                        } catch (e) { }
+                    }
                 });
                 localStorage.setItem('erm_clinic_config', JSON.stringify(state.clinicInfo));
+                localStorage.setItem('erm_notif_config', JSON.stringify(state.notificationConfig));
             }
 
             // [NEW] SMART SEEDING: Jika Sheet baru (Config kosong) tapi kita punya data lokal
@@ -1712,7 +1970,7 @@ async function silentPullRefresh(clean = false) {
             }
 
             if (clean) {
-                state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], protocols: [] };
+                state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], treatments: [], protocols: [] };
                 localStorage.setItem('erm_deleted_ids', JSON.stringify(state.deletedIds));
             }
 
@@ -1865,7 +2123,7 @@ async function handleLogin(e) {
             <div class="flex flex-col gap-2">
                 <div class="flex items-center gap-2"><i data-lucide="alert-circle" width="16"></i> Username atau Password Salah!</div>
                 <button type="button" onclick="pullDataFromSheet()" class="text-[10px] text-blue-600 hover:underline text-left mt-1">
-                    Baru ganti password di Sheet? Klik untuk Tarik Data User Baru
+                    Password tidak dikenali? Klik di sini untuk Sinkronisasi Kredensial dari Cloud/Server
                 </button>
             </div>
         `;
@@ -1958,11 +2216,10 @@ async function backgroundAutoSync() {
     }
     if (state._syncing) return;
 
-    // [GLOBAL SYNC PAUSE] Skip background auto-sync if user is busy with forms/inputs
-    if (!isSafeToAutoSync()) {
-        console.log("BackgroundAutoSync: User busy, skipping this cycle.");
-        return;
-    }
+    // [NEW LOGIC] backgroundAutoSync is now always allowed so that PUSH operations 
+    // can happen in the background. UI refreshing (renderApp) however is still 
+    // gated by isSafeToRefresh() to prevent disrupting the user.
+    // REMOVED: if (!isSafeToAutoSync()) return;
 
     // Use state.sheetId as fallback if scriptUrl is partial or missing
     const sheetId = getSheetIdFromUrl(state.scriptUrl) || state.sheetId;
@@ -2068,25 +2325,24 @@ async function backgroundAutoSync() {
             state.patients = state.patients.filter(p => p && p.id && p.name && p.name.trim() !== "");
 
             let uiNeedsRefresh = false;
-            let hasNewBooking = false;
 
-            // [NEW] Process Config from Server
+            // [FIXED] Process Config from Server (Identity & Branding)
             if (data.config && Array.isArray(data.config) && state.currentView !== 'config') {
                 data.config.forEach(c => {
-                    const k = c.key;
+                    const k = c.key ? c.key.toUpperCase() : '';
                     const v = c.value;
                     if (!v) return;
 
-                    // Identity
                     if (k === 'CLINIC_NAME') state.clinicInfo.name = v;
                     if (k === 'CLINIC_SUBNAME') state.clinicInfo.subname = v;
                     if (k === 'CLINIC_CITY') state.clinicInfo.city = v;
+                    if (k === 'CLINIC_LOGO') state.clinicInfo.logoUrl = v;
                     if (k === 'CLINIC_THERAPIST') state.clinicInfo.therapist = v;
                     if (k === 'CLINIC_SIPF') state.clinicInfo.sipf = v;
                     if (k === 'CLINIC_ADDRESS') state.clinicInfo.address = v;
+                    if (k === 'CLINIC_NPWP') state.clinicInfo.npwp = v;
                     if (k === 'CLINIC_PHONE') state.clinicInfo.phone = v;
                     if (k === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = v;
-                    if (k === 'CLINIC_NPWP') state.clinicInfo.npwp = v;
 
                     // Booking
                     if (k === 'BOOKING_ALIAS') state.bookingConfig.alias = v;
@@ -2141,10 +2397,21 @@ async function backgroundAutoSync() {
                             const serverTime = new Date(inc.updatedAt || 0).getTime();
 
                             if (serverTime > localTime) {
-                                // Server lebih baru (misal: diubah dari device/orang lain)
+                                // JANGAN timpa jika lokal baru saja di ACC (PENDING -> CONFIRMED)
+                                // Kita beri toleransi 2 menit agar server sempat update
+                                const isRecentAcc = localArr[idx].status === 'CONFIRMED' && (Date.now() - localTime < 120000);
+                                
+                                if (isRecentAcc && inc.status === 'PENDING') {
+                                    console.log("Sync Check: Mendeteksi data lama dari server untuk booking yang sudah di-ACC. Diabaikan.");
+                                    return;
+                                }
+
                                 localArr[idx] = inc;
                                 uiNeedsRefresh = true;
-                                if (category === 'appointments' && inc.status === 'PENDING') hasNewBooking = true;
+                                if (category === 'appointments' && inc.status === 'PENDING') {
+                                    const isTrulyNew = !state.appointments.some(a => a.id === inc.id);
+                                    if (isTrulyNew) hasNewBooking = true;
+                                }
                             } else if (serverTime === localTime) {
                                 // Timestamp sama, cek konten: mungkin status berubah (misal PENDING → CONFIRMED)
                                 const locStr = JSON.stringify({ ...localArr[idx], updatedAt: null });
@@ -2240,12 +2507,14 @@ async function backgroundAutoSync() {
             */
 
             // Option 1: Auto-Refresh UI for Schedule, Dashboard, or Kasir
+            const currentPendingCount = (state.appointments || []).filter(a => a.status === 'PENDING').length;
             if (uiNeedsRefresh) {
-                if (hasNewBooking || (state.appointments && state.appointments.filter(a => a.status === 'PENDING').length > (window.lastBookingCount || 0))) {
+                if (hasNewBooking || currentPendingCount > (window.lastBookingCount || 0)) {
                     showSyncBanner(true);
                     updateSidebarBadges();
-                    window.lastBookingCount = state.appointments.filter(a => a.status === 'PENDING').length;
-                } else {
+                }
+                window.lastBookingCount = currentPendingCount;
+                if (!hasNewBooking && !showSyncBanner && isSafeToRefresh()) {
                     // SILENT AUTO-REFRESH for generic data: 
                     // Only if no modal is open and not in config view (to avoid resetting input fields)
                     if (isSafeToRefresh()) {
@@ -2336,7 +2605,7 @@ async function refreshScheduleFromServer() {
     }
 }
 
-function handleLogout() { state.user = null; state.currentView = 'login'; renderApp(); }
+function handleLogout() { state.user = null; state.currentView = 'login'; window._sidebarInitialized = false; renderApp(); }
 
 function navigate(view) {
     if ((view === 'config' || view === 'analytics') && state.user.role !== 'ADMIN') {
@@ -2344,26 +2613,84 @@ function navigate(view) {
         return;
     }
 
-    const prevView = state.currentView;
-    state.currentView = view;
+    if (view === 'analytics') {
+        state.dashboardTab = 'analytics';
+        state.currentView = 'dashboard';
+    } else {
+        if (view === 'dashboard') state.dashboardTab = 'main';
+        state.currentView = view;
+    }
 
-    if (view !== 'assessments') state.filterPatientId = null;
-    if (view === 'kasir') state.kasirTab = state.kasirTab || 'antrian';
+    if (state.currentView !== 'assessments') state.filterPatientId = null;
+    if (state.currentView === 'kasir') state.kasirTab = state.kasirTab || 'antrian';
 
     renderApp();
 }
 
 
+// Only close sidebar on smaller screens (mobile/tablet). On desktop, sidebar stays open during nav.
+function closeSidebarOnMobile() {
+    if (window.innerWidth < 1024) {
+        const sidebar = document.getElementById('app-sidebar');
+        const overlay = document.getElementById('sidebar-overlay');
+        const mainWrapper = document.getElementById('main-wrapper');
+        if (sidebar) sidebar.classList.add('-translate-x-full');
+        if (overlay) overlay.classList.add('hidden');
+        if (mainWrapper) mainWrapper.style.marginLeft = '';
+    }
+}
+
 function toggleSidebar() {
     const sidebar = document.getElementById('app-sidebar');
     const overlay = document.getElementById('sidebar-overlay');
-    const isMobile = window.innerWidth < 768;
-    if (sidebar.classList.contains('-translate-x-full')) {
+    const mainWrapper = document.getElementById('main-wrapper');
+    const isCollapsed = sidebar.classList.contains('-translate-x-full');
+    const isDesktop = window.innerWidth >= 1024;
+
+    if (isCollapsed) {
         sidebar.classList.remove('-translate-x-full');
-        if (isMobile) overlay.classList.remove('hidden');
+        if (isDesktop) {
+            // Desktop: push content right, no overlay
+            mainWrapper.style.marginLeft = '256px';
+            overlay.classList.add('hidden');
+        } else {
+            // Mobile/Tablet: show overlay (darken background)
+            overlay.classList.remove('hidden');
+            mainWrapper.style.marginLeft = '';
+        }
+        localStorage.setItem('erm_sidebar_open', '1');
     } else {
         sidebar.classList.add('-translate-x-full');
         overlay.classList.add('hidden');
+        mainWrapper.style.marginLeft = '';
+        localStorage.setItem('erm_sidebar_open', '0');
+    }
+}
+
+function initSidebarState() {
+    const sidebar = document.getElementById('app-sidebar');
+    const overlay = document.getElementById('sidebar-overlay');
+    const mainWrapper = document.getElementById('main-wrapper');
+    if (!sidebar || !overlay || !mainWrapper) return;
+
+    const savedState = localStorage.getItem('erm_sidebar_open');
+    const isDesktop = window.innerWidth >= 1024;
+    // Default: open on desktop, closed on mobile
+    const shouldOpen = savedState !== null ? savedState === '1' : isDesktop;
+
+    if (shouldOpen) {
+        sidebar.classList.remove('-translate-x-full');
+        overlay.classList.add('hidden');
+        if (isDesktop) {
+            mainWrapper.style.marginLeft = '256px';
+        } else {
+            mainWrapper.style.marginLeft = '';
+            overlay.classList.remove('hidden');
+        }
+    } else {
+        sidebar.classList.add('-translate-x-full');
+        overlay.classList.add('hidden');
+        mainWrapper.style.marginLeft = '';
     }
 }
 
@@ -2580,7 +2907,7 @@ function openHMSWizard(preserveScroll = false) {
             </div>
 
             <!-- TABS HEADER -->
-            <div class="flex border-b border-slate-100 px-6 shrink-0 bg-white">
+            <div class="flex border-b border-slate-100 px-6 shrink-0 bg-white overflow-x-auto pb-1">
                 <button onclick="switchHMSTab('neuro')" class="hms-tab-btn ${!isMSI ? 'active' : ''} flex items-center gap-2 outline-none">
                     <i data-lucide="brain" width="16"></i> <span class="hidden sm:inline">Functional / Neuro</span><span class="sm:hidden">Neuro</span>
                 </button>
@@ -2934,12 +3261,11 @@ function hideHMSObservation(obsText, obsId) {
 
 
 window.addEventListener('resize', () => {
-    if (window.innerWidth >= 768) {
-        document.getElementById('sidebar-overlay').classList.add('hidden');
-        document.getElementById('app-sidebar').classList.remove('-translate-x-full');
-    } else {
-        document.getElementById('app-sidebar').classList.add('-translate-x-full');
-    }
+    // Do nothing - sidebar state is user-controlled via toggle button
+    // We just close the overlay if window is resized (cleanup)
+    const overlay = document.getElementById('sidebar-overlay');
+    const sidebar = document.getElementById('app-sidebar');
+    if (!sidebar || !overlay) return;
 });
 
 /**
@@ -3040,15 +3366,17 @@ function renderApp() {
         _lastRenderedView = 'print';
     } else {
         appLayout.classList.remove('hidden');
+        if (!window._sidebarInitialized) { initSidebarState(); window._sidebarInitialized = true; }
         printContainer.classList.add('hidden');
         printContainer.style.display = 'none';
         document.body.style.overflow = 'hidden';
 
-        ['dashboard', 'schedule', 'patients', 'assessments', 'kasir', 'analytics', 'protocols', 'config'].forEach(v => {
+        ['dashboard', 'schedule', 'patients', 'assessments', 'kasir', 'protocols', 'config'].forEach(v => {
             const btn = document.getElementById(`nav-${v}`);
             if (btn) {
-                const isActive = state.currentView === v;
-                // ADDED 'relative' specifically for schedule to protect the badge positioning
+                let isActive = state.currentView === v;
+                if (v === 'dashboard') isActive = (state.currentView === 'dashboard');
+
                 const baseClass = (v === 'schedule') ? "w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press relative " : "w-full flex items-center gap-3 p-3 rounded-xl transition-all duration-300 btn-press ";
                 btn.className = isActive
                     ? baseClass + "bg-blue-600 text-white shadow-lg shadow-blue-900/30 translate-x-1 font-semibold"
@@ -3196,6 +3524,45 @@ function showProtocolDetail(id) {
 }
 
 function renderDashboard(container) {
+    container.innerHTML = `
+        <div class="fade-in pb-20">
+            <div class="flex items-center justify-between mb-8 bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
+                <div class="flex items-center gap-2 p-1 bg-slate-100 rounded-xl">
+                    <button onclick="switchDashboardTab('main')" id="dash-tab-main" 
+                        class="px-6 py-2.5 rounded-lg text-sm font-black transition-all flex items-center gap-2 ${state.dashboardTab === 'main' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                        <i data-lucide="layout-dashboard" width="16"></i> Ringkasan
+                    </button>
+                    <button onclick="switchDashboardTab('analytics')" id="dash-tab-analytics" 
+                        class="px-6 py-2.5 rounded-lg text-sm font-black transition-all flex items-center gap-2 ${state.dashboardTab === 'analytics' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                        <i data-lucide="line-chart" width="16"></i> Analisis Klinis
+                    </button>
+                </div>
+            </div>
+
+            <div id="dashboard-tab-content">
+                <!-- Content will be injected here -->
+            </div>
+        </div>
+    `;
+    renderIcons();
+    renderDashboardContent();
+}
+
+function switchDashboardTab(tab) {
+    state.dashboardTab = tab;
+    renderDashboardContent();
+    renderDashboard(document.getElementById('main-content')); // Re-render to update tab styles
+}
+
+async function renderDashboardContent() {
+    const subContainer = document.getElementById('dashboard-tab-content');
+    if (!subContainer) return;
+
+    if (state.dashboardTab === 'analytics') {
+        renderAnalyticsView(subContainer);
+        return;
+    }
+
     const count = state.assessments.length;
     const todayStr = today();
     const todayAppointments = state.appointments.filter(a => normalizeDate(a.date) === todayStr);
@@ -3205,18 +3572,18 @@ function renderDashboard(container) {
     const unpaidToday = (state.appointments || []).filter(a => normalizeDate(a.date) === todayStr && (a.status === 'CONFIRMED' || !a.status) && !isPaidAppt(a)).length;
     const formatRp = (num) => 'Rp ' + num.toLocaleString('id-ID');
 
-    container.innerHTML = `
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8 fade-in">
-            <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl p-6 text-white shadow-lg">
+    subContainer.innerHTML = `
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-8 fade-in text-slate-800">
+            <div class="bg-gradient-to-br from-blue-500 to-blue-600 rounded-2xl p-4 md:p-6 text-white shadow-lg">
                 <h3 class="text-4xl font-bold">${state.patients.length}</h3><p class="text-blue-100">Total Pasien</p>
             </div>
-            <div class="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-2xl p-6 text-white shadow-lg">
+            <div class="bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-2xl p-4 md:p-6 text-white shadow-lg">
                 <h3 class="text-4xl font-bold">${count}</h3><p class="text-emerald-100">Assessment</p>
             </div>
-            <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-2xl p-6 text-white shadow-lg">
+            <div class="bg-gradient-to-br from-purple-500 to-purple-600 rounded-2xl p-4 md:p-6 text-white shadow-lg">
                 <h3 class="text-4xl font-bold">${todayAppointments.length}</h3><p class="text-purple-100">Pasien Hari Ini</p>
             </div>
-            <div class="bg-gradient-to-br from-orange-400 to-red-500 rounded-2xl p-6 text-white shadow-lg cursor-pointer hover:opacity-90 transition-opacity" onclick="navigate('kasir')">
+            <div class="bg-gradient-to-br from-orange-400 to-red-500 rounded-2xl p-4 md:p-6 text-white shadow-lg cursor-pointer hover:opacity-90 transition-opacity" onclick="navigate('kasir')">
                 <h3 class="text-2xl md:text-3xl font-bold truncate" title="${formatRp(todayIncome)}">${formatRp(todayIncome)}</h3>
                 <p class="text-orange-100 text-sm md:text-base">Pemasukan Hari Ini</p>
                 ${unpaidToday > 0 ? `<div class="mt-2 bg-white/20 rounded-lg px-2 py-1 text-xs font-bold">${unpaidToday} belum bayar →</div>` : '<div class="mt-2 text-xs text-orange-200">Semua lunas ✓</div>'}
@@ -3240,6 +3607,21 @@ function renderDashboard(container) {
 
 // --- 7.5. VIEW RENDERERS (SCHEDULE) ---
 let scheduleViewDate = new Date();
+
+
+/**
+ * Check if the clinic is closed on a specific date
+ * Supports both custom holiday dates and recurring off-days
+ */
+function isClinicClosed(dateStr) {
+    if (!dateStr) return false;
+    const holidays = (state.bookingConfig.customHolidays || '').split(',').map(d => d.trim());
+    if (holidays.includes(dateStr)) return true;
+    const offDays = (state.bookingConfig.offDays || '').split(',').map(d => d.trim());
+    const dayOfWeek = new Date(dateStr).getDay();
+    if (offDays.includes(String(dayOfWeek))) return true;
+    return false;
+}
 
 function renderScheduleView(container) {
     const year = scheduleViewDate.getFullYear();
@@ -3291,12 +3673,14 @@ function renderScheduleView(container) {
         const day = i + 1;
         const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
         const isToday = now.getDate() === day && now.getMonth() === month && now.getFullYear() === year;
+        const isClosed = isClinicClosed(dateStr);
         const dayAppts = monthAppts.filter(a => normalizeDate(a.date) === dateStr).sort((a, b) => (normalizeTime(a.time) || '').localeCompare(normalizeTime(b.time) || ''));
 
         return `
-                        <div id="day-${dateStr}" data-date="${dateStr}" class="calendar-day-cell min-h-[100px] p-2 hover:bg-blue-50 transition-colors cursor-pointer group relative border border-transparent rounded-lg">
+                        <div id="day-${dateStr}" data-date="${dateStr}" class="calendar-day-cell min-h-[100px] p-2 ${isClosed ? 'bg-slate-50/80 cursor-not-allowed opacity-60' : 'hover:bg-blue-50 transition-colors cursor-pointer group'} relative border border-transparent rounded-lg">
                             <div class="flex justify-between items-start">
-                                <span class="text-sm font-bold ${isToday ? 'bg-blue-600 text-white w-7 h-7 flex items-center justify-center rounded-full shadow-md' : 'text-slate-700'}">${day}</span>
+                                <span class="text-sm font-bold ${isToday ? 'bg-blue-600 text-white w-7 h-7 flex items-center justify-center rounded-full shadow-md' : (isClosed ? 'text-slate-300' : 'text-slate-700')}">${day}</span>
+                                ${isClosed ? '<span class="text-[9px] font-black text-rose-400 uppercase italic mt-1">TUTUP</span>' : ''}
                                 ${dayAppts.length > 0 ? `<span class="bg-blue-100 text-blue-700 text-[10px] font-bold px-1.5 py-0.5 rounded">${dayAppts.length}</span>` : ''}
                             </div>
                             <div class="mt-2 space-y-1">
@@ -3314,7 +3698,7 @@ function renderScheduleView(container) {
         }).join('')}
                                 ${dayAppts.length > 3 ? `<div class="text-[9px] sm:text-[10px] text-slate-500 font-bold pl-1 bg-slate-100 rounded px-1">+${dayAppts.length - 3}</div>` : ''}
                             </div>
-                            <button data-action="add" data-date="${dateStr}" class="calendar-add-btn absolute bottom-2 right-2 opacity-0 group-hover:opacity-100 bg-blue-600 text-white p-1.5 rounded-lg shadow-md hover:scale-110 transition-all"><i data-lucide="plus" width="14"></i></button>
+                            ${!isClosed ? `<button data-action="add" data-date="${dateStr}" class="calendar-add-btn absolute bottom-2 right-2 opacity-0 group-hover:opacity-100 bg-blue-600 text-white p-1.5 rounded-lg shadow-md hover:scale-110 transition-all"><i data-lucide="plus" width="14"></i></button>` : ''}
                         </div>`;
     }).join('')}
                 </div>
@@ -3463,12 +3847,10 @@ function openDailyScheduleModal(dateStr) {
                         </div>
                         <div class="flex gap-2">
                             ${isPending ? `
-                            <button onclick="confirmAppointment('${a.id}')" title="Terima Booking" class="p-2 text-white bg-green-600 hover:bg-green-700 rounded-lg shadow-sm"><i data-lucide="check" width="14"></i></button>
-                            <button onclick="deleteAppointment('${a.id}')" title="Tolak" class="p-2 text-white bg-red-600 hover:bg-red-700 rounded-lg shadow-sm"><i data-lucide="x" width="14"></i></button>
-                            ` : `
-                            <button onclick="handleEditFromDaily('${a.id}')" class="p-2 text-slate-400 hover:text-blue-600 bg-white border border-slate-200 rounded-lg"><i data-lucide="edit-2" width="14"></i></button>
-                            <button onclick="handleDeleteFromDaily('${a.id}', '${dateStr}')" class="p-2 text-slate-400 hover:text-red-600 bg-white border border-slate-200 rounded-lg"><i data-lucide="trash-2" width="14"></i></button>
-                            `}
+                                <button onclick="confirmAppointment('${a.id}')" title="Terima Booking" class="p-2 text-white bg-green-600 hover:bg-green-700 rounded-lg shadow-sm"><i data-lucide="check" width="14"></i></button>
+                            ` : ''}
+                            <button onclick="handleEditFromDaily('${a.id}')" title="Edit" class="p-2 text-slate-400 hover:text-blue-600 bg-white border border-slate-200 rounded-lg"><i data-lucide="edit-2" width="14"></i></button>
+                            <button onclick="handleDeleteFromDaily('${a.id}', '${dateStr}')" title="Hapus" class="p-2 text-slate-400 hover:text-rose-600 bg-white border border-slate-200 rounded-lg"><i data-lucide="trash-2" width="14"></i></button>
                         </div>
                     </div>`;
     }).join('') : `<div class="text-center py-12 text-slate-400 italic bg-slate-50 rounded-xl border border-dashed border-slate-200 flex flex-col items-center gap-3">
@@ -3505,7 +3887,7 @@ function renderPatientList(container) {
                     <table class="w-full text-sm text-left text-slate-600">
                         <thead class="bg-slate-50 text-slate-700 font-bold uppercase text-[10px] border-b border-slate-200 tracking-wider">
                             <tr>
-                                <th class="px-6 py-4">No. RM</th>
+                                <th class="px-6 py-4">No. RM / NIK</th>
                                 <th class="px-6 py-4">Identitas Pasien</th>
                                 <th class="px-6 py-4">Gender / Usia</th>
                                 <th class="px-6 py-4">Diagnosa Medis</th>
@@ -3577,7 +3959,9 @@ function filterPatients() {
             const catIcon = cat === 'Home Visit' ? 'home' : 'building-2';
 
             return `<tr class="border-b border-slate-100 hover:bg-slate-50 transition-colors">
-                <td class="px-6 py-4 font-mono text-xs text-slate-500 font-bold">${p.id}</td>
+                <td class="px-6 py-4 font-mono text-[10px] text-slate-500 font-bold">
+                    <div>${p.id}</div>
+                </td>
                 <td class="px-6 py-4">
                     <div class="font-bold text-slate-800 text-sm md:text-base flex items-center gap-2">
                         ${p.name}
@@ -3595,7 +3979,7 @@ function filterPatients() {
                         <button onclick="viewPatientHistory('${p.id}')" title="Riwayat" class="p-2 bg-white border border-slate-200 text-slate-600 hover:text-indigo-600 hover:border-indigo-300 rounded-lg transition-all shadow-sm"><i data-lucide="history" width="16"></i></button>
                         <button onclick="startAssessment('${p.id}')" title="Assessment Baru" class="p-2 bg-white border border-slate-200 text-slate-600 hover:text-emerald-600 hover:border-emerald-300 rounded-lg transition-all shadow-sm"><i data-lucide="clipboard-plus" width="16"></i></button>
                         <button onclick="openPatientModal('${p.id}')" title="Edit Data" class="p-2 bg-white border border-slate-200 text-slate-600 hover:text-blue-600 hover:border-blue-300 rounded-lg transition-all shadow-sm"><i data-lucide="edit-3" width="16"></i></button>
-                        <button onclick="deletePatient('${p.id}')" title="Hapus" class="p-2 bg-white border border-slate-200 text-slate-600 hover:text-red-600 hover:border-red-300 rounded-lg transition-all shadow-sm"><i data-lucide="trash-2" width="16"></i></button>
+                        <button onclick="deletePatient('${p.id}')" title="Hapus" class="p-2 bg-white border border-slate-200 text-slate-400 hover:text-rose-600 hover:border-rose-300 rounded-lg transition-all shadow-sm"><i data-lucide="trash-2" width="16"></i></button>
                     </div>
                 </td>
             </tr>`;
@@ -3627,7 +4011,7 @@ function filterPatients() {
                     <button onclick="viewPatientHistory('${p.id}')" class="flex flex-col items-center justify-center gap-1 py-2 rounded-lg hover:bg-slate-50 text-slate-600 transition-colors"><div class="bg-indigo-50 text-indigo-600 p-1.5 rounded-md"><i data-lucide="history" width="16"></i></div><span class="text-[10px] font-bold">Riwayat</span></button>
                     <button onclick="startAssessment('${p.id}')" class="flex flex-col items-center justify-center gap-1 py-2 rounded-lg hover:bg-slate-50 text-slate-600 transition-colors"><div class="bg-emerald-50 text-emerald-600 p-1.5 rounded-md"><i data-lucide="clipboard-plus" width="16"></i></div><span class="text-[10px] font-bold">Assess</span></button>
                     <button onclick="openPatientModal('${p.id}')" class="flex flex-col items-center justify-center gap-1 py-2 rounded-lg hover:bg-slate-50 text-slate-600 transition-colors"><div class="bg-blue-50 text-blue-600 p-1.5 rounded-md"><i data-lucide="edit-3" width="16"></i></div><span class="text-[10px] font-bold">Edit</span></button>
-                    <button onclick="deletePatient('${p.id}')" class="flex flex-col items-center justify-center gap-1 py-2 rounded-lg hover:bg-slate-50 text-slate-600 transition-colors"><div class="bg-red-50 text-red-600 p-1.5 rounded-md"><i data-lucide="trash-2" width="16"></i></div><span class="text-[10px] font-bold">Hapus</span></button>
+                    <button onclick="deletePatient('${p.id}')" class="flex flex-col items-center justify-center gap-1 py-2 rounded-lg hover:bg-slate-50 text-slate-400 transition-colors"><div class="bg-rose-50 text-rose-600 p-1.5 rounded-md"><i data-lucide="trash-2" width="16"></i></div><span class="text-[10px] font-bold">Hapus</span></button>
                 </div>
             </div>`;
         }).join('') + loadMoreBtn;
@@ -3765,8 +4149,8 @@ async function deletePatient(id) {
         renderApp(); // Visual update right away
 
         if (state.scriptUrl) {
-            updateSyncStatusUI('pending', false, 3);
-            scheduleSync(3);
+            // [Sync Instant]
+            syncDelta(false);
         }
     }
 }
@@ -3816,15 +4200,16 @@ function renderAssessmentList(container) {
                     <tbody class="divide-y divide-slate-100">
                         ${filteredAssessments.length === 0 ? '<tr><td colspan="5" class="p-8 text-center text-slate-400 italic">Belum ada data.</td></tr>' : filteredAssessments.slice(0, state.assessmentLimit).map(a => {
         const p = state.patients.find(pt => pt.id === a.patientId);
-        return `<tr class="hover:bg-blue-50 transition-colors">
+        const isLocked = a.is_locked === true || a.is_locked === 'true';
+        return `<tr class="hover:bg-blue-50 transition-colors ${isLocked ? 'bg-slate-50/50 italic opacity-80' : ''}">
                                 <td class="p-4 text-center"><input type="checkbox" class="sel-check accent-blue-600 cursor-pointer" value="${a.id}" onchange="updatePrintSelection()"></td>
                                 <td class="p-4 font-mono text-xs text-slate-500">${formatDate(a.date)}</td>
                                 <td class="p-4 font-bold text-slate-800">${p ? p.name : '?'}</td>
-                                <td class="p-4"><span class="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs border border-blue-200 font-medium">${a.diagnosis}</span></td>
+                                <td class="p-4"><span class="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs border border-blue-200 font-medium">${a.diagnosis || (p ? p.diagnosis : '-')}</span></td>
                                 <td class="p-4 flex justify-center gap-2">
                                     <button onclick="viewSinglePrint('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-500 hover:text-blue-600 rounded shadow-sm" title="Lihat"><i data-lucide="eye" width="16"></i></button>
                                     <button onclick="editAssessment('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-500 hover:text-emerald-600 rounded shadow-sm" title="Edit"><i data-lucide="edit-2" width="16"></i></button>
-                                    <button onclick="deleteAssessment('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-500 hover:text-red-600 rounded shadow-sm" title="Hapus"><i data-lucide="trash-2" width="16"></i></button>
+                                    <button onclick="deleteAssessment('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-400 hover:text-rose-600 rounded shadow-sm" title="Hapus"><i data-lucide="trash-2" width="16"></i></button>
                                 </td>
                             </tr>`;
     }).join('') + (hasMoreAssessments ? `<tr><td colspan="5">${loadMoreBtn}</td></tr>` : '')}
@@ -3834,15 +4219,21 @@ function renderAssessmentList(container) {
             <div class="md:hidden divide-y divide-slate-100">
                 ${filteredAssessments.length === 0 ? '<div class="p-8 text-center text-slate-400 italic">Belum ada data.</div>' : filteredAssessments.slice(0, state.assessmentLimit).map(a => {
         const p = state.patients.find(pt => pt.id === a.patientId);
-        return `<div class="p-4 flex gap-3 hover:bg-slate-50 transition-colors">
+        const isLocked = a.is_locked === true || a.is_locked === 'true';
+        return `<div class="p-4 flex gap-3 hover:bg-slate-50 transition-colors ${isLocked ? 'bg-slate-50 opacity-90' : ''}">
                         <div class="pt-1"><input type="checkbox" class="sel-check w-5 h-5 accent-blue-600 rounded border-slate-300 cursor-pointer" value="${a.id}" onchange="updatePrintSelection()"></div>
                         <div class="flex-1">
-                            <div class="flex justify-between items-start mb-1"><h4 class="font-bold text-slate-800 text-sm line-clamp-1">${p ? p.name : '?'}</h4><span class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">${formatDate(a.date)}</span></div>
+                            <div class="flex justify-between items-start mb-1">
+                                <h4 class="font-bold text-slate-800 text-sm line-clamp-1">${p ? p.name : '?'}</h4>
+                                <div class="flex items-center gap-1.5">
+                                    <span class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">${formatDate(a.date)}</span>
+                                </div>
+                            </div>
                             <div class="mb-3"><span class="inline-block bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-[10px] border border-blue-100 font-bold mb-1">${a.diagnosis}</span></div>
                             <div class="flex gap-2">
-                                <button onclick="viewSinglePrint('${a.id}')" class="flex-1 py-2 rounded-lg border border-slate-200 text-slate-600 text-xs font-bold hover:bg-slate-100 flex justify-center items-center gap-1"><i data-lucide="eye" width="14"></i> Lihat</button>
-                                <button onclick="editAssessment('${a.id}')" class="flex-1 py-2 rounded-lg border border-emerald-200 text-emerald-600 bg-emerald-50 text-xs font-bold hover:bg-emerald-100 flex justify-center items-center gap-1"><i data-lucide="edit-2" width="14"></i> Edit</button>
-                                <button onclick="deleteAssessment('${a.id}')" class="w-10 flex items-center justify-center rounded-lg border border-red-200 text-red-600 bg-red-50 hover:bg-red-100"><i data-lucide="trash-2" width="14"></i></button>
+                                <button onclick="viewSinglePrint('${a.id}')" class="flex-1 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-bold hover:bg-slate-100 flex justify-center items-center gap-1"><i data-lucide="eye" width="12"></i> Lihat</button>
+                                <button onclick="editAssessment('${a.id}')" class="flex-1 py-1.5 rounded-lg border border-emerald-200 text-emerald-600 bg-emerald-50 text-xs font-bold hover:bg-emerald-100 flex justify-center items-center gap-1"><i data-lucide="edit-2" width="12"></i> Edit</button>
+                                <button onclick="deleteAssessment('${a.id}')" class="flex-1 py-1.5 rounded-lg border border-rose-200 text-rose-600 bg-rose-50 text-xs font-bold hover:bg-rose-100 flex justify-center items-center gap-1"><i data-lucide="trash-2" width="12"></i> Hapus</button>
                             </div>
                         </div>
                     </div>`;
@@ -3877,6 +4268,12 @@ function updatePrintSelection() {
 }
 
 async function deleteAssessment(id) {
+    const a = state.assessments.find(x => x.id === id);
+    if (a && (a.is_locked === true || a.is_locked === 'true')) {
+        showToast('Data ini terkunci secara permanen untuk keamanan riwayat medis.', 'warning');
+        return;
+    }
+
     if (confirm('Hapus data assessment ini?')) {
         // [IMMEDIATE] Update local state first for instant UI response
         state.assessments = state.assessments.filter(a => a.id !== id);
@@ -3893,8 +4290,8 @@ async function deleteAssessment(id) {
         renderApp(); // Visual update right away
 
         if (state.scriptUrl) {
-            updateSyncStatusUI('pending', false, 3);
-            scheduleSync(3);
+            // [Sync Instant]
+            syncDelta(false);
         }
     }
 }
@@ -3943,10 +4340,16 @@ function renderAssessmentForm(container, useTempData = false) {
             is_consented: false,
             consent_timestamp: '',
             rontgen_url: null, // Initialize as null to prevent overwriting with '' in sheet sync
+            // NEW FIELDS for TTV and Separate D/S
+            ttv_td: '', ttv_hr: '', ttv_rr: '', ttv_temp: '', ttv_spo2: '',
+            rom_d: 'Normal', rom_s: 'Normal',
+            mmt_d: '5', mmt_s: '5',
         };
         if (!Array.isArray(data.pain_points)) data.pain_points = [];
         window.tempFormData = JSON.parse(JSON.stringify(data));
     }
+
+    const isLocked = data.is_locked === true || data.is_locked === 'true';
 
     if (!state.selectedPatient) { navigate('patients'); return; }
     const isNewEntry = !state.currentAssessment && !data.diagnosis;
@@ -3957,6 +4360,12 @@ function renderAssessmentForm(container, useTempData = false) {
 
     container.innerHTML = `
         <div class="h-full overflow-y-auto bg-slate-50 relative flex flex-col">
+            ${(data.is_locked === true || data.is_locked === 'true') ? `
+            <div class="sticky top-0 z-[100] bg-rose-600 text-white px-6 py-2 flex items-center justify-center gap-2 shadow-lg">
+                <i data-lucide="lock" width="14" class="animate-pulse"></i>
+                <span class="text-[10px] md:text-sm font-black uppercase tracking-widest">RIWAYAT TERKUNCI (READ-ONLY)</span>
+            </div>` : ''}
+
             <div id="step-1" class="${isNewEntry ? 'block' : 'hidden'} h-full overflow-y-auto p-8 fade-in">
                 <div class="max-w-5xl mx-auto">
                     <div class="mb-8 text-center">
@@ -3972,10 +4381,10 @@ function renderAssessmentForm(container, useTempData = false) {
                                     <div><h4 class="font-bold text-slate-800 text-lg">Kalkulator Klinis</h4><p class="text-xs text-slate-500">Outcome Measure (ODI, SPADI, dll)</p></div>
                                 </div>
                             </button>
-                            <button onclick="copyLastAssessment()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-blue-100 hover:border-blue-500 hover:shadow-md transition-all text-left group">
+                            <button onclick="openCopyAssessmentModal()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-blue-100 hover:border-blue-500 hover:shadow-md transition-all text-left group">
                                 <div class="flex items-center gap-4 mb-3">
                                     <div class="bg-blue-100 p-3 rounded-xl text-blue-600 group-hover:bg-blue-600 group-hover:text-white transition-colors"><i data-lucide="copy" width="24"></i></div>
-                                    <div><h4 class="font-bold text-slate-800 text-lg">Salin Sebelumnya</h4><p class="text-xs text-slate-500">Gunakan data kunjungan terakhir</p></div>
+                                    <div><h4 class="font-bold text-slate-800 text-lg">Salin Sebelumnya</h4><p class="text-xs text-slate-500">Pilih dan gunakan data kunjungan sebelumnya</p></div>
                                 </div>
                             </button>
                             <button onclick="goToFormManual()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-slate-200 hover:border-slate-400 hover:shadow-md transition-all text-left group">
@@ -4104,11 +4513,46 @@ function renderAssessmentForm(container, useTempData = false) {
                             ` : ''}
                         </div>
                         
-                        <!-- [NEW] 02: SPECIAL TESTS SECTION (FULL WIDTH) -->
+                        <!-- [NEW] 02: TANDA-TANDA VITAL (TTV) -->
+                        <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
+                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
+                                <div class="bg-rose-600 text-white p-2 rounded-lg shadow-rose-200 shadow-md">
+                                    <h3 class="font-black text-lg">02</h3>
+                                </div>
+                                <div>
+                                    <h3 class="font-bold text-lg text-slate-800">Tanda-Tanda Vital (TTV)</h3>
+                                    <p class="text-xs text-slate-400">Tekanan darah, nadi, pernapasan, dan suhu</p>
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 md:gap-4">
+                                <div>
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">TD (mmHg)</label>
+                                    <input type="text" value="${data.ttv_td || ''}" onchange="updateForm('ttv_td', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-3 py-2.5 shadow-sm outline-none focus:border-rose-500 bg-slate-50 font-bold" placeholder="120/80">
+                                </div>
+                                <div>
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">HR (bpm)</label>
+                                    <input type="text" value="${data.ttv_hr || ''}" onchange="updateForm('ttv_hr', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-3 py-2.5 shadow-sm outline-none focus:border-rose-500 bg-slate-50 font-bold" placeholder="80">
+                                </div>
+                                <div>
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">RR (x/mnt)</label>
+                                    <input type="text" value="${data.ttv_rr || ''}" onchange="updateForm('ttv_rr', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-3 py-2.5 shadow-sm outline-none focus:border-rose-500 bg-slate-50 font-bold" placeholder="20">
+                                </div>
+                                <div>
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Suhu (°C)</label>
+                                    <input type="text" value="${data.ttv_temp || ''}" onchange="updateForm('ttv_temp', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-3 py-2.5 shadow-sm outline-none focus:border-rose-500 bg-slate-50 font-bold" placeholder="36.5">
+                                </div>
+                                <div>
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">SpO2 (%)</label>
+                                    <input type="text" value="${data.ttv_spo2 || ''}" onchange="updateForm('ttv_spo2', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-3 py-2.5 shadow-sm outline-none focus:border-rose-500 bg-slate-50 font-bold" placeholder="98">
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- [RESEQUENCED] 03: SPECIAL TESTS SECTION -->
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
                             <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
                                 <div class="bg-indigo-600 text-white p-2 rounded-lg shadow-indigo-200 shadow-md">
-                                    <h3 class="font-black text-lg">02</h3>
+                                    <h3 class="font-black text-lg">03</h3>
                                 </div>
                                 <div>
                                     <h3 class="font-bold text-lg text-slate-800">Tes Spesifik (Provocation)</h3>
@@ -4120,43 +4564,128 @@ function renderAssessmentForm(container, useTempData = false) {
                             </div>
                         </div>
                         
-                        <!-- [NEW] 03: OBJEKTIF DATA (ROM, MMT, BALANCE) -->
+                        <!-- [REDESIGNED] 04: OBJEKTIF DATA (ROM, MMT, BALANCE) -->
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
                             <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
                                 <div class="bg-blue-600 text-white p-2 rounded-lg shadow-blue-200 shadow-md">
-                                    <h3 class="font-black text-lg">03</h3>
+                                    <h3 class="font-black text-lg">04</h3>
                                 </div>
                                 <div>
                                     <h3 class="font-bold text-lg text-slate-800">Pengukuran Objektif</h3>
-                                    <p class="text-xs text-slate-400">ROM, MMT, dan Keseimbangan</p>
+                                    <p class="text-xs text-slate-400">ROM, MMT (Dexter & Sinister), dan Keseimbangan</p>
                                 </div>
                             </div>
                             
                             <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                                <!-- ROM ENHANCED -->
-                                <div class="p-4 bg-slate-50 rounded-xl border border-slate-200">
-                                    <div class="flex justify-between items-center mb-3"><span class="text-xs font-black text-slate-500 uppercase">ROM (Lingkup Gerak Sendi)</span></div>
-                                    <div class="grid grid-cols-2 gap-3 mb-3">
-                                        ${renderFormSelect('Side', 'rom_side', data.obj.rom_side || '-', ['-', 'Dextra', 'Sinistra', 'Bilateral'], true)}
-                                        ${renderFormSelect('Nilai', 'rom', data.obj.rom, ['Normal', 'Terbatas Ringan', 'Terbatas Sedang', 'Terbatas Berat'], true)}
+                                <!-- ROM D/S -->
+                                <div class="col-span-1 md:col-span-3 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+                                    <div class="flex items-center gap-2 mb-4"><i data-lucide="compass" width="16" class="text-blue-600"></i><span class="text-sm font-black text-slate-600 uppercase tracking-widest">ROM (Lingkup Gerak Sendi)</span></div>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                        <!-- ROM DEXTRA ISOM -->
+                                        ${(() => {
+            const d = parseRomISOM(data.rom_d);
+            const cfg = ROM_ISOM_CONFIG[d.plane] || ROM_ISOM_CONFIG['S'];
+            return `
+                                            <div id="rom-isom-area-d" class="flex flex-col gap-3">
+                                                <div class="flex justify-between items-center bg-blue-50/50 p-2 rounded-lg border border-blue-100">
+                                                    <span class="text-[10px] font-black text-blue-600 uppercase tracking-widest">Sisi Dextra (D)</span>
+                                                    <span id="rom-preview-d" class="text-xs font-black text-blue-700 bg-white px-2 py-0.5 rounded border border-blue-200 shadow-sm">${data.rom_d || 'S 0-0-0'}</span>
+                                                </div>
+                                                <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 md:gap-3">
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center">Plane</label>
+                                                        <select onchange="updateRomISOM('D', 'plane', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black bg-white outline-none focus:border-blue-500 transition-all text-center">
+                                                            ${['S', 'F', 'T', 'R'].map(p => `<option value="${p}" ${p === d.plane ? 'selected' : ''}>${p}</option>`).join('')}
+                                                        </select>
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l1}</label>
+                                                        <input type="text" value="${d.v1}" onchange="updateRomISOM('D', 'v1', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-blue-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l2}</label>
+                                                        <input type="text" value="${d.v2}" onchange="updateRomISOM('D', 'v2', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-blue-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l3}</label>
+                                                        <input type="text" value="${d.v3}" onchange="updateRomISOM('D', 'v3', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-blue-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                </div>
+                                                <div id="rom-narrative-d" class="text-[10px] italic">
+                                                    ${getRomClinicalNarrative(d.v2)}
+                                                </div>
+                                            </div>`;
+        })()}
+
+                                        <!-- ROM SINISTRA ISOM -->
+                                        ${(() => {
+            const s = parseRomISOM(data.rom_s);
+            const cfg = ROM_ISOM_CONFIG[s.plane] || ROM_ISOM_CONFIG['S'];
+            return `
+                                            <div id="rom-isom-area-s" class="flex flex-col gap-3">
+                                                <div class="flex justify-between items-center bg-indigo-50/50 p-2 rounded-lg border border-indigo-100">
+                                                    <span class="text-[10px] font-black text-indigo-600 uppercase tracking-widest">Sisi Sinistra (S)</span>
+                                                    <span id="rom-preview-s" class="text-xs font-black text-indigo-700 bg-white px-2 py-0.5 rounded border border-indigo-200 shadow-sm">${data.rom_s || 'S 0-0-0'}</span>
+                                                </div>
+                                                <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 md:gap-3">
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center">Plane</label>
+                                                        <select onchange="updateRomISOM('S', 'plane', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black bg-white outline-none focus:border-indigo-500 transition-all text-center">
+                                                            ${['S', 'F', 'T', 'R'].map(p => `<option value="${p}" ${p === s.plane ? 'selected' : ''}>${p}</option>`).join('')}
+                                                        </select>
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l1}</label>
+                                                        <input type="text" value="${s.v1}" onchange="updateRomISOM('S', 'v1', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-indigo-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l2}</label>
+                                                        <input type="text" value="${s.v2}" onchange="updateRomISOM('S', 'v2', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-indigo-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                    <div class="flex flex-col gap-1">
+                                                        <label class="text-[9px] font-bold text-slate-400 uppercase text-center isom-label">${cfg.l3}</label>
+                                                        <input type="text" value="${s.v3}" onchange="updateRomISOM('S', 'v3', this.value)" class="border-2 border-slate-200 rounded-xl p-2.5 text-sm font-black text-center outline-none focus:border-indigo-500 transition-all" placeholder="0°">
+                                                    </div>
+                                                </div>
+                                                <div id="rom-narrative-s" class="text-[10px] italic">
+                                                    ${getRomClinicalNarrative(s.v2)}
+                                                </div>
+                                            </div>`;
+        })()}
                                     </div>
-                                    <input type="text" placeholder="Part / Segmen..." value="${data.obj.rom_part || '-'}" onchange="updateFormObj('rom_part', this.value)" class="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 outline-none focus:border-blue-500 bg-white">
+                                    <div class="mt-4">
+                                        <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Sendi / Gerakan</label>
+                                        <input type="text" placeholder="Contoh: Flexion Knee, Abduction Shoulder..." value="${data.obj.rom_part || '-'}" onchange="updateFormObj('rom_part', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-4 py-3 outline-none focus:border-blue-500 bg-white font-bold">
+                                    </div>
                                 </div>
 
-                                <!-- MMT ENHANCED -->
-                                <div class="p-4 bg-slate-50 rounded-xl border border-slate-200">
-                                    <div class="flex justify-between items-center mb-3"><span class="text-xs font-black text-slate-500 uppercase">MMT (Kekuatan Otot)</span></div>
-                                    <div class="grid grid-cols-2 gap-3 mb-3">
-                                        ${renderFormSelect('Side', 'mmt_side', data.obj.mmt_side || '-', ['-', 'Dextra', 'Sinistra', 'Bilateral'], true)}
-                                        ${renderFormSelect('Nilai', 'mmt', data.obj.mmt, ['0', '1', '2', '3', '4', '5'], true)}
+                                <!-- MMT D/S -->
+                                <div class="col-span-1 md:col-span-3 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+                                    <div class="flex items-center gap-2 mb-4"><i data-lucide="zap" width="16" class="text-amber-600"></i><span class="text-sm font-black text-slate-600 uppercase tracking-widest">MMT (Nilai Otot)</span></div>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div class="flex flex-col gap-2">
+                                            <span class="text-[10px] font-black text-amber-500 uppercase tracking-widest">Sisi Dextra (D)</span>
+                                            <select onchange="updateForm('mmt_d', this.value)" class="border-2 border-slate-200 rounded-xl p-3 text-sm font-bold text-slate-800 bg-white w-full outline-none focus:border-amber-500 transition-all">
+                                                ${['0', '1', '2', '3', '4', '5'].map(o => `<option value="${o}" ${o === String(data.mmt_d || '5') ? 'selected' : ''}>${o}</option>`).join('')}
+                                            </select>
+                                        </div>
+                                        <div class="flex flex-col gap-2">
+                                            <span class="text-[10px] font-black text-orange-500 uppercase tracking-widest">Sisi Sinistra (S)</span>
+                                            <select onchange="updateForm('mmt_s', this.value)" class="border-2 border-slate-200 rounded-xl p-3 text-sm font-bold text-slate-800 bg-white w-full outline-none focus:border-amber-500 transition-all">
+                                                ${['0', '1', '2', '3', '4', '5'].map(o => `<option value="${o}" ${o === String(data.mmt_s || '5') ? 'selected' : ''}>${o}</option>`).join('')}
+                                            </select>
+                                        </div>
                                     </div>
-                                    <input type="text" placeholder="Grup Otot / Segmen..." value="${data.obj.mmt_part || '-'}" onchange="updateFormObj('mmt_part', this.value)" class="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 outline-none focus:border-blue-500 bg-white">
+                                    <div class="mt-4">
+                                        <label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Grup Otot</label>
+                                        <input type="text" placeholder="Contoh: Quadriceps, Hamstrings..." value="${data.obj.mmt_part || '-'}" onchange="updateFormObj('mmt_part', this.value)" class="w-full text-sm border-2 border-slate-200 rounded-xl px-4 py-3 outline-none focus:border-blue-500 bg-white font-bold">
+                                    </div>
                                 </div>
 
-                                <!-- BALANCE -->
-                                <div class="p-4 bg-slate-50 rounded-xl border border-slate-200 flex flex-col justify-between">
+                                <!-- BALANCE (REMAINING 1/3) -->
+                                <div class="col-span-1 md:col-span-3 p-6 bg-slate-50 rounded-2xl border border-slate-200">
+                                    <div class="flex items-center gap-2 mb-3"><i data-lucide="shield" width="16" class="text-emerald-600"></i><span class="text-xs font-black text-slate-600 uppercase tracking-widest">Keseimbangan</span></div>
                                     <div class="mb-4">
-                                        <div class="flex items-center gap-2 mb-3"><span class="text-xs font-black text-slate-500 uppercase">Keseimbangan</span></div>
                                         ${renderSelect('Pilih Status', 'balance', data.obj.balance, ['Baik', 'Cukup', 'Buruk', 'Risiko Jatuh'])}
                                     </div>
                                     <p class="text-[10px] text-slate-400 italic">Gunakan standarisasi pengukuran (BBS/TUG) jika diperlukan.</p>
@@ -4173,7 +4702,7 @@ function renderAssessmentForm(container, useTempData = false) {
                                 <button type="button" onclick="clearPainPoints()" class="text-xs text-red-600 font-bold hover:bg-red-50 px-3 py-1.5 rounded-lg transition-colors border border-transparent hover:border-red-100"><i data-lucide="trash-2" width="12" class="inline mb-0.5"></i> Reset</button>
                             </div>
                             <div class="flex justify-center bg-slate-50 py-4 rounded-xl border border-slate-200">
-                                <div class="relative w-[300px] h-[400px] shadow-inner overflow-hidden group cursor-crosshair bg-white">
+                                <div class="relative w-full max-w-[300px] h-[400px] shadow-inner overflow-hidden group cursor-crosshair bg-white">
                                     <img src="${window.IMG_ASSETS.body_chart}" class="absolute inset-0 w-full h-full object-fill select-none pointer-events-none" alt="Body Chart">
                                     <div id="pain-map-overlay" onclick="addPainPoint(event)" class="absolute inset-0 w-full h-full z-10">
                                         ${(data.pain_points || []).map((p, idx) => `<div onclick="removePainPoint(${idx}, event)" class="absolute w-6 h-6 -ml-3 -mt-3 bg-red-600/90 rounded-full border-2 border-white shadow-sm flex items-center justify-center text-[10px] text-white font-bold hover:scale-125 transition-transform cursor-pointer animate-bounce-short" style="left: ${p.x}%; top: ${p.y}%;" title="Hapus titik ini">${idx + 1}</div>`).join('')}
@@ -4183,7 +4712,7 @@ function renderAssessmentForm(container, useTempData = false) {
                         </div>
 
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
-                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-indigo-600 text-white p-2 rounded-lg shadow-indigo-200 shadow-md"><h3 class="font-black text-lg">04</h3></div><div><h3 class="font-bold text-lg text-slate-800">Impairment</h3><p class="text-xs text-slate-400">Body Function & Structure</p></div></div>
+                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-indigo-600 text-white p-2 rounded-lg shadow-indigo-200 shadow-md"><h3 class="font-black text-lg">05</h3></div><div><h3 class="font-bold text-lg text-slate-800">Impairment</h3><p class="text-xs text-slate-400">Body Function & Structure</p></div></div>
                             <div class="grid grid-cols-1 gap-6">
                                 ${renderSectionBox('Body Function (b)', 'activity', `<div class="bg-slate-100 p-4 rounded-xl mb-4"><label class="flex justify-between text-sm font-bold mb-3 text-slate-700"><span>VAS Nyeri</span> <span class="bg-slate-800 text-white px-3 py-0.5 rounded-full text-xs" id="vas-display">${data.vas} / 10</span></label><input type="range" min="0" max="10" value="${data.vas}" oninput="updateForm('vas', this.value); document.getElementById('vas-display').innerText=this.value;" class="w-full h-2 bg-slate-300 rounded-lg cursor-pointer accent-slate-800 appearance-none"></div>${renderTextAreaWithMenu('b', data.b, 'Body Function')}`, 'b', true)}
                                 ${renderSectionBox('Body Structure (s)', 'box', renderTextAreaWithMenu('s', data.s, 'Body Structure'), 's', true)}
@@ -4191,7 +4720,7 @@ function renderAssessmentForm(container, useTempData = false) {
                         </div>
 
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
-                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-violet-600 text-white p-2 rounded-lg shadow-violet-200 shadow-md"><h3 class="font-black text-lg">05</h3></div><div><h3 class="font-bold text-lg text-slate-800">Limitation</h3><p class="text-xs text-slate-400">Activity & Participation</p></div></div>
+                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-violet-600 text-white p-2 rounded-lg shadow-violet-200 shadow-md"><h3 class="font-black text-lg">06</h3></div><div><h3 class="font-bold text-lg text-slate-800">Limitation</h3><p class="text-xs text-slate-400">Activity & Participation</p></div></div>
                             <div class="grid grid-cols-1 gap-6">
                                 ${renderSectionBox('Activity Limitation (d)', 'alert-circle', renderTextAreaWithMenu('d_act', data.d_act, 'Activity'), 'd_act', true)}
                                 ${renderSectionBox('Participation Restriction (d)', 'users', renderTextAreaWithMenu('d_part', data.d_part, 'Participation'), 'd_part', true)}
@@ -4207,7 +4736,7 @@ function renderAssessmentForm(container, useTempData = false) {
                                         <i data-lucide="activity" width="20"></i>
                                     </div>
                                     <div>
-                                        <h3 class="font-bold text-lg text-slate-800">06 Analisis Sistem Gerak (HMS)</h3>
+                                        <h3 class="font-bold text-lg text-slate-800">07 Analisis Sistem Gerak (HMS)</h3>
                                         <p class="text-xs text-slate-400">Diagnosis berdasarkan observasi gerakan fungsional</p>
                                     </div>
                                 </div>
@@ -4280,11 +4809,11 @@ function renderAssessmentForm(container, useTempData = false) {
 
                         </div>
 
-                        <!-- [NEW] 07: INTERVENTION SECTION (FULL WIDTH) -->
+                        <!-- [NEW] 08: INTERVENTION SECTION (FULL WIDTH) -->
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
                             <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
                                 <div class="bg-cyan-600 text-white p-2 rounded-lg shadow-cyan-200 shadow-md">
-                                    <h3 class="font-black text-lg">07</h3>
+                                    <h3 class="font-black text-lg">08</h3>
                                 </div>
                                 <div class="flex-1">
                                     <h3 class="font-bold text-lg text-slate-800">Intervensi Fisioterapi</h3>
@@ -4301,7 +4830,7 @@ function renderAssessmentForm(container, useTempData = false) {
                         </div>
 
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm">
-                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-emerald-600 text-white p-2 rounded-lg shadow-emerald-200 shadow-md"><h3 class="font-black text-lg">END</h3></div><div><h3 class="font-bold text-lg text-slate-800">Evaluasi & Rencana</h3></div></div>
+                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4"><div class="bg-emerald-600 text-white p-2 rounded-lg shadow-emerald-200 shadow-md"><h3 class="font-black text-lg">09</h3></div><div><h3 class="font-bold text-lg text-slate-800">Evaluasi & Rencana</h3></div></div>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
                                 <div>
                                     <h4 class="text-xs font-bold mb-3 text-slate-500 uppercase">Hasil Evaluasi</h4>
@@ -4347,16 +4876,16 @@ function renderAssessmentForm(container, useTempData = false) {
                                 </div>
                             </div>
                         <!-- Section Informed Consent Digital (v2.4) -->
-                        ${state.pdfConfig.showInformedConsent ? `
+                                                ${state.pdfConfig.showInformedConsent ? `
                         <div class="bg-blue-50 p-6 md:p-8 rounded-2xl border-2 border-blue-100 shadow-sm mt-6 fade-in">
                             <div class="flex items-start gap-4">
                                 <div class="shrink-0 mt-1">
                                     <input type="checkbox" id="form-is-consented" ${data.is_consented ? 'checked' : ''} 
-                                        onchange="updateForm('is_consented', this.checked); if(this.checked) updateForm('consent_timestamp', new Date().toLocaleString('id-ID'));" 
-                                        class="w-6 h-6 accent-blue-600 rounded cursor-pointer">
+                                        ${isLocked ? 'disabled' : `onchange="updateForm('is_consented', this.checked); if(this.checked) updateForm('consent_timestamp', new Date().toLocaleString('id-ID'));"`} 
+                                        class="w-6 h-6 accent-blue-600 rounded ${isLocked ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'}">
                                 </div>
                                 <div class="flex-1">
-                                    <label for="form-is-consented" class="font-bold text-slate-800 cursor-pointer select-none">
+                                    <label for="form-is-consented" class="font-bold text-slate-800 ${isLocked ? 'cursor-not-allowed' : 'cursor-pointer'} select-none">
                                         Persetujuan Tindakan (Informed Consent)
                                     </label>
                                     <p class="text-xs text-slate-500 mt-1 leading-relaxed">
@@ -4365,8 +4894,8 @@ function renderAssessmentForm(container, useTempData = false) {
                                     ${data.consent_timestamp ? `<p class="text-[10px] text-blue-600 font-bold mt-2 flex items-center gap-1"><i data-lucide="clock" width="10"></i> Disetujui pada: ${data.consent_timestamp}</p>` : ''}
                                     
                                     <div class="mt-4 pt-4 border-t border-blue-100 flex flex-col sm:flex-row items-center gap-4">
-                                        <button type="button" onclick="openSignatureModal()" 
-                                            class="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold hover:bg-blue-700 shadow-md transition-all">
+                                        <button type="button" ${isLocked ? `onclick="showToast('Persetujuan terkunci.', 'info')"` : 'onclick="openSignatureModal()"'}
+                                            class="flex items-center gap-2 px-4 py-2 ${isLocked ? 'bg-slate-300' : 'bg-blue-600 hover:bg-blue-700'} text-white rounded-xl text-sm font-bold shadow-md transition-all">
                                             <i data-lucide="pen-tool" width="16"></i>
                                             ${data.patient_signature ? 'Ulangi Tanda Tangan' : 'Tanda Tangan Pasien'}
                                         </button>
@@ -4385,7 +4914,12 @@ function renderAssessmentForm(container, useTempData = false) {
                             <button type="button" onclick="navigate('assessments')" class="w-full md:w-auto px-6 py-3 text-red-600 font-bold hover:bg-red-50 rounded-xl transition-colors text-sm border border-slate-200 md:border-transparent">Batal</button>
                             <div class="flex gap-3 w-full md:w-auto">
                                 <button type="button" onclick="showStep1()" class="flex-1 md:flex-none px-4 md:px-6 py-3 text-slate-600 font-bold hover:bg-slate-100 rounded-xl transition-colors text-sm border border-slate-200 text-center"><span class="md:hidden">&lt; Back</span> <span class="hidden md:inline">&lt; Kembali</span></button>
-                                <button type="button" onclick="saveAssessment()" class="flex-[2] md:flex-none px-4 md:px-8 py-3 bg-blue-600 text-white font-bold rounded-xl shadow-lg hover:bg-blue-700 hover:shadow-xl transition-all flex items-center justify-center gap-2 btn-press text-sm"><i data-lucide="save" width="18"></i> <span>Simpan</span> <span class="hidden md:inline">Data</span></button>
+                                <button type="button" ${isLocked ? `onclick="showToast('Riwayat ini bersifat permanen dan tidak dapat diubah.', 'info')"` : 'onclick="saveAssessment()"'} 
+                                    class="flex-[2] md:flex-none px-4 md:px-8 py-3 ${isLocked ? 'bg-slate-300' : 'bg-blue-600 hover:bg-blue-700'} text-white font-bold rounded-xl shadow-lg transition-all flex items-center justify-center gap-2 btn-press text-sm">
+                                    <i data-lucide="${isLocked ? 'lock' : 'save'}" width="18"></i> 
+                                    <span>${isLocked ? 'Locked' : 'Simpan'}</span> 
+                                    <span class="hidden md:inline">${isLocked ? '' : 'Data'}</span>
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -4507,10 +5041,92 @@ function renderFormSelect(label, objKey, val, options, tiny = false) {
     </div>`;
 }
 
-function updateForm(key, val) { window.tempFormData[key] = val; }
-function updateFormObj(key, val) { window.tempFormData.obj[key] = val; }
+function updateForm(key, val) {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
+    window.tempFormData[key] = val;
+}
+function updateFormObj(key, val) {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
+    window.tempFormData.obj[key] = val;
+}
+
+// [ISOM HELPERS]
+// [ISOM HELPERS ENHANCED]
+function parseRomISOM(str) {
+    if (!str || str === '-' || str === 'Normal') return { plane: 'S', v1: '0', v2: '0', v3: '0' };
+    // Handle format: "S: 0 - 0 - 0 [Indikasi...]"
+    const parts = str.split(':');
+    const plane = parts[0] ? parts[0].trim() : 'S';
+
+    // Clean up the value part: remove anything in brackets and extra spaces
+    let valPart = parts[1] || '';
+    valPart = valPart.split('[')[0].trim(); // Get "0 - 0 - 0"
+
+    const vals = valPart.split('-').map(v => v.trim());
+    return {
+        plane: plane,
+        v1: vals[0] || '0',
+        v2: vals[1] || '0',
+        v3: vals[2] || '0'
+    };
+}
+
+const ROM_ISOM_CONFIG = {
+    'S': { name: 'Sagital', l1: 'Ext', l2: '0/Stiff', l3: 'Flex' },
+    'F': { name: 'Frontal', l1: 'Abd', l2: '0/Stiff', l3: 'Add' },
+    'T': { name: 'Transversal', l1: 'Left/Exo', l2: '0/Stiff', l3: 'Right/Endo' },
+    'R': { name: 'Rotasi', l1: 'Left/Exo', l2: '0/Stiff', l3: 'Right/Endo' }
+};
+
+function getRomClinicalNarrative(v2, isHtml = true) {
+    const val2 = parseInt(v2) || 0;
+    if (val2 !== 0) {
+        if (isHtml) return `<span class="text-rose-600 font-black">⚠️ Indikasi: Kaku pada ${val2}°</span>`;
+        return `Kaku pada ${val2}°`;
+    }
+    if (isHtml) return `<span class="text-slate-400 font-bold">✓ Indikasi: Awal 0° (Normal)</span>`;
+    return `Normal`;
+}
+
+function updateRomISOM(side, field, val) {
+    const key = `rom_${side.toLowerCase()}`;
+    const current = parseRomISOM(window.tempFormData[key] || '');
+    current[field] = val;
+
+    // Canonical format: "Plane: V1 - V2 - V3 [Narrative]"
+    const narrativeText = getRomClinicalNarrative(current.v2, false);
+    const formattedData = `${current.plane}: ${current.v1} - ${current.v2} - ${current.v3} [${narrativeText}]`;
+    const formattedDisplay = `${current.plane}: ${current.v1} - ${current.v2} - ${current.v3}`;
+
+    updateForm(key, formattedData);
+
+    // Quick re-update of the labels and narrative in UI
+    const areaId = `rom-isom-area-${side.toLowerCase()}`;
+    const el = document.getElementById(areaId);
+    if (el) {
+        // Update preview (Display only numbers for UI header)
+        const preview = document.getElementById(`rom-preview-${side.toLowerCase()}`);
+        if (preview) preview.innerText = formattedDisplay;
+
+        // Update labels if plane changed
+        if (field === 'plane') {
+            const config = ROM_ISOM_CONFIG[val] || ROM_ISOM_CONFIG['S'];
+            const labels = el.querySelectorAll('.isom-label');
+            if (labels.length === 3) {
+                labels[0].innerText = config.l1;
+                labels[1].innerText = config.l2;
+                labels[2].innerText = config.l3;
+            }
+        }
+
+        // Update narrative
+        const narrative = document.getElementById(`rom-narrative-${side.toLowerCase()}`);
+        if (narrative) narrative.innerHTML = getRomClinicalNarrative(current.v2, true);
+    }
+}
 
 function toggleFormItem(category, item) {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
     const list = window.tempFormData[category];
     const index = list.indexOf(item);
     if (index > -1) list.splice(index, 1);
@@ -4530,6 +5146,7 @@ function updateGroupUI(category) {
 }
 
 function addCustomItem(category) {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
     const input = document.getElementById(`custom-${category}`);
     const val = input.value.trim();
     if (val) {
@@ -4542,7 +5159,7 @@ function addCustomItem(category) {
 // --- 11. TEMPLATE & SAVING LOGIC ---
 function processICFTemplateList(list) {
     if (!list || !Array.isArray(list)) return list;
-    
+
     // Lazy-load flattened ICF to ensure it exists
     const master = getFlattenedICF();
 
@@ -4560,11 +5177,11 @@ function processICFTemplateList(list) {
 
     return list.map(item => {
         const lowerItem = item.toLowerCase().trim();
-        
+
         // --- STEP 1: FILTERING (Jangan masukkan jika itu Tes Spesifik, biarkan di seksi 02) ---
         const isKnownTest = allTestRef.some(ref => lowerItem.includes(ref));
-        const isGenericTestPattern = (lowerItem.includes('test') || lowerItem.includes(' hasil ')) && 
-                                     (lowerItem.includes('(+)') || lowerItem.includes('(-)'));
+        const isGenericTestPattern = (lowerItem.includes('test') || lowerItem.includes(' hasil ')) &&
+            (lowerItem.includes('(+)') || lowerItem.includes('(-)'));
         if (isKnownTest || isGenericTestPattern) return null;
 
         // --- STEP 2: RESOLUTION (Ubah teks deskriptif jadi format Kode ICF) ---
@@ -4582,13 +5199,13 @@ function processICFTemplateList(list) {
 
         // Cari item yang paling mirip di database master (Prioritas exact name, lalu include name, lalu include desc)
         const match = master.find(m => m.name.toLowerCase() === searchKey) ||
-                      master.find(m => m.name.toLowerCase().includes(searchKey)) ||
-                      master.find(m => m.desc && m.desc.toLowerCase().includes(searchKey));
+            master.find(m => m.name.toLowerCase().includes(searchKey)) ||
+            master.find(m => m.desc && m.desc.toLowerCase().includes(searchKey));
 
         if (match) {
             return `${match.code} (${match.name})`;
         }
-        
+
         return item; // Tetap kembalikan teks aslinya jika tidak ada match cerdas
     }).filter(x => x !== null);
 }
@@ -4597,7 +5214,7 @@ function discoverRelatedICF(diagnosis, key) {
     if (!diagnosis) return [];
     const diagLower = diagnosis.toLowerCase();
     const rawKeywords = diagLower.split(/[\s/.,()]+/).filter(k => k.length > 2);
-    
+
     // Keyword Expansion with IndonSynonyms
     const keywords = [...rawKeywords];
     if (window.IndonSynonyms) {
@@ -4625,18 +5242,22 @@ function discoverRelatedICF(diagnosis, key) {
 function applyTemplate(tName) {
     const t = ICF_TEMPLATES[tName];
     if (!t) return;
-    
+
     // Base metadata
     window.tempFormData.diagnosis = tName;
     window.tempFormData.icd = t.icd || '';
     window.tempFormData.icf_codes = t.codes || '';
-    
-    // Load & Resolve Clinical Data Arrays (Smarter matching logic applied here)
+
+    // Update the UI field immediately if it exists
+    const diagInput = document.getElementById('form-diagnosis');
+    if (diagInput) diagInput.value = tName;
+
+    // Load & Resolve Clinical Data Arrays
     window.tempFormData.b = processICFTemplateList([...(t.b || [])]);
     window.tempFormData.s = processICFTemplateList([...(t.s || [])]);
     window.tempFormData.d_act = processICFTemplateList([...(t.d_act || [])]);
     window.tempFormData.d_part = processICFTemplateList([...(t.d_part || [])]);
-    
+
     // --- SMART DISCOVERY PHASE ---
     // Jika data dari template dirasa kurang lengkap (< 8 item), cari tambahan dari Master DB secara otomatis
     ['b', 's', 'd_act', 'd_part'].forEach(key => {
@@ -4650,60 +5271,116 @@ function applyTemplate(tName) {
     });
 
     window.tempFormData.bSize = window.tempFormData.b.length; // Utility
-    
+
     // Interventions & Evals
     window.tempFormData.intervention = t.intervention ? [...t.intervention] : [];
     window.tempFormData.eval = t.eval ? [...t.eval] : [];
-    
+
     // Reset secondary analysis
     window.tempFormData.hms_diagnosis = '';
     window.tempFormData.hms_notes = '';
-    
+
     showToast(`Template ${tName} dimuat dengan Auto-Discovery!`, 'success');
     renderAssessmentForm(document.getElementById('main-content'), true);
 }
 
 /**
- * [IDE 5] Copy Previous Assessment
- * Mencari data asesmen terakhir pasien ini dan menyalinnya ke form aktif
+ * [IDE 5] Open Selection Modal for Previous Assessment
+ * Menampilkan daftar riwayat sebelumnya agar user bisa memilih mana yang ingin disalin
  */
-function copyLastAssessment() {
+function openCopyAssessmentModal() {
     if (!state.selectedPatient) return;
-    
-    // Cari asesmen terakhir untuk pasien ini (sorting by date desc)
-    const prev = state.assessments
-        .filter(a => a.patientId === state.selectedPatient.id)
-        .sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-        
-    if (!prev) {
+
+    const list = state.assessments
+        .filter(a => String(a.patientId) === String(state.selectedPatient.id))
+        .sort((a, b) => parseDateSafe(b.date) - parseDateSafe(a.date));
+
+    if (list.length === 0) {
         showToast('Tidak ada data asesmen sebelumnya untuk pasien ini.', 'warning');
         return;
     }
-    
-    if (!confirm('Salin data dari asesmen terakhir? Data yang sudah Anda ketik akan tertimpa.')) return;
-    
+
+    let html = `
+        <div class="p-6 relative">
+            <div class="flex justify-between items-start mb-4">
+                <div>
+                    <h3 class="text-xl font-black text-slate-800 leading-tight">Pilih Riwayat untuk Disalin</h3>
+                    <p class="text-xs text-slate-500 mt-1">Diagnosis, ICF, dan Plan akan disalin ke form baru.</p>
+                </div>
+                <button onclick="closeModal()" class="w-10 h-10 -mr-2 bg-slate-50 text-slate-400 hover:text-slate-800 hover:bg-slate-100 rounded-full flex items-center justify-center transition-all">
+                    <i data-lucide="x" width="20"></i>
+                </button>
+            </div>
+            
+            <div class="space-y-4 max-h-[60vh] overflow-y-auto pr-3 pt-4 custom-scrollbar">
+                ${list.map((a, index) => `
+                    <button onclick="executeCopyAssessment('${a.id}')" class="w-full text-left p-5 rounded-2xl border-2 border-slate-100 hover:border-blue-600 hover:bg-white hover:shadow-lg transition-all group relative mt-2">
+                        ${index === 0 ? '<span class="absolute -top-3 left-4 bg-blue-600 text-white text-[9px] font-black px-3 py-1 rounded-full shadow-lg z-30 uppercase tracking-widest border-2 border-white">Terbaru / Rekomendasi</span>' : ''}
+                        
+                        <div class="flex justify-between items-start mb-2">
+                            <div class="flex items-center gap-2">
+                                <div class="bg-slate-100 p-2 rounded-lg text-slate-500 group-hover:bg-blue-600 group-hover:text-white transition-colors">
+                                    <i data-lucide="calendar" width="14"></i>
+                                </div>
+                                <span class="text-xs font-black text-slate-400 uppercase tracking-tighter">${formatDateForDisplay(a.date)}</span>
+                            </div>
+                            <i data-lucide="chevron-right" width="20" class="text-slate-300 group-hover:text-blue-600 group-hover:translate-x-1 transition-all"></i>
+                        </div>
+                        
+                        <div class="font-black text-slate-800 text-base md:text-lg group-hover:text-blue-600 mb-1 transition-colors line-clamp-1">${a.diagnosis || 'Tanpa Diagnosa'}</div>
+                        
+                        <div class="flex flex-wrap gap-2 mt-2">
+                            ${a.icf_codes ? `<div class="bg-indigo-50 text-indigo-600 text-[9px] font-bold px-2 py-0.5 rounded border border-indigo-100">ICF: ${a.icf_codes}</div>` : ''}
+                            ${a.icd ? `<div class="bg-slate-50 text-slate-600 text-[9px] font-bold px-2 py-0.5 rounded border border-slate-200">ICD: ${a.icd}</div>` : ''}
+                        </div>
+                    </button>
+                `).join('')}
+            </div>
+            
+            <div class="mt-8 flex justify-end gap-3 border-t border-slate-100 pt-6">
+                <button onclick="closeModal()" class="px-6 py-2.5 text-xs font-black text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-xl transition-all uppercase tracking-widest">Tutup</button>
+            </div>
+        </div>
+    `;
+
+    openModal(html);
+}
+
+/**
+ * Eksekusi penyalinan data dari assessment tertentu
+ */
+function executeCopyAssessment(aid) {
+    const prev = state.assessments.find(a => String(a.id) === String(aid));
+    if (!prev) return;
+
+    if (!confirm('Salin data dari riwayat ini? Data yang sudah Anda ketik akan tertimpa.')) return;
+
+    closeModal();
+
     // Copy data penting (Diagnosis, ICF, ICD, Anamnesis, Plan)
     window.tempFormData.diagnosis = prev.diagnosis || '';
     window.tempFormData.icd = prev.icd || '';
     window.tempFormData.icf_codes = prev.icf_codes || '';
     window.tempFormData.custom_assessment = prev.custom_assessment || '';
-    
+
     // Copy ICF Arrays (Deep copy)
     window.tempFormData.b = Array.isArray(prev.b) ? [...prev.b] : [];
     window.tempFormData.s = Array.isArray(prev.s) ? [...prev.s] : [];
     window.tempFormData.d_act = Array.isArray(prev.d_act) ? [...prev.d_act] : [];
     window.tempFormData.d_part = Array.isArray(prev.d_part) ? [...prev.d_part] : [];
-    
+
     // Copy Plan & Intervention
     window.tempFormData.intervention = Array.isArray(prev.intervention) ? [...prev.intervention] : [];
     window.tempFormData.eval = Array.isArray(prev.eval) ? [...prev.eval] : [];
     window.tempFormData.plan = prev.plan || '';
-    
+
     // Keep the current date, don't copy the old date!
     window.tempFormData.date = today();
-    
-    showToast('Data dari kunjungan sebelumnya berhasil disalin!', 'success');
+
+    showToast('Data riwayat berhasil disalin!', 'success');
     showStep2();
+    // Force re-render specifically after copying data to ensure UI sync
+    renderAssessmentForm(document.getElementById('main-content'), true);
 }
 
 function updateUploadBadge() {
@@ -4771,7 +5448,7 @@ async function processBackgroundUpload(assessmentId, fileData, fileName, patient
                 }
 
                 showToast('🚀 Link Dokumen Tersimpan!', 'success');
-                if (state.scriptUrl) scheduleSync(1); // Trigger sync lebih cepat (1 detik)
+                if (state.scriptUrl) syncDelta(false);
             }
         } else {
             console.error("Background upload failed:", res.message);
@@ -4786,7 +5463,12 @@ async function processBackgroundUpload(assessmentId, fileData, fileName, patient
 }
 
 function saveAssessment() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     const data = window.tempFormData;
+    if (data && (data.is_locked === true || data.is_locked === 'true')) {
+        showToast('Riwayat ini terkunci.', 'warning');
+        return;
+    }
     if (!data.diagnosis) { alert("Mohon isi diagnosa medis."); return; }
 
     const fileToUpload = data.rontgen_base64;
@@ -4811,6 +5493,10 @@ function saveAssessment() {
 
 let signaturePad = null;
 function openSignatureModal() {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) {
+        showToast('Riwayat terkunci.', 'warning');
+        return;
+    }
     openModal(`
         <div class="p-6">
             <div class="text-center mb-6">
@@ -4868,6 +5554,7 @@ function openSignatureModal() {
                 window.closeModal = originalClose;
                 originalClose();
             };
+            window.closeModal = originalClose;
         }
     }, 100);
 }
@@ -4877,6 +5564,7 @@ function clearSignature() {
 }
 
 function saveSignature() {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
     if (!signaturePad || signaturePad.isEmpty()) {
         alert("Mohon isi tanda tangan terlebih dahulu.");
         return;
@@ -4908,6 +5596,15 @@ function saveSignature() {
 }
 
 async function finalizeSaveAssessment(data) {
+    if (data && (data.is_locked === true || data.is_locked === 'true')) {
+        showToast('Asesmen terkunci.', 'danger');
+        return;
+    }
+    // ensure diagnosis is not empty (if not using template/manual edit, fallback to patient diagnosis)
+    if (!data.diagnosis && state.selectedPatient) {
+        data.diagnosis = state.selectedPatient.diagnosis || '';
+    }
+
     if (isReadOnly()) {
         alert("PERINGATAN: Anda sedang membuka Database Arsip (Read-Only). Perubahan tidak dapat disimpan di sini.");
         return;
@@ -4922,13 +5619,12 @@ async function finalizeSaveAssessment(data) {
     }
 
     data.updatedAt = getServerTimeISO();
+    data._dirty = true; // [FIX] Guarantee immediate sync regardless of lastSync
     closeModal();
     saveData();
 
     // NON-BLOCKING SYNC: Langsung pindah halaman, sync jalan di background (3s buffer)
-    if (state.scriptUrl) {
-        scheduleSync(3);
-    }
+    if (state.scriptUrl) syncDelta(false);
 
     navigate('assessments');
 }
@@ -4963,7 +5659,7 @@ window.handleRontgenUpload = async (input) => {
 };
 
 function selectTemplateAndGo(tName) { applyTemplate(tName); showStep2(); }
-function goToFormManual() { window.tempFormData.diagnosis = ''; showStep2(); }
+function goToFormManual() { window.tempFormData.diagnosis = state.selectedPatient ? state.selectedPatient.diagnosis : ''; showStep2(); }
 function showStep1() { document.getElementById('step-1').classList.remove('hidden'); document.getElementById('step-2').classList.add('hidden'); }
 function showStep2() { document.getElementById('step-1').classList.add('hidden'); document.getElementById('step-2').classList.remove('hidden'); const scrollArea = document.getElementById('main-form-scroll'); if (scrollArea) scrollArea.scrollTop = 0; renderIcons(); }
 function updateICFSelectionUI() {
@@ -5067,6 +5763,10 @@ function refreshPainDots() {
 }
 // --- 13. APPOINTMENT LOGIC ---
 function openAppointmentModal(dateStr, apptId = null, prefillData = null) {
+    if (dateStr && !apptId && isClinicClosed(dateStr)) {
+        showToast("Maaf, klinik tutup pada tanggal tersebut.", "warning");
+        return;
+    }
     let appt = { id: '', patientId: '', therapistId: state.user.username, date: dateStr, time: '09:00', notes: '', groupId: null, fee: 0 };
     let defaultFreq = 'once';
     let defaultCount = 6;
@@ -5150,7 +5850,7 @@ function openAppointmentModal(dateStr, apptId = null, prefillData = null) {
             </form>
         </div>
         <div class="bg-slate-50 px-6 py-4 border-t flex justify-between sticky bottom-0 z-20">
-            ${apptId ? `<button onclick="deleteAppointment('${appt.id}')" class="px-4 py-2.5 bg-red-100 text-red-600 rounded-lg font-bold hover:bg-red-200 transition-colors text-sm">Hapus</button>` : '<div></div>'}
+            ${apptId ? `<button onclick="showToast('Penghapusan jadwal dinonaktifkan di aplikasi.', 'info')" class="px-4 py-2.5 bg-slate-100 text-slate-400 rounded-lg font-bold cursor-not-allowed text-sm">Hapus Terkunci</button>` : '<div></div>'}
             <div class="flex gap-2">
                 <button onclick="closeModal()" class="px-5 py-2.5 bg-white border border-slate-300 text-slate-700 rounded-lg font-medium hover:bg-slate-50 transition-colors text-sm">Batal</button>
                 ${appt.status === 'PENDING' ? `
@@ -5183,7 +5883,7 @@ function openAppointmentModal(dateStr, apptId = null, prefillData = null) {
         if (matches.length > 0) {
             resultBox.innerHTML = matches.map(p => `
                 <div class="p-3 hover:bg-blue-50 cursor-pointer transition-colors flex justify-between items-center group" onclick="selectPatientSearch('${p.id}', '${p.name.replace(/'/g, "\\'")}', ${p.defaultFee || 0}, ${p.quota || 0})">
-                    <div><div class="font-bold text-slate-700 text-sm group-hover:text-blue-700">${p.name}</div><div class="text-[10px] text-slate-400 font-mono">${p.id} • ${p.diagnosis || '-'}</div></div>
+                    <div><div class="font-bold text-slate-700 text-sm group-hover:text-blue-700">${p.name}</div><div class="text-[10px] text-slate-400 font-mono">${p.id} ${p.nik ? `• ${p.nik}` : ""} • ${p.diagnosis || "-"}</div></div>
                     <div class="text-xs font-bold text-slate-400 group-hover:text-blue-600">Pilih</div>
                 </div>`).join('');
             resultBox.classList.remove('hidden');
@@ -5291,6 +5991,7 @@ window.togglePacketCount = (val) => {
 };
 
 function saveAppointment() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     const form = document.getElementById('appt-form');
     const id = form.querySelector('[name="id"]').value;
     const patientId = form.querySelector('[name="patientId"]').value;
@@ -5302,6 +6003,12 @@ function saveAppointment() {
 
 
     if (!patientId || !date || !time) { alert("Data wajib diisi!"); return; }
+
+    // Security Guard: Prevent booking on closed dates
+    if (isClinicClosed(date)) {
+        showToast("Maaf, klinik tutup pada tanggal pilihan tersebut.", "danger");
+        return;
+    }
 
     // Conflict Detection
     const isConflict = state.appointments.some(a =>
@@ -5328,7 +6035,10 @@ function saveAppointment() {
             showSeriesOptions("Edit Jadwal Berulang", "Apakah Anda ingin mengubah jadwal ini saja atau seluruh paket?",
                 () => { // Single
                     const idx = state.appointments.findIndex(a => a.id === id);
-                    if (idx > -1) { state.appointments[idx] = { ...state.appointments[idx], ...updates, date, groupId: null }; finalizeSave(); }
+                    if (idx > -1) {
+                        state.appointments[idx] = { ...state.appointments[idx], ...updates, date, id: id, groupId: null };
+                        finalizeSave();
+                    }
                 },
                 () => { // All
                     state.appointments.forEach(a => {
@@ -5338,14 +6048,17 @@ function saveAppointment() {
                         }
                     });
                     const idx = state.appointments.findIndex(a => a.id === id);
-                    if (idx > -1) state.appointments[idx].date = date;
+                    if (idx > -1) {
+                        state.appointments[idx].date = date;
+                        state.appointments[idx].id = id; // Ensure ID preserved
+                    }
                     finalizeSave();
                 }
             );
             return;
         } else {
             const idx = state.appointments.findIndex(a => a.id === id);
-            if (idx > -1) { state.appointments[idx] = { ...state.appointments[idx], ...updates, date }; finalizeSave(); }
+            if (idx > -1) { state.appointments[idx] = { ...state.appointments[idx], ...updates, date, id: id }; finalizeSave(); }
         }
     } else {
         const newId = `APT${Date.now()}`;
@@ -5360,7 +6073,7 @@ function saveAppointment() {
             console.log(`Booking Baru: Potong Kuota di Depan. Sisa: ${state.patients[pIdx].quota}`);
         }
 
-        state.appointments.push({ id: newId, date, ...updates, groupId: null });
+        state.appointments.push({ id: newId, date, ...updates, groupId: null, _dirty: true });
         finalizeSave();
     }
 }
@@ -5370,6 +6083,22 @@ function saveAppointment() {
  */
 function deduplicateAppointments(arr) {
     if (!arr || arr.length === 0) return [];
+
+    // [AUTO-FIX] Normalize keys that might be destroyed by Google Apps Script `norm()`
+    arr.forEach(a => {
+        if (a.patientid && !a.patientId) a.patientId = a.patientid;
+        if (a.therapistid && !a.therapistId) a.therapistId = a.therapistid;
+        if (a.patienttype && !a.patientType) a.patientType = a.patienttype;
+        if (a.paymentstatus && !a.paymentStatus) a.paymentStatus = a.paymentstatus;
+        if (a.paymentmethod && !a.paymentMethod) a.paymentMethod = a.paymentmethod;
+        if (a.finalamount && !a.finalAmount) a.finalAmount = a.finalamount;
+        if (a.groupid && !a.groupId) a.groupId = a.groupid;
+        if (a.paidat && !a.paidAt) a.paidAt = a.paidat;
+        if (a.visitorname && !a.visitor_name) a.visitor_name = a.visitorname;
+        if (a.visitorcontact && !a.visitor_contact) a.visitor_contact = a.visitorcontact;
+        if (a.updatedat && !a.updatedAt) a.updatedAt = a.updatedat;
+    });
+
     const map = new Map();
     // Sort by updatedAt descending to keep newest in case of conflict
     const sorted = [...arr].sort((a, b) => {
@@ -5381,11 +6110,25 @@ function deduplicateAppointments(arr) {
     const unique = [];
     const seenKeys = new Set();
 
+    const normalizeTime = (t) => {
+        if (!t) return "00:00";
+        const clean = String(t).replace('.', ':');
+        if (clean.includes(':')) {
+            const parts = clean.split(':');
+            const h = parts[0].padStart(2, '0');
+            const m = parts[1].padStart(2, '0');
+            return `${h}:${m}`;
+        }
+        return clean.padStart(5, '0');
+    };
+
     sorted.forEach(item => {
-        // Business logic unique key: same patient, same date, same time
-        const key = `${item.patientId}_${item.date}_${item.time}`;
+        // Business logic unique key: same patient, same date, same time (normalized)
+        const normT = normalizeTime(item.time);
+        const key = `${item.patientId}_${item.date}_${normT}`;
+
         if (!seenKeys.has(item.id) && !seenKeys.has(key)) {
-            unique.push(item);
+            unique.push({ ...item, time: normT }); // Update to normalized time for consistency
             seenKeys.add(item.id);
             seenKeys.add(key);
         }
@@ -5440,7 +6183,7 @@ async function confirmAppointment(id, fromUrl = false) {
         await saveData();
 
         if (state.scriptUrl) {
-            scheduleSync(3);
+            syncDelta(false);
         }
 
         if (fromUrl) {
@@ -5500,8 +6243,8 @@ function deleteAppointment(id, fromUrl = false) {
 
         finalizeDelete();
         if (state.scriptUrl) {
-            updateSyncStatusUI('pending', false, 3);
-            scheduleSync(3);
+            // [Sync Instant]
+            syncDelta(false);
         }
         if (fromUrl) {
             showToast("Booking Berhasil DITOLAK/DIHAPUS", "error");
@@ -5549,7 +6292,7 @@ async function finalizeSave() {
     closeModal();
     document.getElementById('choice-modal').classList.add('hidden');
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     if (state.currentView === 'schedule') renderScheduleView(document.getElementById('main-content'));
     else navigate('schedule');
 }
@@ -5562,7 +6305,7 @@ async function finalizeDelete() {
     closeModal();
     document.getElementById('choice-modal').classList.add('hidden');
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     renderScheduleView(document.getElementById('main-content'));
 }
 
@@ -5583,26 +6326,37 @@ function showSeriesOptions(title, message, onSingle, onSeries) {
 
 // --- 14. PATIENT MODAL ---
 function openPatientModal(id = null) {
-    const p = id ? state.patients.find(pat => pat.id === id) : { id: '', name: '', gender: 'L', dob: '', phone: '', job: '', address: '', diagnosis: '', category: 'Klinik', quota: 0 };
+    const p = id ? state.patients.find(pat => pat.id === id) : { id: '', nik: '', name: '', gender: 'L', dob: '', phone: '', job: '', address: '', diagnosis: '', category: 'Klinik', quota: 0, is_locked: false };
     if (!p.category) p.category = 'Klinik';
+    const isLocked = p.is_locked === true || p.is_locked === 'true';
 
     const modalHtml = `
+        <style>
+            /* Scoped Radio UI Fix - Category only (adjacent sibling works here) */
+            #patient-form input[name="category"][value="Klinik"]:checked + label { background-color: #dbeafe !important; border-color: #60a5fa !important; color: #1e40af !important; box-shadow: 0 0 0 1px #60a5fa; }
+            #patient-form input[name="category"][value="Home Visit"]:checked + label { background-color: #ffedd5 !important; border-color: #fb923c !important; color: #9a3412 !important; box-shadow: 0 0 0 1px #fb923c; }
+            /* Gender styles applied via JS onclick - CSS fallback below */
+            .pat-gen-btn-active-l { background-color: #eff6ff !important; border-color: #60a5fa !important; color: #1d4ed8 !important; }
+            .pat-gen-btn-active-p { background-color: #fdf2f8 !important; border-color: #f472b6 !important; color: #be185d !important; }
+            .pat-gen-btn-inactive { background-color: #ffffff !important; border-color: #e2e8f0 !important; color: #64748b !important; }
+        </style>
         <div class="bg-white px-6 py-4 border-b flex justify-between items-center sticky top-0 z-20 shrink-0">
             <h3 class="text-xl font-bold text-slate-800">${id ? 'Edit Pasien' : 'Pasien Baru'}</h3>
             <button onclick="closeModal()" class="bg-slate-100 p-2 rounded-full text-slate-500 hover:bg-slate-200 transition-colors"><i data-lucide="x" width="20"></i></button>
         </div>
-        <div class="px-6 py-6 space-y-5 overflow-y-auto modal-scroll flex-1 min-h-0">
+        <div class="px-6 py-6 space-y-5 overflow-y-auto modal-scroll flex-1 min-h-0 max-h-[60vh] md:max-h-[70vh]">
             <form id="patient-form">
                 <input type="hidden" name="id" value="${p.id}">
                 <div class="bg-slate-50 p-3 rounded-lg border border-slate-200">
                     <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Kategori Layanan</label>
                     <div class="flex gap-3">
-                        <label class="flex-1 flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${p.category === 'Klinik' ? 'bg-blue-100 border-blue-400 text-blue-800 ring-1 ring-blue-400' : 'bg-white border-slate-300 hover:bg-slate-50'}">
-                            <input type="radio" name="category" value="Klinik" class="accent-blue-600 w-4 h-4" ${p.category === 'Klinik' ? 'checked' : ''}>
+                        <input type="radio" id="pat-cat-klinik" name="category" value="Klinik" class="accent-blue-600 w-4 h-4 sr-only" ${p.category === 'Klinik' ? 'checked' : ''}>
+                        <label for="pat-cat-klinik" class="flex-1 flex items-center gap-3 p-3 rounded-lg border border-slate-300 bg-white cursor-pointer transition-all hover:bg-slate-50">
                             <div><span class="block font-bold text-sm">Datang ke Klinik</span><span class="text-[10px] opacity-70">Rawat Jalan</span></div>
                         </label>
-                        <label class="flex-1 flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-all ${p.category === 'Home Visit' ? 'bg-orange-100 border-orange-400 text-orange-800 ring-1 ring-orange-400' : 'bg-white border-slate-300 hover:bg-slate-50'}">
-                            <input type="radio" name="category" value="Home Visit" class="accent-orange-600 w-4 h-4" ${p.category === 'Home Visit' ? 'checked' : ''}>
+                        
+                        <input type="radio" id="pat-cat-home" name="category" value="Home Visit" class="accent-orange-600 w-4 h-4 sr-only" ${p.category === 'Home Visit' ? 'checked' : ''}>
+                        <label for="pat-cat-home" class="flex-1 flex items-center gap-3 p-3 rounded-lg border border-slate-300 bg-white cursor-pointer transition-all hover:bg-slate-50">
                             <div><span class="block font-bold text-sm">Home Visit</span><span class="text-[10px] opacity-70">Kunjungan Rumah</span></div>
                         </label>
                     </div>
@@ -5617,30 +6371,80 @@ function openPatientModal(id = null) {
                     <input type="number" name="quota" value="${p.quota || 0}" class="w-full border-2 border-blue-300 p-2.5 rounded-lg focus:ring-4 focus:ring-blue-500/30 outline-none text-blue-900 font-black text-xl bg-white text-center" placeholder="0">
                     <p class="text-[9px] text-blue-600 font-bold mt-2 leading-tight uppercase">*Ketik sisa kuota pasien manual di sini. Akan dipotong otomatis jika pasien memakai paket saat jadwal terapi.</p>
                 </div>
-                <div class="space-y-4">
-                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Nama Lengkap</label><input type="text" name="name" value="${p.name}" required class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800"></div>
-                    <div class="bg-white p-3 rounded-lg border border-slate-200">
-                        <div class="flex justify-between items-center mb-2"><label class="text-xs font-bold text-slate-500 uppercase">Kelahiran</label><div class="flex bg-slate-100 rounded-md p-0.5"><button type="button" id="btn-mode-date" onclick="toggleDobMode('date')" class="px-3 py-1 text-[10px] font-bold rounded bg-white text-blue-600 shadow-sm transition-all">Tanggal</button><button type="button" id="btn-mode-age" onclick="toggleDobMode('age')" class="px-3 py-1 text-[10px] font-bold rounded text-slate-500 hover:text-slate-700 transition-all">Usia</button></div></div>
-                        <div id="input-box-date"><input type="date" id="inp-dob-date" value="${p.dob}" class="w-full border border-slate-300 bg-white p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"></div>
-                        <div id="input-box-age" class="hidden"><div class="flex items-center gap-2"><input type="number" id="inp-dob-age" placeholder="Contoh: 45" class="w-full border border-slate-300 bg-white p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"><span class="text-sm font-bold text-slate-500">Tahun</span></div></div>
-                    </div>
+                <div class="space-y-4 ${isLocked ? 'opacity-60 pointer-events-none' : ''}">
+                    <!-- NIK & Identity -->
+                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">NIK (Nomor Induk Kependudukan)</label><input type="text" name="nik" value="${p.nik || ''}" ${isLocked ? 'disabled' : ''} class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800 font-mono" placeholder="16 Digit NIK..."></div>
+                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Nama Lengkap</label><input type="text" name="name" value="${p.name}" required ${isLocked ? 'disabled' : ''} class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800"></div>
+                    
                     <div class="grid grid-cols-2 gap-4">
-                        <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Jenis Kelamin</label><div class="flex gap-2 mt-1"><label class="flex-1 flex items-center justify-center gap-2 cursor-pointer text-xs p-2.5 rounded border ${p.gender === 'L' ? 'bg-blue-50 border-blue-200 text-blue-700' : 'border-slate-200'}"><input type="radio" name="gender" value="L" ${p.gender === 'L' ? 'checked' : ''} class="accent-blue-600"> Laki</label><label class="flex-1 flex items-center justify-center gap-2 cursor-pointer text-xs p-2.5 rounded border ${p.gender === 'P' ? 'bg-pink-50 border-pink-200 text-pink-700' : 'border-slate-200'}"><input type="radio" name="gender" value="P" ${p.gender === 'P' ? 'checked' : ''} class="accent-pink-600"> Pr</label></div></div>
-                        <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">No HP</label><input type="text" name="phone" value="${p.phone}" class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"></div>
+                        <div>
+                            <label class="text-xs font-bold text-slate-500 uppercase block mb-1">Gender</label>
+                            <div class="flex gap-2">
+                                <input type="radio" id="pat-gen-l" name="gender" value="L" class="absolute opacity-0 w-0 h-0 pointer-events-none" ${p.gender === 'L' ? 'checked' : ''}>
+                                <div id="lbl-pat-gen-l" role="radio" aria-checked="${p.gender === 'L' ? 'true' : 'false'}" onclick="event.preventDefault();event.stopPropagation();document.getElementById('pat-gen-l').checked=true;updatePatientGenderUI();" class="flex-1 flex items-center justify-center gap-2 p-2.5 rounded-lg border cursor-pointer transition-all select-none ${p.gender === 'L' ? 'pat-gen-btn-active-l' : 'pat-gen-btn-inactive'}">
+                                    <span class="text-xs font-bold">♂ Laki-laki</span>
+                                </div>
+                                
+                                <input type="radio" id="pat-gen-p" name="gender" value="P" class="absolute opacity-0 w-0 h-0 pointer-events-none" ${p.gender === 'P' ? 'checked' : ''}>
+                                <div id="lbl-pat-gen-p" role="radio" aria-checked="${p.gender === 'P' ? 'true' : 'false'}" onclick="event.preventDefault();event.stopPropagation();document.getElementById('pat-gen-p').checked=true;updatePatientGenderUI();" class="flex-1 flex items-center justify-center gap-2 p-2.5 rounded-lg border cursor-pointer transition-all select-none ${p.gender === 'P' ? 'pat-gen-btn-active-p' : 'pat-gen-btn-inactive'}">
+                                    <span class="text-xs font-bold">♀ Perempuan</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="flex justify-between items-center mb-1">
+                                <label class="text-xs font-bold text-slate-500 uppercase">Tgl Lahir / Usia</label>
+                                <div class="flex bg-slate-100 p-0.5 rounded-md">
+                                    <button type="button" id="btn-mode-date" onclick="toggleDobMode('date')" class="px-2 py-0.5 text-[9px] font-black rounded ${p.dob ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400'}">TGL</button>
+                                    <button type="button" id="btn-mode-age" onclick="toggleDobMode('age')" class="px-2 py-0.5 text-[9px] font-black rounded ${!p.dob ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400'}">USIA</button>
+                                </div>
+                            </div>
+                            <div id="input-box-date" class="${!p.dob ? 'hidden' : ''}">
+                                <input type="date" id="inp-dob-date" name="dob" value="${p.dob || ''}" class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800 text-sm">
+                            </div>
+                            <div id="input-box-age" class="${p.dob ? 'hidden' : ''}">
+                                <div class="relative">
+                                    <input type="number" id="inp-dob-age" value="${p.dob ? calculateAge(p.dob) : ''}" class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800 font-bold text-sm" placeholder="Umur...">
+                                    <span class="absolute right-3 top-2.5 text-xs font-bold text-slate-400">Tahun</span>
+                                </div>
+                            </div>
+                        </div>
                     </div>
-                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Pekerjaan</label><input type="text" name="job" value="${p.job}" class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm"></div>
-                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Alamat Domisili</label><textarea name="address" class="w-full border p-2.5 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-sm h-20 resize-none placeholder-slate-300" placeholder="Jalan, RT/RW, Kelurahan...">${p.address || ''}</textarea></div>
-                    <div class="bg-rose-50 p-4 rounded-xl border border-rose-200">
-                        <label class="text-[11px] font-black text-rose-600 uppercase block mb-2"><i data-lucide="alert-triangle" width="14" class="inline"></i> Waspada / Kondisi Khusus (Tags)</label>
-                        <input type="text" name="tags" value="${p.tags || ''}" class="w-full border-2 border-rose-300 p-2.5 rounded-lg focus:ring-4 focus:ring-rose-500/30 outline-none text-rose-800 font-bold bg-white" placeholder="Contoh: HIV, Hepatitis, Alergi Obat...">
-                        <p class="text-[9px] text-rose-500 font-bold mt-2 leading-tight uppercase">Pisahkan dengan koma jika lebih dari satu. Tag ini akan muncul sebagai Red-Flag di daftar pasien.</p>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">No. HP / WhatsApp</label><input type="text" name="phone" value="${p.phone || ''}" class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800" placeholder="08..."></div>
+                        <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Pekerjaan</label><input type="text" name="job" value="${p.job || ''}" class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800" placeholder="Karyawan, Guru, dsb..."></div>
                     </div>
+
+                    <div><label class="text-xs font-bold text-slate-500 uppercase block mb-1">Alamat Lengkap</label><textarea name="address" class="w-full border p-3 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none text-slate-800 text-sm min-h-[80px]" placeholder="Alamat tinggal sekarang...">${p.address || ''}</textarea></div>
+                    
+                    <div class="bg-rose-50 p-4 rounded-xl border border-rose-100">
+                        <label class="text-[10px] font-black text-rose-800 uppercase block mb-1.5"><i data-lucide="tag" width="12" class="inline"></i> Label / Tag Pasien (Opsional)</label>
+                        <input type="text" name="tags" value="${p.tags || ''}" class="w-full border-2 border-rose-200 p-2.5 rounded-lg focus:ring-4 focus:ring-rose-500/20 outline-none text-rose-900 font-bold text-sm bg-white" placeholder="Contoh: RESIKO TINGGI, VIP, dsb...">
+                        <p class="text-[9px] text-rose-500 font-medium mt-1.5 leading-tight italic">*Label ini akan muncul berkedip di daftar pasien sebagai pengingat khusus.</p>
+                    </div>
+                </div>
+                
+                <div class="mt-6 pt-6 border-t border-slate-100">
+                    <label class="flex items-center gap-3 cursor-pointer group">
+                        <div class="relative">
+                            <input type="checkbox" name="is_locked" class="sr-only" ${isLocked ? 'checked' : ''} onchange="this.nextElementSibling.classList.toggle('bg-blue-600', this.checked); this.nextElementSibling.classList.toggle('bg-slate-300', !this.checked);">
+                            <div class="block w-10 h-6 rounded-full transition-colors ${isLocked ? 'bg-blue-600' : 'bg-slate-300'}"></div>
+                            <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isLocked ? 'translate-x-4' : ''}"></div>
+                        </div>
+                        <div>
+                            <span class="text-sm font-bold text-slate-700 flex items-center gap-1">
+                                <i data-lucide="${isLocked ? 'lock' : 'unlock'}" width="14"></i> Kunci Data (Read-Only)
+                            </span>
+                            <p class="text-[10px] text-slate-400 font-medium">Jika diaktifkan, data ini tidak bisa diubah lagi untuk menjaga validitas history.</p>
+                        </div>
+                    </label>
                 </div>
             </form>
         </div>
         <div class="bg-slate-50 px-6 py-4 border-t flex justify-end gap-3 sticky bottom-0 z-20 shrink-0">
             <button onclick="closeModal()" class="px-5 py-2.5 bg-white border border-slate-300 text-slate-700 rounded-lg font-medium hover:bg-slate-50 transition-colors text-sm">Batal</button>
-            <button onclick="submitPatientForm()" class="px-6 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 shadow-md transition-all btn-press text-sm flex items-center gap-2 font-bold"><i data-lucide="save" width="16"></i> Simpan Data</button>
+            <button onclick="submitPatientForm()" class="px-6 py-2.5 ${isLocked ? 'bg-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 shadow-md'} text-white rounded-lg transition-all btn-press text-sm flex items-center gap-2 font-bold"><i data-lucide="${isLocked ? 'lock' : 'save'}" width="16"></i> ${isLocked ? 'Data Terkunci' : 'Simpan Data'}</button>
         </div>
     `;
     document.getElementById('modal-content').innerHTML = modalHtml;
@@ -5649,6 +6453,7 @@ function openPatientModal(id = null) {
 }
 
 async function submitPatientForm() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     if (isReadOnly()) {
         alert("PERINGATAN: Anda sedang membuka Database Arsip (Read-Only). Perubahan tidak dapat disimpan di sini.");
         return;
@@ -5666,8 +6471,18 @@ async function submitPatientForm() {
         }
     }
 
+    // Prevention: If data is already locked and user is NOT an admin trying to force something
+    const oldP = state.patients.find(pt => pt.id === (form.querySelector('[name="id"]').value));
+    if (oldP && (oldP.is_locked === true || oldP.is_locked === 'true')) {
+        alert("⚠️ GAGAL: Data ini sudah terkunci dan tidak dapat diubah.");
+        return;
+    }
+
+    const nikValue = form.querySelector('[name="nik"]').value;
+
     const newP = {
         id: form.querySelector('[name="id"]').value || generateNextRM(),
+        nik: nikValue,
         name: form.querySelector('[name="name"]').value,
         category: form.querySelector('[name="category"]:checked')?.value || 'Klinik',
         gender: form.querySelector('[name="gender"]:checked')?.value || 'L',
@@ -5677,9 +6492,11 @@ async function submitPatientForm() {
         address: form.querySelector('[name="address"]').value,
         diagnosis: form.querySelector('[name="diagnosis"]').value,
         quota: parseInt(form.querySelector('[name="quota"]')?.value) || 0,
-        defaultFee: (state.patients.find(pt => pt.id === (form.querySelector('[name="id"]').value))?.defaultFee) || 0,
+        defaultFee: oldP?.defaultFee || 0,
         tags: (form.querySelector('[name="tags"]')?.value || "").trim(),
-        updatedAt: getServerTimeISO()
+        is_locked: form.querySelector('[name="is_locked"]')?.checked || false,
+        updatedAt: getServerTimeISO(),
+        _dirty: true // [FIX] Always push immediately regardless of lastSync timing
     };
 
     if (!newP.name) { alert('Nama wajib diisi!'); return; }
@@ -5691,8 +6508,8 @@ async function submitPatientForm() {
     closeModal();
     await saveData();
     if (state.scriptUrl) {
-        updateSyncStatusUI('pending', false, 3);
-        scheduleSync(3);
+        // [Sync Instant] _dirty flag guarantees this gets included in filterDelta
+        syncDelta(false);
     }
     renderPatientList(document.getElementById('main-content'));
 }
@@ -5714,6 +6531,35 @@ function toggleDobMode(mode) {
     }
 }
 
+/**
+ * Updates the visual highlight of gender radio buttons in the patient form.
+ * Uses direct classList manipulation — no 'for' or 'onchange' to avoid
+ * browser auto-scrolling to sr-only/hidden radio inputs.
+ */
+function updatePatientGenderUI() {
+    const lblL = document.getElementById('lbl-pat-gen-l');
+    const lblP = document.getElementById('lbl-pat-gen-p');
+    const radL = document.getElementById('pat-gen-l');
+    const radP = document.getElementById('pat-gen-p');
+    if (!lblL || !lblP || !radL || !radP) return;
+
+    // Reset both
+    lblL.classList.remove('pat-gen-btn-active-l', 'pat-gen-btn-active-p', 'pat-gen-btn-inactive');
+    lblP.classList.remove('pat-gen-btn-active-l', 'pat-gen-btn-active-p', 'pat-gen-btn-inactive');
+
+    if (radL.checked) {
+        lblL.classList.add('pat-gen-btn-active-l');
+        lblP.classList.add('pat-gen-btn-inactive');
+        lblL.setAttribute('aria-checked', 'true');
+        lblP.setAttribute('aria-checked', 'false');
+    } else if (radP.checked) {
+        lblP.classList.add('pat-gen-btn-active-p');
+        lblL.classList.add('pat-gen-btn-inactive');
+        lblL.setAttribute('aria-checked', 'false');
+        lblP.setAttribute('aria-checked', 'true');
+    }
+}
+
 // --- 15. CONFIG & USER MGMT ---
 function renderConfigView(container, activeTab = 'identity') {
     const conf = state.pdfConfig || {};
@@ -5721,7 +6567,7 @@ function renderConfigView(container, activeTab = 'identity') {
     <div class="fade-in pb-32">
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mb-6">
             <div class="p-6 border-b border-slate-100"><h2 class="text-2xl font-black text-slate-800">Konfigurasi Sistem</h2><p class="text-slate-500 text-sm">Atur identitas klinik dan tampilan hasil cetak.</p></div>
-            <div class="flex bg-slate-50 overflow-x-auto">
+            <div class="flex bg-slate-50 overflow-x-auto pb-1">
                 <button onclick="switchConfigTab('identity')" id="tab-btn-identity" class="px-6 py-3 text-sm font-bold text-blue-600 border-b-2 border-blue-600 bg-white transition-colors flex items-center gap-2"><i data-lucide="building-2" width="16"></i> Identitas Klinik</button>
                 <button onclick="switchConfigTab('print')" id="tab-btn-print" class="px-6 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-2"><i data-lucide="printer" width="16"></i> Layout Cetak (PDF)</button>
                 <button onclick="switchConfigTab('notif')" id="tab-btn-notif" class="px-6 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-2"><i data-lucide="bell" width="16"></i> Notifikasi</button>
@@ -5778,27 +6624,96 @@ function renderConfigView(container, activeTab = 'identity') {
                             <label class="text-xs font-bold text-slate-500 uppercase block mb-1.5">Alias Klinik (ID Booking)</label>
                             <div class="flex gap-2">
                                 <span class="bg-slate-100 text-slate-500 px-3 py-2.5 rounded-l-lg border border-r-0 text-xs font-mono font-bold border-slate-200">booking/?id=</span>
-                                <input type="text" id="conf-booking-alias" placeholder="nama-klinik-anda"
-                                    oninput="updateBookingLinkPreview()"
+                                <input type="text" id="conf-booking-alias" 
+                                    readonly
                                     value="${state.bookingConfig.alias || ''}"
-                                    class="flex-1 border border-slate-200 p-2.5 rounded-r-lg focus:ring-2 focus:ring-emerald-500 outline-none text-sm font-mono">
+                                    class="flex-1 bg-slate-50 border border-slate-200 p-2.5 rounded-r-lg outline-none text-sm font-mono text-slate-500 cursor-not-allowed">
                             </div>
                             <p class="text-[11px] text-slate-400 mt-1">Huruf kecil, tanpa spasi, gunakan tanda hubung (-). Contoh: <i>klinik-sehat-blitar</i></p>
                         </div>
 
+                        <div class="bg-indigo-50/50 p-4 rounded-xl border border-indigo-100 mb-6">
+                            <h4 class="text-[10px] font-black text-indigo-700 uppercase tracking-widest mb-2 flex items-center gap-2">
+                                <i data-lucide="info" width="14"></i> Petunjuk Pengoperasian
+                            </h4>
+                            <p class="text-[10px] text-slate-600 leading-relaxed">
+                                <b>1. Jam Buka Default:</b> Pilih jam umum yang berlaku setiap hari.<br>
+                                <b>2. Advanced Table:</b> Jika Anda mengisi "JAM" di tabel bawah, maka jam default di atas akan diabaikan khusus untuk hari tersebut.<br>
+                                <b>3. Slot/Jam:</b> Mengatur berapa banyak pasien yang bisa booking di jam yang sama (misal: isi 2 jika ada 2 terapis).
+                            </p>
+                        </div>
+
                         <div>
-                            <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Jam Tersedia</label>
-                            <div class="grid grid-cols-3 gap-2">
+                            <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Jam Buka Default (Cepat)</label>
+                            <div class="grid grid-cols-4 gap-2">
                                 ${['06:00', '07:00', '08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00', '22:00'].map(h => {
         const saved = state.bookingConfig.availableHours || '08:00,09:00,10:00,11:00,13:00,14:00,15:00,16:00';
-        const checked = saved.split(',').includes(h) ? 'checked' : '';
-        return `<label class="flex items-center gap-1.5 text-sm cursor-pointer hover:bg-slate-50 p-1.5 rounded-lg">
-                                        <input type="checkbox" value="${h}" ${checked} onchange="updateBookingLinkPreview()" class="booking-hour-check w-4 h-4 accent-emerald-500">
-                                        <span class="font-medium text-slate-700">${h}</span>
+        const isChecked = saved.split(',').includes(h) ? 'checked' : '';
+        return `<label class="flex items-center gap-1.5 text-[10px] cursor-pointer hover:bg-slate-50 p-1 rounded border border-slate-100">
+                                        <input type="checkbox" value="${h}" ${isChecked} onchange="updateBookingLinkPreview()" class="booking-hour-check w-3 h-3 accent-emerald-500">
+                                        <span class="font-bold text-slate-700">${h}</span>
                                     </label>`;
     }).join('')}
                             </div>
-                            <p class="text-[10px] text-slate-400 mt-2 italic">*Jika dicentang, hari tersebut akan otomatis "Tutup" di halaman booking.</p>
+                            <p class="text-[9px] text-slate-400 mt-1 italic">Jam ini berlaku setiap hari kerja jika tidak diatur khusus di tabel bawah.</p>
+                        </div>
+
+                        <div class="pt-4 border-t border-slate-100">
+                            <label class="text-xs font-bold text-slate-500 uppercase block mb-3 flex justify-between items-center">
+                                <span>Advanced: Atur Jam & Slot per Hari</span>
+                                <span class="bg-blue-100 text-blue-700 text-[9px] px-1.5 py-0.5 rounded-full font-bold">PREMIUM</span>
+                            </label>
+                            <div class="bg-slate-50 rounded-xl border border-slate-200 overflow-hidden">
+                                <table class="w-full text-left text-[10px] border-collapse">
+                                    <thead class="bg-slate-100 border-b border-slate-200">
+                                        <tr>
+                                            <th class="px-2 py-2 font-black text-slate-500 w-12">HARI</th>
+                                            <th class="px-2 py-2 font-black text-slate-500 text-center w-12">AKTIF</th>
+                                            <th class="px-2 py-2 font-black text-slate-500">JAM (Pemisah Koma)</th>
+                                            <th class="px-2 py-2 font-black text-slate-500 w-16">SLOT/JAM</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-slate-200">
+                                        ${['Mingu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((dayName, idx) => {
+        const dayCfg = (state.bookingConfig.dayConfig && state.bookingConfig.dayConfig[idx]) || { active: null, hours: '', slots: 1 };
+        const isActive = dayCfg.active === false ? '' : 'checked';
+        const hours = dayCfg.hours || '';
+        const slots = dayCfg.slots || 1;
+        return `
+                                        <tr class="bg-white hover:bg-slate-50 transition-colors">
+                                            <td class="px-2 py-3 font-bold text-slate-700">${dayName}</td>
+                                            <td class="px-2 py-3 text-center">
+                                                <input type="checkbox" id="adv-day-active-${idx}" ${isActive} class="adv-day-check w-4 h-4 accent-blue-600 cursor-pointer">
+                                            </td>
+                                            <td class="px-2 py-3">
+                                                <input type="text" id="adv-day-hours-${idx}" value="${hours}" placeholder="08:00, 09:00..." class="w-full bg-slate-50 border border-slate-200 rounded p-1.5 focus:bg-white focus:ring-1 focus:ring-blue-500 outline-none font-mono text-[9px]">
+                                            </td>
+                                            <td class="px-2 py-3">
+                                                <input type="number" id="adv-day-slots-${idx}" value="${slots}" min="1" max="10" class="w-full bg-slate-50 border border-slate-200 rounded p-1.5 focus:bg-white focus:ring-1 focus:ring-blue-500 outline-none font-bold text-center">
+                                            </td>
+                                        </tr>`;
+    }).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <p class="text-[9px] text-slate-400 mt-2 leading-tight">
+                                💡 <b>Tips:</b> Jika 'Jam' diisi, maka Jam Default di atas akan diabaikan khusus hari tersebut. 
+                                Kolom 'Slot' menentukan berapa banyak pasien yang bisa booking di jam yang sama.
+                            </p>
+                        </div>
+
+                        <div class="pt-4 border-t border-slate-100">
+                            <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Hari Libur Rutin (Tutup Otomatis)</label>
+                            <div class="grid grid-cols-7 gap-1">
+                                ${['Min', 'Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab'].map((day, i) => {
+        const currentOff = (state.bookingConfig.offDays || '').split(',').map(d => d.trim());
+        const isChecked = currentOff.includes(String(i)) ? 'checked' : '';
+        return `<label class="flex flex-col items-center gap-1 p-1.5 rounded-lg border cursor-pointer ${isChecked ? 'bg-rose-50 border-rose-200 ring-1 ring-rose-100' : 'bg-white border-slate-200'}">
+                                        <input type="checkbox" value="${i}" ${isChecked} class="off-day-check w-3 h-3 accent-rose-500">
+                                        <span class="text-[9px] font-black ${isChecked ? 'text-rose-700' : 'text-slate-500'}">${day}</span>
+                                    </label>`;
+    }).join('')}
+                            </div>
                         </div>
 
                         <!-- [NEW] GUI Custom Holidays Manager -->
@@ -6091,6 +7006,24 @@ function renderConfigView(container, activeTab = 'identity') {
                                 </div>
                             </div>
                         </div>
+                        
+                        <!-- GOOGLE CALENDAR INTEGRATION -->
+                        <div class="bg-indigo-50 p-4 rounded-xl border border-indigo-100 col-span-1 md:col-span-2">
+                            <div class="flex items-center gap-3 mb-3">
+                                <div class="p-2 bg-indigo-100 rounded-lg text-indigo-600"><i data-lucide="calendar" width="18"></i></div>
+                                <div><h4 class="font-bold text-indigo-800">Integrasi Google Calendar (SaaS)</h4><p class="text-[11px] text-indigo-600">Jadwal terapi otomatis masuk ke aplikasi Kalender Anda</p></div>
+                            </div>
+                            <div class="flex justify-between items-center bg-white p-3 rounded-lg border border-indigo-100">
+                                <div>
+                                    <p class="text-xs font-bold text-slate-700">Status Koneksi</p>
+                                    <p class="text-[10px] text-slate-500 max-w-xs mt-1 leading-tight"><i data-lucide="info" width="10" class="inline"></i> Anda akan dialihkan ke layar otorisasi aman Google untuk memberikan izin pada aplikasi Fisiota.</p>
+                                </div>
+                                <button onclick="connectGoogleCalendar()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-md transition-all">
+                                    <i data-lucide="link" width="14"></i> Hubungkan Kalender
+                                </button>
+                            </div>
+                        </div>
+
                     </div>
                 </div>
 
@@ -6149,19 +7082,23 @@ function renderConfigView(container, activeTab = 'identity') {
                 <div class="space-y-6">
                     <div class="bg-white p-6 rounded-xl shadow border border-slate-200">
                         <h3 class="font-bold text-lg text-slate-800 mb-2">Integrasi Cloud Storage</h3>
-                        <p class="text-xs text-slate-500 mb-2">Gunakan Sheet ID yang diberikan oleh Admin via WA untuk menambah backup data terbaru. (data lama tetap bisa dibuka melalui menu ini. Backup data dilakukan minimal tiap 1 tahun sekal)</p>
-                        <input type="text" id="script-url" value="${state.scriptUrl}" 
-                            oninput="const id=getSheetIdFromUrl(this.value); if(id) document.getElementById('conf-sheet-id').value=id;"
-                            placeholder="https://docs.google.com/spreadsheets/d/..." class="w-full border p-2 rounded text-xs font-mono bg-slate-50 mb-3">
+                        <p class="text-xs text-slate-500 mb-2">ID Database aktif terhubung secara otomatis ke sistem. Lakukan proses Tarik/Kirim data secara rutin.</p>
                         
-                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">Google Sheet ID (Otomatis/Manual)</label>
-                        <input type="text" id="conf-sheet-id" value="${state.sheetId}" placeholder="1abc123..." class="w-full border p-2 rounded text-xs font-mono bg-white mb-1">
+                        <input type="hidden" id="script-url" value="${state.scriptUrl}">
                         
-                        <p class="text-[10px] text-slate-400 mb-3 italic">*Pastikan Sheet di-SHARE (Editor) ke Email Script Server:<br><strong class="text-blue-600">contactlazuardy@gmail.com</strong></p>
-                        <button onclick="saveConfig()" class="bg-slate-800 text-white w-full py-2 rounded text-sm font-bold mb-4">Simpan & Koneksikan</button>
-                        <div class="flex gap-2">
-                            <button onclick="pullDataFromSheet()" class="flex-1 border p-2 rounded text-xs font-bold hover:bg-slate-50">Tarik Data</button>
-                            <button onclick="pushDataToSheet()" class="flex-1 border p-2 rounded text-xs font-bold hover:bg-slate-50">Kirim Data</button>
+                        <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">ID Terkunci (Read-Only)</label>
+                        <div class="relative w-full mb-1">
+                            <input type="password" id="conf-sheet-id" value="${state.sheetId}" readonly
+                                class="w-full border p-2 pr-10 rounded text-xs font-mono bg-slate-100 text-slate-500 cursor-not-allowed select-all">
+                            <button type="button" onclick="const inp=document.getElementById('conf-sheet-id'); inp.type = inp.type==='password'?'text':'password';" class="absolute right-2 top-2 text-slate-400 hover:text-blue-600 focus:outline-none cursor-pointer" title="Lihat/Sembunyikan ID">
+                                <i data-lucide="eye" width="16"></i>
+                            </button>
+                        </div>
+                        
+                        <p class="text-[10px] text-slate-400 mb-3 italic">*Pergantian Database hanya bisa dilakukan oleh Sistem / via menu Arsip.</p>
+                        <div class="flex gap-2 mt-4">
+                            <button onclick="pullDataFromSheet()" class="flex-1 bg-slate-800 text-white border border-slate-800 p-2 rounded text-xs font-bold hover:bg-slate-700">Tarik Data (Sinkron)</button>
+                            <button onclick="pushDataToSheet()" class="flex-1 border p-2 rounded text-xs font-bold hover:bg-slate-50 text-slate-700">Kirim Data (Backup)</button>
                         </div>
                     </div>
                     <div class="bg-white p-6 rounded-xl shadow border border-slate-200">
@@ -6197,9 +7134,13 @@ function renderHolidayList() {
     holidays.sort();
 
     container.innerHTML = holidays.map(date => {
+        const d = new Date(date);
+        const options = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+        const formattedDate = isNaN(d) ? date : d.toLocaleDateString('id-ID', options);
+        
         return `
             <div class="flex items-center justify-between bg-white px-3 py-2 rounded-lg border border-slate-100 shadow-sm transition-all hover:border-emerald-200">
-                <span class="text-xs font-bold text-slate-700">${date}</span>
+                <span class="text-xs font-bold text-slate-700">${formattedDate}</span>
                 <button onclick="removeCustomHoliday('${date}')" class="text-red-400 hover:text-red-600 p-1 hover:bg-red-50 rounded transition-all">
                     <i data-lucide="x" width="12"></i>
                 </button>
@@ -6257,7 +7198,7 @@ async function handleLogoUpload(event) {
 
             // [FIXED] Using the same "Sakti" URL as Rontgen Upload to ensure success
             const targetUrl = (typeof LICENSE_API_URL !== 'undefined' && LICENSE_API_URL) ? LICENSE_API_URL : state.scriptUrl;
-            
+
             if (!targetUrl) throw new Error("URL Script Cloud tidak ditemukan. Pastikan lisensi terhubung.");
 
             const res = await fetch(targetUrl, {
@@ -6284,7 +7225,7 @@ async function handleLogoUpload(event) {
 
             if (result.status === 'success') {
                 // [FIXED] Use cloud URL to avoid truncation in Google Sheets cell (50k char limit)
-                state.clinicInfo.logoUrl = result.fileUrl; 
+                state.clinicInfo.logoUrl = result.fileUrl;
                 showToast("Logo Berhasil Diupdate! ✅", "success");
                 saveClinicConfig();
                 renderConfigView(document.getElementById('main-content'), 'identity');
@@ -6353,7 +7294,7 @@ async function saveClinicConfig() {
                 { key: 'CLINIC_LOGO', value: state.clinicInfo.logoUrl || '' }
             ];
 
-            updateSyncStatusUI('pending', false, 3);
+            // [Sync Instant]
             await fetch(LICENSE_API_URL, {
                 method: 'POST', mode: 'cors',
                 headers: { 'Content-Type': 'text/plain' }, // Avoid preflight
@@ -6378,14 +7319,14 @@ async function saveClinicConfig() {
     } else {
         alert('Identitas Klinik Berhasil Disimpan (Lokal)!');
     }
-    scheduleSync(3);
+    syncDelta(false);
 }
 function updatePdfConfig(key, value) {
     state.pdfConfig[key] = value;
     localStorage.setItem('erm_pdf_config', JSON.stringify(state.pdfConfig));
     state.configUpdatedAt = new Date().toISOString();
     saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
 
 
 
@@ -6462,25 +7403,78 @@ async function saveBookingConfig() {
     const btn = document.querySelector('button[onclick="saveBookingConfig()"]');
     const originalText = btn ? btn.innerHTML : 'Simpan & Generate Link';
 
-    const alias = (document.getElementById('conf-booking-alias') || {}).value.trim().toLowerCase().replace(/\s+/g, '-');
-    if (!alias) { alert('⚠️ Isi Alias Klinik terlebih dahulu!'); return; }
+    const alias = (document.getElementById('conf-booking-alias') || {}).value.trim().toLowerCase() || state.bookingConfig.alias;
+    if (!alias) {
+        alert('⚠️ Lisensi Anda belum memiliki Alias. Silakan hubungi admin atau sinkronkan ulang lisensi.');
+        return;
+    }
 
-    const checks = document.querySelectorAll('.booking-hour-check:checked');
-    const hours = Array.from(checks).map(c => c.value).join(',');
-    if (hours.length === 0) { alert('⚠️ Pilih minimal 1 jam tersedia!'); return; }
+    const hourChecks = document.querySelectorAll('.booking-hour-check:checked');
+    const hours = Array.from(hourChecks).map(c => c.value).join(',');
 
-    const offChecks = document.querySelectorAll('.booking-off-day-check:checked');
+    const offChecks = document.querySelectorAll('.off-day-check:checked');
     const offDays = Array.from(offChecks).map(c => c.value).join(',');
     const customHolidays = state.bookingConfig.customHolidays || "";
+
+    // Collect Advanced Day Config
+    const dayConfig = {};
+    for (let i = 0; i < 7; i++) {
+        const isActive = document.getElementById(`adv-day-active-${i}`)?.checked;
+        const hoursInput = document.getElementById(`adv-day-hours-${i}`)?.value.trim();
+        const slotsInput = parseInt(document.getElementById(`adv-day-slots-${i}`)?.value || "1");
+
+        dayConfig[i] = {
+            active: isActive,
+            hours: hoursInput,
+            slots: slotsInput
+        };
+    }
 
     // Update State
     state.bookingConfig.alias = alias;
     state.bookingConfig.availableHours = hours;
     state.bookingConfig.offDays = offDays;
+    state.bookingConfig.dayConfig = dayConfig;
     // customHolidays already updated in state by add/remove functions
 
     // Sync UI
     updateBookingLinkPreview();
+
+    const payload = {
+        action: 'save_booking_config',
+        sheet_id: state.sheetId || getSheetIdFromUrl(state.scriptUrl),
+        alias: alias,
+        available_hours: hours,
+        off_days: offDays,
+        custom_holidays: customHolidays,
+        day_config: dayConfig
+    };
+
+    try {
+        btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin" width="16"></i> Menyimpan...`;
+        btn.disabled = true;
+        lucide.createIcons();
+
+        // [Sync Instant to Master]
+        const res = await fetch(LICENSE_API_URL, {
+            method: 'POST', mode: 'cors',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify(payload)
+        });
+        const result = await res.json();
+        if (result.status === 'success') {
+            alert('✅ Konfigurasi Booking Berhasil Disimpan & Sinkron Master!');
+        } else {
+            throw new Error(result.message);
+        }
+    } catch (e) {
+        console.warn("Sync booking config failed, saved locally:", e);
+        alert('Tersimpan secara lokal (Sinkronisasi Master Gagal).');
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+        lucide.createIcons();
+    }
     await saveData();
 
     // Pastikan kita punya URL Script untuk sinkronisasi
@@ -6499,7 +7493,7 @@ async function saveBookingConfig() {
                 return;
             }
 
-            updateSyncStatusUI('pending', false, 3);
+            // [Sync Instant]
             // CRITICAL: Gunakan LICENSE_API_URL (App Script), bukan state.scriptUrl (Sheet)
             await fetch(LICENSE_API_URL, {
                 method: 'POST',
@@ -6528,7 +7522,7 @@ async function saveBookingConfig() {
             }
         }
     }
-    scheduleSync(3);
+    syncDelta(false);
 }
 
 async function saveNotificationConfig() {
@@ -6574,7 +7568,7 @@ async function saveNotificationConfig() {
                 ];
 
                 // CRITICAL FIX: Use LICENSE_API_URL (The App Script), NOT state.scriptUrl (The Sheet)
-                updateSyncStatusUI('pending', false, 3);
+                // [Sync Instant]
                 await fetch(LICENSE_API_URL, {
                     method: 'POST',
                     mode: 'cors',
@@ -6597,8 +7591,40 @@ async function saveNotificationConfig() {
             alert('Konfigurasi Disimpan Lokal (Cloud Skip: URL Sheet belum diset)!');
         }
     }
-    scheduleSync(3);
+    syncDelta(false);
 }
+
+// --- GOOGLE CALENDAR OAUTH (Improved 403-proof version) ---
+window.connectGoogleCalendar = async function () {
+    if (!state.sheetId && !state.scriptUrl) {
+        alert("Sistem belum mendeteksi ID Utama Klinik. Silakan Reload halaman.");
+        return;
+    }
+    const realSheetId = state.sheetId || getSheetIdFromUrl(state.scriptUrl);
+    if (!realSheetId) return;
+
+    const confirmMsg = "Sistem akan mengarahkan Anda ke Halaman Keamanan Google.\n\nPastikan Anda masuk (Login) menggunakan Email Gmail Klinik yang kalendernya ingin digunakan.\n\nLanjutkan?";
+    if (!confirm(confirmMsg)) return;
+
+    // Use fetch to get the auth URL as plain text to avoid 403 HtmlService errors
+    const fetchEndpoint = LICENSE_API_URL + "?action=start_oauth&sheet_id=" + encodeURIComponent(realSheetId);
+
+    try {
+        const response = await fetch(fetchEndpoint);
+        if (!response.ok) throw new Error("Gagal mengambil URL Oauth");
+        const authUrl = await response.text();
+
+        if (authUrl.startsWith('http')) {
+            window.location.href = authUrl; // Langsung redirect di tab yang sama agar lebih stabil
+        } else {
+            console.error("Link Oauth tidak valid: ", authUrl);
+            alert("Terjadi kesalahan dari Server Google. Silakan coba beberapa saat lagi.");
+        }
+    } catch (err) {
+        console.error("Oauth Redirect Error: ", err);
+        alert("Gagal terhubung ke server. Pastikan koneksi internet stabil dan Deployment Script sudah diset ke 'Anyone'.");
+    }
+};
 
 async function testTelegramConnection() {
     const chatId = document.getElementById('notif-tg-chatid').value.trim();
@@ -6634,23 +7660,38 @@ async function testTelegramConnection() {
     }
 }
 
-function switchConfigTab(tabName) {
+async function switchConfigTab(tabName) {
     state.activeConfigTab = tabName;
+    
+    // [AUTO-SYNC] Tarik data Master terbaru saat buka tab booking/license
+    if (tabName === 'booking' || tabName === 'license') {
+        if (typeof checkLicense === 'function') await checkLicense();
+    }
+
     document.querySelectorAll('.config-tab-content').forEach(el => el.classList.add('hidden'));
     const content = document.getElementById(`tab-content-${tabName}`);
     if (content) content.classList.remove('hidden');
-    ['identity', 'print', 'notif', 'system', 'license', 'booking', 'packages', 'archives', 'maintenance'].forEach(t => {
+
+    ['identity', 'print', 'notif', 'system', 'license', 'booking', 'packages', 'treatments', 'archives', 'maintenance'].forEach(t => {
         const btn = document.getElementById(`tab-btn-${t}`);
         if (!btn) return;
-        if (t === tabName) btn.className = "px-6 py-3 text-sm font-bold text-blue-600 border-b-2 border-blue-600 bg-white transition-colors flex items-center gap-2";
-        else btn.className = "px-6 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-2";
+        if (t === tabName) {
+            btn.className = "px-6 py-3 text-sm font-bold text-blue-600 border-b-2 border-blue-600 bg-white transition-colors flex items-center gap-2";
+        } else {
+            btn.className = "px-6 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-2";
+        }
     });
 }
 
 function saveConfig() {
     const oldSheetId = state.sheetId;
-    state.scriptUrl = document.getElementById('script-url').value.trim();
-    state.sheetId = document.getElementById('conf-sheet-id').value.trim() || getSheetIdFromUrl(state.scriptUrl);
+
+    // Auto-extract ID if user pasted a full URL into the single ID input
+    const rawInput = document.getElementById('conf-sheet-id').value.trim();
+    state.sheetId = getSheetIdFromUrl(rawInput) || rawInput;
+
+    // Defensive assignment to mock the old scriptUrl so legacy 'if(!state.scriptUrl) return;' checks don't break
+    state.scriptUrl = state.sheetId ? `https://docs.google.com/spreadsheets/d/${state.sheetId}/edit` : "";
 
     localStorage.setItem('erm_script_url', state.scriptUrl);
     localStorage.setItem('erm_sheet_id', state.sheetId);
@@ -6686,7 +7727,7 @@ function saveConfig() {
 
     setTimeout(() => {
         alert('✅ Konfigurasi Cloud Berhasil Disimpan & Disinkronkan!');
-        scheduleSync(3);
+        syncDelta(false);
     }, 1000);
 
     if (document.getElementById('conf-sheet-id')) {
@@ -6716,6 +7757,7 @@ function openUserModal(id = null) {
 }
 
 async function saveUser() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     const form = document.getElementById('user-form');
     const id = form.querySelector('[name="id"]').value;
     const name = form.querySelector('[name="name"]').value;
@@ -6823,7 +7865,7 @@ function openOutcomeModal() {
     }
     const modalHtml = `
         <div class="bg-white px-6 py-4 border-b flex justify-between items-center sticky top-0 z-20"><h3 class="text-xl font-bold text-slate-800 flex items-center gap-2"><i data-lucide="calculator" class="text-emerald-600"></i> Kalkulator Klinis</h3><button onclick="closeModal()" class="bg-slate-100 p-2 rounded-full text-slate-500 hover:bg-slate-200"><i data-lucide="x" width="20"></i></button></div>
-        <div class="px-6 py-6 overflow-y-auto modal-scroll">
+        <div class="px-6 py-6 overflow-y-auto modal-scroll max-h-[60vh] md:max-h-[70vh]">
             ${suggestedOM ? `<div class="bg-blue-50 border border-blue-200 p-3 rounded-lg mb-4 flex items-start gap-3 fade-in"><i data-lucide="lightbulb" class="text-blue-600 mt-0.5" width="20"></i><div><p class="text-xs font-bold text-blue-800 uppercase">Saran Sistem</p><p class="text-sm text-blue-700">Sesuai diagnosa: <strong>${suggestedOM}</strong></p></div></div>` : ''}
             <div class="mb-6"><label class="block text-sm font-bold text-slate-700 mb-2">Pilih Instrumen Ukur</label><select id="om-select" onchange="renderQuestionnaire(this.value)" class="w-full border p-3 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500 bg-white shadow-sm font-medium text-slate-700"><option value="">-- Pilih Kuesioner --</option>${Object.keys(OUTCOME_MEASURES).map(k => `<option value="${k}" ${k === suggestedOM ? 'selected' : ''}>${k}</option>`).join('')}</select><p id="om-desc" class="text-xs text-slate-500 mt-2 italic"></p></div>
             <div id="om-questions" class="space-y-4"></div>
@@ -6969,9 +8011,8 @@ function closePrintView() {
 function printHTML(html, title = 'Document') {
     const iframe = document.createElement('iframe');
     iframe.style.position = 'fixed';
-    iframe.style.right = '0';
-    // ... rest doesn't matter, just match lines
-    iframe.style.bottom = '0';
+    iframe.style.right = '100vw'; // Hide far away but keep in DOM
+    iframe.style.bottom = '100vh';
     iframe.style.width = '0';
     iframe.style.height = '0';
     iframe.style.border = '0';
@@ -6984,10 +8025,24 @@ function printHTML(html, title = 'Document') {
     doc.write(styledHtml);
     doc.close();
 
-    iframe.contentWindow.focus();
-    setTimeout(() => {
+    // [SMART WAIT] Ensure images are loaded before printing
+    const checkImages = () => {
+        const images = iframe.contentWindow.document.getElementsByTagName('img');
+        const allLoaded = Array.from(images).every(img => img.complete && img.naturalHeight !== 0);
+
+        if (allLoaded) {
+            triggerPrint();
+        } else {
+            // Check again in 100ms
+            setTimeout(checkImages, 100);
+        }
+    };
+
+    const triggerPrint = () => {
+        iframe.contentWindow.focus();
         const titleBackup = document.title;
         document.title = title;
+
         setTimeout(() => {
             iframe.contentWindow.print();
             document.title = titleBackup;
@@ -6995,7 +8050,11 @@ function printHTML(html, title = 'Document') {
                 if (document.body.contains(iframe)) document.body.removeChild(iframe);
             }, 1000);
         }, 100);
-    }, 500);
+    };
+
+    // Fail-safe: Start checking after a short delay and force print after max 3s
+    setTimeout(checkImages, 300);
+    setTimeout(triggerPrint, 3000); // Max wait 3s
 }
 
 function generateReceiptHTML(apptId, type = 'RECEIPT', paperSize = '58mm') {
@@ -7217,7 +8276,10 @@ function generateSingleAssessmentHTML(a, p) {
         <div style="border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; margin-bottom: 6px;">
             <table style="width: 100%; font-size: 0.8em; border-collapse: collapse;">
                 <tr>
-                    <td style="width: 45%;"><span style="color: #94a3b8; font-weight: bold; text-transform: uppercase;">Nama:</span> <span style="font-weight: 950; color: #0f172a; text-transform: uppercase; margin-left: 4px;">${p ? p.name : '-'}</span></td>
+                    <td style="width: 45%;">
+                        <span style="color: #94a3b8; font-weight: bold; text-transform: uppercase;">Nama:</span> <span style="font-weight: 950; color: #0f172a; text-transform: uppercase; margin-left: 4px;">${p ? p.name : '-'}</span>
+                        ${p && p.nik ? `<div style="font-size: 0.75em; color: #64748b; font-family: monospace; margin-top: 2px;">NIK: ${p.nik}</div>` : ''}
+                    </td>
                     <td style="width: 30%;"><span style="color: #94a3b8; font-weight: bold; text-transform: uppercase;">No. RM:</span> <span style="font-family: monospace; font-weight: bold; color: #334155; margin-left: 4px;">${p ? p.id : '-'}</span></td>
                     <td style="width: 25%; text-align: right;"><span style="color: #94a3b8; font-weight: bold; text-transform: uppercase;">Tgl:</span> <span style="font-weight: bold; color: #0f172a; margin-left: 4px;">${new Date(a.date).toLocaleDateString('id-ID')}</span></td>
                 </tr>
@@ -7232,7 +8294,7 @@ function generateSingleAssessmentHTML(a, p) {
                     <div class="break-inside-avoid" style="page-break-inside: avoid; break-inside: avoid;">
                         <h3 style="font-weight: 950; color: #0f172a; text-transform: uppercase; margin-bottom: 4px; font-size: 0.75em; border-bottom: 1px solid #e2e8f0; padding-bottom: 3px;">A. Diagnosa Medis</h3>
                         <div style="padding: 6px 8px; background: #f8fafc; border-radius: 4px;">
-                            <span style="display: block; font-weight: 900; color: #1e293b; font-size: 0.85em;">${a.diagnosis || '-'}</span>
+                            <span style="display: block; font-weight: 900; color: #1e293b; font-size: 0.85em;">${a.diagnosis || (p ? p.diagnosis : '-')}</span>
                             <span style="color: #64748b; font-size: 0.65em; font-weight: bold;">ICD-10: ${a.icd || '-'}</span>
                         </div>
                     </div>` : ''}
@@ -7266,6 +8328,21 @@ function generateSingleAssessmentHTML(a, p) {
                     <div class="break-inside-avoid" style="page-break-inside: avoid; break-inside: avoid;">
                         <h3 style="font-weight: bold; color: #64748b; text-transform: uppercase; margin-bottom: 4px; font-size: 0.75em;">Pemeriksaan Objektif</h3>
                         <div style="background: #fdfdfd; border: 1px solid #f1f5f9; border-radius: 6px; padding: 6px 8px;">
+                            
+                            <!-- [NEW] TTV IN PDF -->
+                            <div style="margin-bottom: 8px; border-bottom: 1px dashed #e2e8f0; padding-bottom: 6px;">
+                                <p style="font-size: 0.62em; font-weight: 900; color: #64748b; text-transform: uppercase; margin-bottom: 4px;">Tanda-Tanda Vital (TTV):</p>
+                                <table style="width: 100%; font-size: 0.72em; border-collapse: collapse;">
+                                    <tr>
+                                        <td><span style="color: #94a3b8;">TD:</span> <b>${a.ttv_td || '-'}</b> <small>mmHg</small></td>
+                                        <td><span style="color: #94a3b8;">HR:</span> <b>${a.ttv_hr || '-'}</b> <small>bpm</small></td>
+                                        <td><span style="color: #94a3b8;">RR:</span> <b>${a.ttv_rr || '-'}</b> <small>x/m</small></td>
+                                        <td><span style="color: #94a3b8;">Suhu:</span> <b>${a.ttv_temp || '-'}</b> <small>°C</small></td>
+                                        <td><span style="color: #94a3b8;">SpO2:</span> <b>${a.ttv_spo2 || '-'}</b> <small>%</small></td>
+                                    </tr>
+                                </table>
+                            </div>
+
                             <table style="width: 100%; border-collapse: collapse; margin-bottom: 5px;">
                                 <tr>
                                     <td style="font-size: 0.7em; font-weight: bold; color: #64748b;">VAS Nyeri</td>
@@ -7274,19 +8351,43 @@ function generateSingleAssessmentHTML(a, p) {
                             </table>
                             <table style="width: 100%; border-collapse: collapse; font-size: 0.78em; color: #475569;">
                                 <tr>
-                                    <td style="padding-bottom: 2px;">ROM:</td>
-                                    <td style="font-weight: bold; text-align: right;">
-                                        ${a.obj?.rom_side && a.obj.rom_side !== '-' ? `${a.obj.rom_side} ` : ''}
-                                        ${a.obj?.rom || '-'}
-                                        ${a.obj?.rom_part && a.obj.rom_part !== '-' ? ` (${a.obj.rom_part})` : ''}
+                                    <td style="padding-bottom: 2px; vertical-align: top;">ROM:</td>
+                                    <td style="font-weight: bold; text-align: right; line-height: 1.2;">
+                                        <div style="font-size: 0.85em;">
+                                            ${(() => {
+                const formatISOM = (str) => {
+                    if (!str || str === '-' || str === 'Normal') return str;
+                    const parts = str.split(' ');
+                    if (parts.length < 2) return str;
+                    const p = parts[0];
+                    const v = parts[1].split('-');
+                    if (v.length < 3) return str;
+                    return `${p}: ${v[0]}° - ${v[1]}° - ${v[2]}°`;
+                };
+                const rd = formatISOM(a.rom_d);
+                const rs = formatISOM(a.rom_s);
+
+                let html = '';
+                if (a.rom_d) html += `<span>(D) ${rd}</span>`;
+                if (a.rom_d && a.rom_s) html += '<span style="margin: 0 4px; color: #cbd5e1;">|</span>';
+                if (a.rom_s) html += `<span>(S) ${rs}</span>`;
+                if (!a.rom_d && !a.rom_s) html += (a.obj?.rom || '-');
+                return html;
+            })()}
+                                        </div>
+                                        <div style="font-size: 0.75em; font-weight: normal; color: #64748b; margin-top: 1px;">${a.obj?.rom_part && a.obj.rom_part !== '-' ? a.obj.rom_part : ''}</div>
                                     </td>
                                 </tr>
                                 <tr>
-                                    <td style="padding-bottom: 2px;">MMT:</td>
-                                    <td style="font-weight: bold; text-align: right;">
-                                        ${a.obj?.mmt_side && a.obj.mmt_side !== '-' ? `${a.obj.mmt_side} ` : ''}
-                                        ${a.obj?.mmt || '-'}
-                                        ${a.obj?.mmt_part && a.obj.mmt_part !== '-' ? ` (${a.obj.mmt_part})` : ''}
+                                    <td style="padding-bottom: 2px; vertical-align: top;">MMT:</td>
+                                    <td style="font-weight: bold; text-align: right; line-height: 1.2;">
+                                        <div style="font-size: 0.85em;">
+                                            ${a.mmt_d ? `<span>(D) ${a.mmt_d}</span>` : ''}
+                                            ${a.mmt_d && a.mmt_s ? '<span style="margin: 0 4px; color: #cbd5e1;">|</span>' : ''}
+                                            ${a.mmt_s ? `<span>(S) ${a.mmt_s}</span>` : ''}
+                                            ${!a.mmt_d && !a.mmt_s ? (a.obj?.mmt || '-') : ''}
+                                        </div>
+                                        <div style="font-size: 0.75em; font-weight: normal; color: #64748b; margin-top: 1px;">${a.obj?.mmt_part && a.obj.mmt_part !== '-' ? a.obj.mmt_part : ''}</div>
                                     </td>
                                 </tr>
                                 <tr><td style="padding-bottom: 2px;">Balance:</td><td style="font-weight: bold; text-align: right;">${a.obj?.balance || '-'}</td></tr>
@@ -7295,20 +8396,20 @@ function generateSingleAssessmentHTML(a, p) {
                         
                         <!-- [NEW] POSITIVE SPECIAL TESTS IN PDF -->
                         ${(() => {
-                            const specTests = a.obj?.special_tests || {};
-                            const pos = [];
-                            for (const tid in specTests) {
-                                if (specTests[tid] === '(+)') {
-                                    let name = tid;
-                                    for (const r in SPECIAL_TESTS_DB) {
-                                        const t = SPECIAL_TESTS_DB[r].find(x => x.id === tid);
-                                        if (t) { name = t.name; break; }
-                                    }
-                                    pos.push(name);
-                                }
-                            }
-                            if (pos.length === 0 && !a.obj?.special_tests_note) return '';
-                            return `
+                const specTests = a.obj?.special_tests || {};
+                const pos = [];
+                for (const tid in specTests) {
+                    if (specTests[tid] === '(+)') {
+                        let name = tid;
+                        for (const r in SPECIAL_TESTS_DB) {
+                            const t = SPECIAL_TESTS_DB[r].find(x => x.id === tid);
+                            if (t) { name = t.name; break; }
+                        }
+                        pos.push(name);
+                    }
+                }
+                if (pos.length === 0 && !a.obj?.special_tests_note) return '';
+                return `
                             <div style="margin-top: 8px; break-inside: avoid;">
                                 <p style="font-size: 0.62em; font-weight: 950; color: #e11d48; text-transform: uppercase; margin-bottom: 3px; border-bottom: 1px dotted #fda4af; padding-bottom: 2px;">Hasil Tes Spesifik:</p>
                                 <div style="display: flex; flex-wrap: wrap; gap: 3px; margin-bottom: 4px;">
@@ -7316,7 +8417,7 @@ function generateSingleAssessmentHTML(a, p) {
                                 </div>
                                 ${a.special_tests_note ? `<div style="font-size: 0.72em; font-style: italic; color: #475569; padding: 4px 8px; background: #fff1f2/30; border-left: 2px solid #e11d48; line-height: 1.2; margin-top: 4px;"><b>Note:</b> ${a.special_tests_note}</div>` : ''}
                             </div>`;
-                        })()}
+            })()}
                     </div>` : ''}
                 </td>
             </tr>
@@ -7595,7 +8696,7 @@ function openSmartICFPicker(key, title) {
     const currentDx = (window.tempFormData ? window.tempFormData.diagnosis : '') || '';
     const dxLower = currentDx.toLowerCase();
     const rawKeywords = dxLower.split(/[\s/.,()]+/).filter(k => k.length > 2);
-    
+
     // Keyword Expansion (Mendukung istilah Indonesia)
     const keywords = [...rawKeywords];
     if (window.IndonSynonyms) {
@@ -7608,7 +8709,7 @@ function openSmartICFPicker(key, title) {
 
     const templateItems = new Set();
     const recommendedSet = new Set();
-    
+
     // Priority 1: Exact Template Match
     if (currentDx && ICF_TEMPLATES[currentDx] && ICF_TEMPLATES[currentDx][key]) {
         ICF_TEMPLATES[currentDx][key].forEach(item => {
@@ -7618,7 +8719,7 @@ function openSmartICFPicker(key, title) {
             }
         });
     }
-    
+
     // Priority 2: Expert Keyword & Hierarchy Discovery
     if (keywords.length > 0) {
         const master = getFlattenedICF();
@@ -7631,7 +8732,7 @@ function openSmartICFPicker(key, title) {
                 const itemStr = `${m.code} (${m.name})`;
                 templateItems.add(itemStr);
                 recommendedSet.add(itemStr);
-                
+
                 // Hierarchical boost (Parent)
                 if (m.code.length >= 4) {
                     const pCode = m.code.substring(0, 4);
@@ -7687,8 +8788,8 @@ function openSmartICFPicker(key, title) {
             <div class="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50" id="picker-list">
                 <!-- Recommendations will be injected by filter (Initial view) -->
                 ${sortedItems.map((item, idx) => {
-                    const isRec = templateItems.has(item);
-                    return `
+        const isRec = templateItems.has(item);
+        return `
                         <div class="picker-item-card bg-white p-4 rounded-xl border-2 ${isRec ? 'border-amber-300 bg-amber-50/20' : 'border-slate-200'} hover:border-indigo-400 transition-all shadow-sm group" data-text="${item.toLowerCase()}">
                         <div class="flex justify-between items-start">
                                 <div class="flex-1">
@@ -7739,10 +8840,10 @@ function selectICFWithQualifier(key, item, qualifier, idx) {
     const qData = ICF_QUALIFIERS[qualifier];
     const fullText = `${item} .${qualifier}`; // Format standar: Kode .Kualifikator
     const input = document.getElementById(`form-${key}`);
-    
+
     // Get current items as array
     let currentLines = input.value.split('\n').filter(l => l.trim() !== '');
-    
+
     // Check if item (without qualifier) already exists, if so update it
     const existingIdx = currentLines.findIndex(l => l.includes(item));
     if (existingIdx !== -1) {
@@ -7750,7 +8851,7 @@ function selectICFWithQualifier(key, item, qualifier, idx) {
     } else {
         currentLines.push(fullText);
     }
-    
+
     const newVal = currentLines.join('\n');
     updateForm(key, newVal);
     input.value = newVal;
@@ -7760,7 +8861,7 @@ function selectICFWithQualifier(key, item, qualifier, idx) {
     const btns = group.querySelectorAll('button');
     btns.forEach(b => {
         b.classList.remove('bg-indigo-600', 'text-white', 'border-indigo-600');
-        if(b.innerText === qualifier) {
+        if (b.innerText === qualifier) {
             b.classList.add('bg-indigo-600', 'text-white', 'border-indigo-600');
         }
     });
@@ -7777,7 +8878,7 @@ let flattenedICF = null;
 function getFlattenedICF() {
     if (flattenedICF) return flattenedICF;
     if (!window.ICF_DB) return [];
-    
+
     const result = [];
     const traverse = (obj, category) => {
         if (!obj) return;
@@ -7787,10 +8888,10 @@ function getFlattenedICF() {
             } else if (typeof data === 'object') {
                 const name = data.name || '';
                 if (name) {
-                    result.push({ 
-                        code, 
-                        name, 
-                        category, 
+                    result.push({
+                        code,
+                        name,
+                        category,
                         desc: data.desc || '',
                         inclusions: data.inclusions || '' // Critical for deep searching
                     });
@@ -7827,12 +8928,12 @@ function filterPickerItems(query) {
     if (term.length > 2) {
         const masterData = getFlattenedICF();
         const baseCat = key.split('_')[0]; // 'b', 's', 'd'
-        
+
         const filteredMaster = masterData.filter(m => {
             // Match category and then search in code/name/desc/inclusions
             const isCatMatch = (m.category === baseCat || (baseCat === 'd' && m.category === 'd'));
             if (!isCatMatch) return false;
-            
+
             const pool = `${m.code} ${m.name} ${m.desc || ''} ${m.inclusions || ''}`.toLowerCase();
             return pool.includes(term);
         }).slice(0, 30); // Limit results for snappier UI
@@ -8167,7 +9268,7 @@ function renderKasirView(container) {
     container.innerHTML = `
         <div class="space-y-6 fade-in pb-24">
             <!-- Tab Header -->
-            <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 flex gap-1">
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 flex gap-1 overflow-x-auto pb-2">
                 <button onclick="switchKasirTab('antrian')" id="ktab-antrian"
                     class="flex-1 py-2.5 px-4 rounded-xl text-[11px] md:text-sm font-bold transition-all ${tab === 'antrian' ? 'bg-blue-600 text-white shadow-md' : 'text-slate-500 hover:bg-slate-100'}">
                     <i data-lucide="clock" width="14" class="inline mr-1"></i> Antrian
@@ -8212,13 +9313,28 @@ function renderKasirAntrian(formatRp) {
     }).sort((a, b) => a.date.localeCompare(b.date) || (a.time || '').localeCompare(b.time || ''));
 
     // [FIXED LOGIC] 2. Laporan Lunas Hari Ini: Hitung semua uang yang MASUK hari ini
-    // Meskipun itu pelunasan atas jadwal kemarin (backdated), jika bayarnya hari ini, masuk Pemasukan Hari Ini.
+    // Menggunakan pembanding robust berbasis Local Time (Asia/Jakarta) agar transaksi pagi tidak hilang.
     const lunas = (state.appointments || []).filter(a => {
-        const payDate = a.paidAt ? a.paidAt.slice(0, 10) : '';
-        return (payDate === todayStr || (a.date === todayStr && isPaidAppt(a))) && isPaidAppt(a);
+        if (!isPaidAppt(a)) return false;
+
+        // Pemasukan Hari Ini: 
+        // 1. Tanggal Pelunasan (paidAt) adalah Tanggal Hari Ini.
+        // 2. ATAU Tanggal Jadwal (date) Hari Ini dan sudah lunas.
+        // 3. Tambahan: Baru saja diupdate dalam 5 menit terakhir (agar langsung muncul di laporan)
+        const effectivePayDate = a.paidAt ? a.paidAt.split('T')[0] : '';
+        const isRecentlyUpdated = (Date.now() - new Date(a.updatedAt || 0).getTime()) < 300000;
+
+        return (effectivePayDate === todayStr || a.date === todayStr || isRecentlyUpdated);
     }).sort((a, b) => (b.paidAt || b.date || '').localeCompare(a.paidAt || a.date || ''));
 
-    const totalLunasHariIni = lunas.reduce((s, a) => s + (parseRp(a.finalAmount) || parseRp(a.fee) || 0), 0);
+    // SUM TOTAL LUNAS SEBENARNYA (Menggunakan finalAmount jika ada, jika tidak fallback ke fee)
+    // [FIX] Hindari double counting: prioritaskan finalAmount karena bulk pay menyimpan total di satu record dan 0 di record lainnya.
+    const totalLunasHariIni = lunas.reduce((s, a) => {
+        const amt = (a.finalAmount !== undefined && a.finalAmount !== null && a.finalAmount !== "")
+            ? parseRp(a.finalAmount)
+            : (parseRp(a.fee) || 0);
+        return s + amt;
+    }, 0);
     const totalTunggakan = antrian.reduce((s, a) => s + (parseRp(a.fee) || 0), 0);
 
     return `
@@ -8371,22 +9487,27 @@ function renderKasirPengeluaran(formatRp) {
                                 <th class="text-left px-6 py-3 text-[10px] font-bold text-slate-500 uppercase">Kategori</th>
                                 <th class="text-left px-6 py-3 text-[10px] font-bold text-slate-500 uppercase">Catatan</th>
                                 <th class="text-right px-6 py-3 text-[10px] font-bold text-slate-500 uppercase">Nominal</th>
-                                <th class="text-center px-6 py-3" style="width: 50px;"></th>
+                                <th class="text-center px-6 py-3" style="width: 100px;">Aksi</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-100">
                             ${filtered.map(e => `
-                                <tr class="hover:bg-slate-50 transition-colors">
+                                <tr class="hover:bg-slate-50 transition-colors ${e.is_locked ? 'bg-slate-50/50' : ''}">
                                     <td class="px-6 py-4 text-slate-600 font-medium">${e.date}</td>
                                     <td class="px-6 py-4">
-                                        <span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-extrabold uppercase">${e.category || 'LAINNYA'}</span>
+                                        <div class="flex items-center gap-1.5">
+                                            <span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] font-extrabold uppercase">${e.category || 'LAINNYA'}</span>
+                                            ${e.is_locked ? '<i data-lucide="lock" class="text-blue-500" width="12"></i>' : ''}
+                                        </div>
                                     </td>
                                     <td class="px-6 py-4 text-slate-400 text-xs italic">${e.notes || '-'}</td>
                                     <td class="px-6 py-4 text-right font-black text-rose-600">${formatRp(e.amount)}</td>
                                     <td class="px-6 py-4 text-center">
-                                        <button onclick="deleteExpense('${e.id}')" class="text-slate-300 hover:text-rose-500 transition-colors">
-                                            <i data-lucide="trash-2" width="16"></i>
-                                        </button>
+                                        <div class="flex items-center justify-center gap-3">
+                                            <button onclick="openExpenseModal('${e.id}')" class="text-slate-300 hover:text-blue-500 transition-colors">
+                                                <i data-lucide="edit-3" width="16"></i>
+                                            </button>
+                                        </div>
                                     </td>
                                 </tr>
                             `).join('')}
@@ -8398,7 +9519,9 @@ function renderKasirPengeluaran(formatRp) {
     `;
 }
 
-function openExpenseModal() {
+function openExpenseModal(id = null) {
+    const e = id ? state.expenses.find(item => item.id === id) : { id: '', date: today(), category: 'Operasional', amount: 0, notes: '', is_locked: false };
+    const isLocked = e.is_locked === true || e.is_locked === 'true';
     const modal = document.getElementById('modal-container');
     const content = document.getElementById('modal-content');
     modal.classList.remove('hidden');
@@ -8406,7 +9529,7 @@ function openExpenseModal() {
     content.innerHTML = `
         <div class="bg-white px-6 py-4 border-b flex justify-between items-center sticky top-0 z-20">
             <div>
-                <h3 class="text-xl font-bold text-slate-800">Tambah Pengeluaran</h3>
+                <h3 class="text-xl font-bold text-slate-800">${id ? 'Edit' : 'Tambah'} Pengeluaran</h3>
                 <p class="text-xs text-slate-400">Pencatatan biaya operasional harian</p>
             </div>
             <button onclick="closeModal()" class="bg-slate-100 p-2 rounded-full text-slate-500 hover:bg-slate-200 transition-colors">
@@ -8414,40 +9537,62 @@ function openExpenseModal() {
             </button>
         </div>
         <div class="px-6 py-6 space-y-5 overflow-y-auto max-h-[80vh]">
-            <div>
-                <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Tanggal Pengeluaran</label>
-                <input type="date" id="exp-date" value="${today()}" 
-                    class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-semibold outline-none focus:border-blue-500 transition-all">
+            <input type="hidden" id="exp-id" value="${e.id}">
+            <div class="${isLocked ? 'opacity-60 pointer-events-none' : ''}">
+                <div class="mb-4">
+                    <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Tanggal Pengeluaran</label>
+                    <input type="date" id="exp-date" value="${e.date}" ${isLocked ? 'disabled' : ''}
+                        class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-semibold outline-none focus:border-blue-500 transition-all">
+                </div>
+                <!-- ... other fields ... -->
             </div>
-            <div>
-                <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Kategori Biaya</label>
-                <select id="exp-category" class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-bold text-slate-700 outline-none focus:border-blue-500 transition-all">
-                    <option value="Operasional">Operasional (Listrik, Air, Internet)</option>
-                    <option value="Alat Medis">Alat Medis & Bahan Habis Pakai</option>
-                    <option value="Gaji">Gaji / Honor Terapis</option>
-                    <option value="Sewa">Sewa Tempat / Maintenance</option>
-                    <option value="Lainnya">Lainnya / Non-Operasional</option>
-                </select>
-            </div>
-            <div>
-                <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Nominal (Rp)</label>
-                <div class="relative">
-                    <span class="absolute left-4 top-1/2 -translate-y-1/2 font-black text-rose-400">Rp</span>
-                    <input type="number" id="exp-amount" placeholder="0"
-                        class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl pl-12 pr-4 py-4 text-xl font-black text-rose-600 outline-none focus:border-rose-500 focus:bg-white transition-all">
+            <div class="${isLocked ? 'opacity-60 pointer-events-none' : ''}">
+                <div class="mb-4">
+                    <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Kategori Biaya</label>
+                    <select id="exp-category" ${isLocked ? 'disabled' : ''} class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 font-bold text-slate-700 outline-none focus:border-blue-500 transition-all">
+                        <option value="Operasional" ${e.category === 'Operasional' ? 'selected' : ''}>Operasional (Listrik, Air, Internet)</option>
+                        <option value="Alat Medis" ${e.category === 'Alat Medis' ? 'selected' : ''}>Alat Medis & Bahan Habis Pakai</option>
+                        <option value="Gaji" ${e.category === 'Gaji' ? 'selected' : ''}>Gaji / Honor Terapis</option>
+                        <option value="Sewa" ${e.category === 'Sewa' ? 'selected' : ''}>Sewa Tempat / Maintenance</option>
+                        <option value="Lainnya" ${e.category === 'Lainnya' ? 'selected' : ''}>Lainnya / Non-Operasional</option>
+                    </select>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Nominal (Rp)</label>
+                    <div class="relative">
+                        <span class="absolute left-4 top-1/2 -translate-y-1/2 font-black text-rose-400">Rp</span>
+                        <input type="number" id="exp-amount" placeholder="0" value="${e.amount}" ${isLocked ? 'disabled' : ''}
+                            class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl pl-12 pr-4 py-4 text-xl font-black text-rose-600 outline-none focus:border-rose-500 focus:bg-white transition-all">
+                    </div>
+                </div>
+                <div class="mb-4">
+                    <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Detail / Keterangan</label>
+                    <textarea id="exp-notes" placeholder="Tulis rincian pengeluaran di sini..." ${isLocked ? 'disabled' : ''}
+                        class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-4 text-sm outline-none focus:border-blue-500 focus:bg-white transition-all min-h-[100px]">${e.notes}</textarea>
                 </div>
             </div>
-            <div>
-                <label class="block text-xs font-bold text-slate-500 uppercase mb-2 ml-1">Detail / Keterangan</label>
-                <textarea id="exp-notes" placeholder="Tulis rincian pengeluaran di sini..."
-                    class="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-4 text-sm outline-none focus:border-blue-500 focus:bg-white transition-all min-h-[100px]"></textarea>
+            
+            <div class="pt-2 border-t border-slate-100">
+                <label class="flex items-center gap-3 cursor-pointer group mb-6">
+                    <div class="relative">
+                        <input type="checkbox" id="exp-locked" class="sr-only" ${isLocked ? 'checked' : ''} onchange="this.nextElementSibling.classList.toggle('bg-blue-600', this.checked); this.nextElementSibling.classList.toggle('bg-slate-300', !this.checked);">
+                        <div class="block w-10 h-6 rounded-full transition-colors ${isLocked ? 'bg-blue-600' : 'bg-slate-300'}"></div>
+                        <div class="dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isLocked ? 'translate-x-4' : ''}"></div>
+                    </div>
+                    <div>
+                        <span class="text-sm font-bold text-slate-700 flex items-center gap-1">
+                            <i data-lucide="${isLocked ? 'lock' : 'unlock'}" width="14"></i> Kunci Laporan Pengeluaran
+                        </span>
+                        <p class="text-[10px] text-slate-400 font-medium leading-tight">Mencegah perubahan data untuk keamanan pembukuan keuangan.</p>
+                    </div>
+                </label>
             </div>
             
             <div class="pt-2">
-                <button onclick="saveExpense()"
-                    class="w-full bg-rose-600 hover:bg-rose-700 text-white font-bold py-4 rounded-2xl shadow-lg transition-all transform active:scale-95 flex items-center justify-center gap-2 group">
-                    <i data-lucide="save" width="20" class="group-hover:rotate-12 transition-transform"></i>
-                    Simpan Data Pengeluaran
+                <button onclick="saveExpense()" ${isLocked ? 'disabled' : ''}
+                    class="w-full ${isLocked ? 'bg-slate-400 cursor-not-allowed' : 'bg-rose-600 hover:bg-rose-700'} text-white font-bold py-4 rounded-2xl shadow-lg transition-all transform active:scale-95 flex items-center justify-center gap-2 group">
+                    <i data-lucide="${isLocked ? 'lock' : 'save'}" width="20" class="group-hover:rotate-12 transition-transform"></i>
+                    ${isLocked ? 'Laporan Terkunci' : 'Simpan Data Pengeluaran'}
                 </button>
             </div>
         </div>
@@ -8456,47 +9601,62 @@ function openExpenseModal() {
 }
 
 async function saveExpense() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     if (isReadOnly()) {
         alert("PERINGATAN: Anda sedang membuka Database Arsip (Read-Only). Perubahan tidak dapat disimpan di sini.");
         return;
     }
+    const id = document.getElementById('exp-id').value;
     const date = document.getElementById('exp-date').value;
     const category = document.getElementById('exp-category').value;
     const amount = Number(document.getElementById('exp-amount').value) || 0;
     const notes = document.getElementById('exp-notes').value;
+    const is_locked = document.getElementById('exp-locked').checked;
 
     if (amount <= 0) {
         alert('Mohon masukkan nominal belanja/pengeluaran!');
         return;
     }
 
+    // Protection: If data was already locked
+    const oldE = state.expenses.find(item => item.id === id);
+    if (oldE && (oldE.is_locked === true || oldE.is_locked === 'true')) {
+        alert("⚠️ GAGAL: Data pengeluaran ini sudah terkunci.");
+        return;
+    }
+
     const entry = {
-        id: 'EXP-' + Date.now(),
+        id: id || ('EXP-' + Date.now()),
         date,
         category,
         amount,
         notes,
-        updatedAt: getServerTimeISO()
+        is_locked,
+        updatedAt: getServerTimeISO(),
+        _dirty: true // [FIX] Guarantee immediate sync regardless of lastSync
     };
 
     if (!Array.isArray(state.expenses)) state.expenses = [];
-    state.expenses.push(entry);
+
+    if (id) {
+        const idx = state.expenses.findIndex(item => item.id === id);
+        if (idx !== -1) state.expenses[idx] = entry;
+    } else {
+        state.expenses.push(entry);
+    }
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     renderKasirView(document.getElementById('main-content'));
     showToast("Catatan pengeluaran berhasil disimpan.");
 }
 
 async function deleteExpense(id) {
-    if (!confirm('Hapus selamanya catatan pengeluaran ini?')) return;
-    trackDelete(id);
-    state.expenses = (state.expenses || []).filter(e => e.id !== id);
     if (!state.deletedIds.expenses) state.deletedIds.expenses = [];
     state.deletedIds.expenses.push(id);
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     renderKasirView(document.getElementById('main-content'));
     showToast("Data pengeluaran dihapus.");
 }
@@ -8757,7 +9917,7 @@ function renderKasirLaporan(formatRp) {
                             <button onclick="pullDataFromSheet()" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-bold shadow-md hover:bg-blue-700 transition-all flex items-center gap-1"><i data-lucide="refresh-cw" width="12"></i> Tarik Data Terbaru</button>
                         </div>
                    </div>`
-            : `<div class="overflow-x-auto">
+            : `<div class="overflow-x-auto horizontal-scroll-container">
                     <table class="w-full text-sm">
                         <thead class="bg-slate-50 border-b border-slate-200">
                             <tr>
@@ -8844,6 +10004,8 @@ function openPaymentModal(apptId) {
     if (!a) return;
     const p = (state.patients || []).find(pt => pt.id === a.patientId);
     const nama = p ? p.name : (a.visitor_name || a.name || 'Pasien Baru');
+
+    state._currentPaymentAppt = a; // [FIX] Store current appointment for context helpers like Bulk Pay
 
     // Ambil fee dari appointment, jika kosong ambil dari assessment terakhir di hari yang sama, jika masih kosong ambil defaultFee
     let feeBase = parseRp(a.fee) || parseRp(a.finalAmount);
@@ -8936,7 +10098,7 @@ function openPaymentModal(apptId) {
                 </button>
             </div>
         </div>
-        <div class="flex-1 px-6 py-5 space-y-5 overflow-y-auto modal-scroll min-h-0">
+        <div class="flex-1 px-6 py-5 space-y-5 overflow-y-auto modal-scroll min-h-0 max-h-[55vh] md:max-h-[65vh]">
             <!-- Rincian & Setting Tarif -->
             <div class="bg-slate-50 rounded-xl p-4 space-y-3 border border-slate-200 shadow-inner">
                 ${p && p.quota > 0 ? `
@@ -8999,33 +10161,46 @@ function openPaymentModal(apptId) {
             </div>
             ` : ''}
 
-            <!-- Pilih Metode -->
-            <div>
-                <p class="text-xs font-bold text-slate-500 uppercase mb-2">Pilih Metode Pembayaran</p>
-                <div class="grid grid-cols-2 gap-2" id="pm-method-group">
+            <!-- Pilih Metode [RESTORED] -->
+            <div class="mb-4">
+                <p class="text-[10px] font-black text-slate-500 uppercase mb-2">Pilih Metode Pembayaran</p>
+                <div class="grid grid-cols-5 gap-2" id="pm-method-group">
                     ${['Paket', 'Tunai', 'Transfer', 'QRIS', 'BPJS'].map(m => `
                         <label class="cursor-pointer">
                             <input type="radio" name="pm-method" value="${m}" class="peer hidden" onchange="pmMethodSelected(this)">
-                            <div class="peer-checked:bg-purple-600 peer-checked:text-white peer-checked:border-purple-600 border border-slate-200 bg-white rounded-xl py-3 px-2 flex flex-col justify-center items-center transition-all">
-                                <div class="text-3xl mb-1">${m === 'Paket' ? '📦' : m === 'Tunai' ? '💵' : m === 'Transfer' ? '🏦' : m === 'QRIS' ? '📱' : '🏥'}</div>
-                                <div class="text-[10px] uppercase font-bold text-center">${m}</div>
+                            <div class="peer-checked:bg-purple-600 peer-checked:text-white peer-checked:border-purple-600 border border-slate-200 bg-white rounded-xl py-2 px-1 flex flex-col justify-center items-center transition-all hover:border-purple-300">
+                                <div class="text-xl mb-1">${m === 'Paket' ? '📦' : m === 'Tunai' ? '💵' : m === 'Transfer' ? '🏦' : m === 'QRIS' ? '📱' : '🏥'}</div>
+                                <div class="text-[9px] uppercase font-black text-center whitespace-nowrap">${m}</div>
                             </div>
                         </label>`).join('')}
                 </div>
             </div>
 
+            <!-- Tanggal Bayar -->
+            <div class="bg-indigo-50/50 p-3 rounded-xl border border-indigo-100 flex items-center justify-between gap-3 mb-4">
+               <div>
+                  <p class="text-[10px] font-black text-indigo-800 uppercase leading-none">Tanggal Bayar</p>
+                  <p class="text-[8px] text-indigo-500 font-bold mb-1 italic">Default: Hari Ini</p>
+               </div>
+               <input type="date" id="pm-paid-at" value="${getServerTimeISO().split('T')[0]}" 
+                  class="bg-white border-2 border-indigo-200 rounded-lg px-2 py-1 text-xs font-bold focus:border-indigo-500 outline-none">
+            </div>
+
             <!-- Bulk Pay Option (By Patient) -->
             ${(state.appointments || []).filter(x => x.patientId === a.patientId && !isPaidAppt(x)).length > 1 ? `
-            <div class="bg-indigo-50 border border-indigo-100 rounded-xl p-3 flex items-center justify-between">
-                <div>
-                   <p class="text-[10px] font-black text-indigo-700 uppercase">Input Seluruh Tagihan Pasien Ini?</p>
-                   <p class="text-[9px] text-indigo-500 leading-tight">Melunasi semua jadwal atas nama <b>${nama}</b> yang belum lunas (${(state.appointments || []).filter(x => x.patientId === a.patientId && !isPaidAppt(x)).length} sesi)</p>
+                <div class="mb-4 bg-amber-50 border border-amber-200 p-3 rounded-xl flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="layers" class="text-amber-600" width="18"></i>
+                        <div>
+                            <p class="text-[10px] font-black text-amber-800 uppercase leading-none">Bayar Borongan (Tunggakan)</p>
+                            <p class="text-[9px] text-amber-600 font-bold">Lunasi semua sesi yang belum bayar sekaligus</p>
+                        </div>
+                    </div>
+                    <label class="relative inline-flex items-center cursor-pointer">
+                        <input type="checkbox" id="pm-bulk-pay" class="sr-only peer" onchange="handleBulkPayToggle(this)">
+                        <div class="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500"></div>
+                    </label>
                 </div>
-                <label class="relative inline-flex items-center cursor-pointer">
-                    <input type="checkbox" id="pm-bulk-pay" class="sr-only peer">
-                    <div class="w-10 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
-                </label>
-            </div>
             ` : ''}
         </div>
         <div class="px-6 py-4 border-t bg-slate-50">
@@ -9045,11 +10220,41 @@ function openPaymentModal(apptId) {
     };
 
     window.handlePaymentUpdateManual = (fromShorthand = false) => {
-        const fee = Number(document.getElementById('pm-fee-base')?.value) || 0;
-        const disc = Number(document.getElementById('pm-discount')?.value) || 0;
+        const fee = parseRp(document.getElementById('pm-fee-base')?.value) || 0;
+        const disc = parseRp(document.getElementById('pm-discount')?.value) || 0;
+        const total = Math.max(0, fee - disc);
+
+        if (!fromShorthand) state._isPmFeeEdited = true;
+
+        const totalEl = document.getElementById('pm-total');
+        if (totalEl) totalEl.innerText = formatRp(total);
         state._currentDiscount = disc;
-        state._isPmFeeEdited = true; // MARK AS MANUALLY EDITED
-        updatePaymentTotal(fee);
+    };
+
+    /**
+     * [FIX] Handle Bulk Pay Toggle: Automatically sum all unpaid fees
+     */
+    window.handleBulkPayToggle = (el) => {
+        const isBulk = el.checked;
+        const feeInput = document.getElementById('pm-fee-base');
+        if (!feeInput) return;
+
+        if (isBulk) {
+            // Sum all unpaid fees for this patient
+            const patientId = state._currentPaymentAppt?.patientId;
+            const unpaid = (state.appointments || []).filter(x => x.patientId === patientId && !isPaidAppt(x));
+            const totalUnpaidFee = unpaid.reduce((s, x) => s + (parseRp(x.fee) || 0), 0);
+
+            feeInput.value = totalUnpaidFee;
+            state._isPmFeeEdited = true; // [FIX] Lock this value so applyPackagePricing doesn't overwrite it
+            showToast(`Membayar ${unpaid.length} sesi sekaligus.`, 'info');
+        } else {
+            // Revert to initial fee
+            feeInput.value = state._initialPmFee || 0;
+            state._isPmFeeEdited = false;
+        }
+
+        handlePaymentUpdateManual();
     };
 
     window.toggleTreatmentFee = (checkbox, price) => {
@@ -9127,7 +10332,8 @@ function updatePaymentTotal(feeBase) {
 }
 
 async function confirmPayment(apptId) {
-    const a = (state.appointments || []).find(x => x.id === apptId);
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
+    const a = (state.appointments || []).find(x => String(x.id).trim() === String(apptId).trim());
     if (!a) return;
 
     const feeBase = Number(document.getElementById('pm-fee-base')?.value) || 0;
@@ -9146,14 +10352,30 @@ async function confirmPayment(apptId) {
 
     const isNewPurchase = document.getElementById('pm-is-new-purchase')?.checked;
 
+    // [FIX] Capture Payment Date from UI
+    const paidAtInput = document.getElementById('pm-paid-at')?.value;
+    const paidAtStr = paidAtInput ? `${paidAtInput}T${new Date().toLocaleTimeString('en-GB')}` : getServerTimeISO();
+
     // Update state
     a.fee = feeBase;
+    // [CRITICAL FIX] Key Purification: Remove any truncated/corrupted or mismatched keys from sheet imports
+    // This ensures that our preferred camelCase keys are the ONLY sources of truth.
+    Object.keys(a).forEach(k => {
+        const kn = k.toLowerCase();
+        if (kn === 'paymentstatus' && k !== 'paymentStatus') delete a[k];
+        if (kn === 'paymentmethod' && k !== 'paymentMethod') delete a[k];
+        if (kn === 'finalamount' && k !== 'finalAmount') delete a[k];
+        if (kn === 'paidat' && k !== 'paidAt') delete a[k];
+        if (kn === 'updatedat' && k !== 'updatedAt') delete a[k];
+    });
+
     a.paymentStatus = 'PAID';
     a.paymentMethod = method;
     a.discount = discount;
     a.finalAmount = finalAmount;
-    a.paidAt = getServerTimeISO();
+    a.paidAt = paidAtStr;
     a.updatedAt = getServerTimeISO();
+    a._dirty = true; // [INSTANT PUSH] Mark as dirty to ensure sync picks it up immediately
 
     // Auto Quota Management
     const pIdx = state.patients.findIndex(p => p.id === a.patientId);
@@ -9175,23 +10397,38 @@ async function confirmPayment(apptId) {
         // Handle Bulk Payment for THIS PATIENT if checked
         const isBulk = document.getElementById('pm-bulk-pay')?.checked;
         if (isBulk) {
+            // BULK PAYMENT DISTRIBUTION [FIX]
             state.appointments.forEach(other => {
                 if (other.patientId === a.patientId && !isPaidAppt(other)) {
                     other.paymentStatus = 'PAID';
                     other.paymentMethod = method;
-                    other.fee = (other.id === a.id) ? feeBase : (parseRp(other.fee) || 0); // Keep original if exists
-                    other.discount = (other.id === a.id) ? discount : 0;
-                    other.finalAmount = (other.id === a.id) ? finalAmount : 0;
-                    other.paidAt = a.paidAt;
-                    other.updatedAt = a.updatedAt;
+
+                    // Logic: Keep individual fees for stats, but set finalAmount to 0 for others 
+                    // to prevent double counting in financial reports (Main item carries the total paid)
+                    if (other.id === a.id) {
+                        other.fee = feeBase;
+                        other.discount = discount;
+                        other.finalAmount = finalAmount;
+                    } else {
+                        // other.fee remains as is (historical session fee)
+                        other.discount = 0;
+                        other.finalAmount = 0; // Set to 0 because total is already in 'a.finalAmount'
+                    }
+
+                    other.paidAt = paidAtStr;
+                    other.updatedAt = getServerTimeISO();
+                    other._dirty = true;
                 }
             });
             console.log(`Bulk Payment Activated: All unpaid sessions for patient ${a.patientId} marked as PAID.`);
         }
     }
 
-    await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    await saveData(); // [CRITICAL] Ensure local persistence before Cloud Sync
+    if (state.scriptUrl) {
+        updateSyncStatusUI('syncing', false);
+        syncDelta(false);
+    }
 
     // UI Feedback Sukses & Opsi Cetak
     const content = document.getElementById('modal-content');
@@ -9934,7 +11171,6 @@ function renderPackageTable() {
                     <td class="px-6 py-4 text-center">
                         <div class="flex items-center justify-center gap-2">
                             <button onclick="openPackageModal('${p.id}')" class="text-blue-500 hover:text-blue-700 p-1.5 rounded-lg hover:bg-blue-50 transition-all"><i data-lucide="edit-3" width="16"></i></button>
-                            <button onclick="deletePackage('${p.id}')" class="text-rose-400 hover:text-rose-600 p-1.5 rounded-lg hover:bg-rose-50 transition-all"><i data-lucide="trash-2" width="16"></i></button>
                         </div>
                     </td>
                 </tr>`;
@@ -9988,6 +11224,7 @@ function openPackageModal(id = null) {
 }
 
 async function savePackage() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     const form = document.getElementById('package-form');
     const id = form.querySelector('[name="id"]').value;
     const name = form.querySelector('[name="name"]').value.trim();
@@ -9997,7 +11234,7 @@ async function savePackage() {
 
     if (!name || sessions <= 0 || price < 0) { alert('Mohon lengkapi data paket dengan benar!'); return; }
 
-    const pkg = { id: id || 'PKG-' + Date.now(), name, sessions, price, description, updatedAt: getServerTimeISO() };
+    const pkg = { id: id || 'PKG-' + Date.now(), name, sessions, price, description, updatedAt: getServerTimeISO(), _dirty: true };
 
     if (!state.packages) state.packages = [];
 
@@ -10010,7 +11247,7 @@ async function savePackage() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     renderConfigView(document.getElementById('main-content'));
     showToast("Paket layanan berhasil disimpan.");
 }
@@ -10023,7 +11260,7 @@ async function deletePackage(id) {
     state.deletedIds.packages.push(id);
 
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     const container = document.getElementById('package-list-container');
     if (container) {
         container.innerHTML = renderPackageTable();
@@ -10050,7 +11287,10 @@ function renderTreatmentTable() {
     const list = state.treatments || [];
     if (list.length === 0) {
         return `<div class="p-12 text-center text-slate-400 border-2 border-dashed border-slate-100 rounded-2xl mb-8">
-                    <p class="font-medium">Belum ada daftar tindakan kustom.</p>
+                    <p class="font-medium mb-4">Belum ada daftar tindakan kustom.</p>
+                    <button onclick="silentPullRefresh(true)" class="text-blue-600 hover:text-blue-700 text-sm font-bold flex items-center justify-center gap-2 mx-auto">
+                        <i data-lucide="refresh-cw" width="16"></i> Tarik Ulang Data dari Sheet
+                    </button>
                 </div>`;
     }
 
@@ -10070,7 +11310,6 @@ function renderTreatmentTable() {
                     <td class="px-6 py-4 text-center">
                         <div class="flex items-center justify-center gap-2">
                             <button onclick="openTreatmentModal('${t.id}')" class="text-blue-500 p-1.5 hover:bg-blue-50 rounded-lg"><i data-lucide="edit-3" width="14"></i></button>
-                            <button onclick="deleteTreatment('${t.id}')" class="text-rose-400 p-1.5 hover:bg-rose-50 rounded-lg"><i data-lucide="trash-2" width="14"></i></button>
                         </div>
                     </td>
                 </tr>`).join('')}
@@ -10110,6 +11349,7 @@ function openTreatmentModal(id = null) {
 }
 
 async function saveTreatment() {
+    updateSyncStatusUI('syncing', false); // [IMMEDIATE UI FEEDBACK]
     const form = document.getElementById('treatment-form');
     const id = form.querySelector('[name="id"]').value;
     const name = form.querySelector('[name="name"]').value.trim();
@@ -10117,7 +11357,7 @@ async function saveTreatment() {
 
     if (!name) { alert('Nama tindakan harus diisi!'); return; }
 
-    const item = { id: id || 'TND-' + Date.now(), name, price, updatedAt: getServerTimeISO() };
+    const item = { id: id || 'TND-' + Date.now(), name, price, updatedAt: getServerTimeISO(), _dirty: true };
     if (!state.treatments) state.treatments = [];
 
     if (id) {
@@ -10129,7 +11369,7 @@ async function saveTreatment() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     renderConfigView(document.getElementById('main-content'), 'treatments');
     showToast("Data tindakan berhasil disimpan.");
 }
@@ -10141,7 +11381,7 @@ async function deleteTreatment(id) {
     if (!state.deletedIds.treatments) state.deletedIds.treatments = [];
     state.deletedIds.treatments.push(id);
     await saveData();
-    if (state.scriptUrl) scheduleSync(3);
+    if (state.scriptUrl) syncDelta(false);
     const container = document.getElementById('treatment-list-container');
     if (container) { container.innerHTML = renderTreatmentTable(); renderIcons(); }
     showToast("Tindakan dihapus.");
@@ -10293,6 +11533,7 @@ async function refreshAnalytics() {
     const genderStats = { L: 0, P: 0 };
     let totalAge = 0;
     let ageCount = 0;
+    const ageGroupStats = { child: 0, teen: 0, adult: 0, elderly: 0 };
     const dxStats = {};
     const ivStats = {};
     const trendStats = {};
@@ -10316,30 +11557,57 @@ async function refreshAnalytics() {
         return found.replace(/KEC\.|KECAMATAN|KAB\.|KABUPATEN|KOTA|KEL\.|KELURAHAN/g, '').trim() || 'LAINNYA';
     };
 
-    // --- PASS 1: FULL PATIENT INVENTORY (GEO, RISK, GENDER) ---
-    patients.forEach(p => {
-        totalPatients++;
-        if (p.gender === 'L') genderStats.L++; else if (p.gender === 'P') genderStats.P++;
-        if (p.dob) {
-            const age = new Date().getFullYear() - new Date(p.dob).getFullYear();
-            totalAge += age; ageCount++;
-        }
-
-        // GEO (Capture from all patients)
-        const region = getRegion(p.address);
-        geoStats[region] = (geoStats[region] || 0) + 1;
-
-        // RED-FLAG (Capture ALL tags in database)
-        if (p.tags) {
-            const tgs = p.tags.split(',').map(s => s.trim().toUpperCase());
-            tgs.forEach(t => { if (t && t !== '-') riskStats[t] = (riskStats[t] || 0) + 1; });
-        }
-
-        const regTime = new Date(p.createdAt || p.updatedAt || Date.now()).getTime();
-        if (regTime >= startTime && regTime <= endTime) newPatients++;
+    // --- PASS 1: ACTIVITY DISCOVERY (Find patients active in this period) ---
+    const activePatientIds = new Set();
+    assessments.forEach(a => {
+        const aTime = new Date(a.date).getTime();
+        if (aTime >= startTime && aTime <= endTime) activePatientIds.add(String(a.patientId));
+    });
+    appts.forEach(a => {
+        const aTime = new Date(a.date).getTime();
+        if (aTime >= startTime && aTime <= endTime) activePatientIds.add(String(a.patientId));
     });
 
-    // --- PASS 2: ACTIVITY ANALYSIS (ASSESSMENTS & RETENTION) ---
+    // --- PASS 2: FILTERED PATIENT INVENTORY (GEO, RISK, GENDER) ---
+    patients.forEach(p => {
+        const regTime = new Date(p.createdAt || p.updatedAt || Date.now()).getTime();
+        const isNew = regTime >= startTime && regTime <= endTime;
+        const wasSeen = activePatientIds.has(String(p.id));
+
+        // Only count patients who were registered in this period OR had activity
+        if (isNew || wasSeen) {
+            totalPatients++;
+            if (p.gender === 'L') genderStats.L++; else if (p.gender === 'P') genderStats.P++;
+            if (p.dob) {
+                const age = new Date().getFullYear() - new Date(p.dob).getFullYear();
+                totalAge += age; ageCount++;
+
+                if (age <= 11) ageGroupStats.child++;
+                else if (age <= 18) ageGroupStats.teen++;
+                else if (age <= 59) ageGroupStats.adult++;
+                else ageGroupStats.elderly++;
+            }
+
+            // GEO
+            const region = getRegion(p.address);
+            geoStats[region] = (geoStats[region] || 0) + 1;
+
+            // RED-FLAG
+            if (p.tags) {
+                const tgs = p.tags.split(',').map(s => s.trim().toUpperCase());
+                tgs.forEach(t => { if (t && t !== '-') riskStats[t] = (riskStats[t] || 0) + 1; });
+            }
+
+            if (isNew) {
+                newPatients++;
+            } else {
+                // If not new but seen, they are 'Old' patients for this period
+                oldPatientsStore.add(p.id);
+            }
+        }
+    });
+
+    // --- PASS 3: ACTIVITY ANALYSIS (ASSESSMENTS & RETENTION) ---
     const uniquePatientsInPeriod = new Set();
     assessments.forEach(a => {
         const aTime = new Date(a.date).getTime();
@@ -10355,11 +11623,7 @@ async function refreshAnalytics() {
         const dStr = a.date.split('T')[0];
         trendStats[dStr] = (trendStats[dStr] || 0) + 1;
 
-        const p = patients.find(pt => pt.id === a.patientId);
-        if (p) {
-            const pRegT = new Date(p.createdAt || p.updatedAt || Date.now()).getTime();
-            if (fromVal && pRegT < startTime) oldPatientsStore.add(a.patientId);
-        }
+        // Note: oldPatientsStore calculation already handled in PASS 2
 
         let ivs = a.intervention || [];
         if (typeof ivs === 'string') ivs = ivs.split(',').map(s => s.trim());
@@ -10478,6 +11742,11 @@ async function refreshAnalytics() {
                 <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 border-b pb-3 w-full text-center text-[9px]">GENDER</h4>
                 <div class="w-full max-w-[140px]"><canvas id="chart-gender"></canvas></div>
             </div>
+
+            <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center">
+                <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 border-b pb-3 w-full text-center text-[9px]">PROPORSI USIA</h4>
+                <div class="w-full max-w-[140px]"><canvas id="chart-age"></canvas></div>
+            </div>
             
             <div class="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
                 <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-6 border-b pb-3 w-full text-center text-[9px]">📍 Top 5 Wilayah</h4>
@@ -10520,8 +11789,21 @@ async function refreshAnalytics() {
         </div>
     `;
 
-    initDemographicCharts({ gender: genderStats, trend: trendStats, hours: hourStats });
+    initDemographicCharts({ gender: genderStats, age: ageGroupStats, trend: trendStats, hours: hourStats });
     renderIcons();
+
+    // Save analytics data snapshot for printing
+    window._lastAnalyticsData = {
+        totalIncome, totalExpense, netProfit,
+        retentionRate, totalPatients, newPatients,
+        conversionRate, arpp, totalVisits,
+        genderL: genderStats.L, genderP: genderStats.P,
+        ageGroup: ageGroupStats,
+        dxStats, ivStats, geoStats, riskStats,
+        topDx, topIv, topGeo,
+        period: (fromVal && toVal) ? `${fromVal} s/d ${toVal}` : 'SEMUA WAKTU',
+        generatedAt: new Date()
+    };
 
     // BACKGROUND SYNC (Non-blocking)
     (async () => {
@@ -10536,9 +11818,11 @@ function initDemographicCharts(data) {
     const ctxGender = document.getElementById('chart-gender').getContext('2d');
     const chartTrendEl = document.getElementById('chart-trend');
     const chartHourEl = document.getElementById('chart-hour');
+    const chartAgeEl = document.getElementById('chart-age');
 
     // Hancurkan Chart lama (Hemat Memori)
     if (window._chartGender) window._chartGender.destroy();
+    if (window._chartAge) window._chartAge.destroy();
     if (window._chartTrend) window._chartTrend.destroy();
     if (window._chartHour) window._chartHour.destroy();
 
@@ -10557,12 +11841,54 @@ function initDemographicCharts(data) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
-            plugins: { legend: { position: 'bottom', labels: { font: { weight: 'bold', size: 9 } } } },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        font: { weight: 'bold', size: 9 },
+                        padding: 10,
+                        boxWidth: 10,
+                        usePointStyle: true
+                    }
+                }
+            },
             cutout: '70%'
         }
     });
 
-    // 2. CHART TREN (LINE)
+    // 2. CHART AGE (Donut)
+    if (chartAgeEl) {
+        window._chartAge = new Chart(chartAgeEl.getContext('2d'), {
+            type: 'doughnut',
+            data: {
+                labels: ['Anak', 'Remaja', 'Dewasa', 'Lansia'],
+                datasets: [{
+                    data: [data.age.child || 0, data.age.teen || 0, data.age.adult || 0, data.age.elderly || 0],
+                    backgroundColor: ['#10b981', '#6366f1', '#f59e0b', '#ef4444'],
+                    borderWidth: 4,
+                    borderColor: '#ffffff'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: {
+                            font: { size: 9, weight: 'bold' },
+                            padding: 10,
+                            boxWidth: 10,
+                            usePointStyle: true
+                        }
+                    }
+                },
+                cutout: '65%'
+            }
+        });
+    }
+
+    // 3. CHART TREN (LINE)
     if (chartTrendEl) {
         const trendLabels = Object.keys(data.trend).sort();
         const trendValues = trendLabels.map(l => data.trend[l]);
@@ -10593,7 +11919,7 @@ function initDemographicCharts(data) {
         });
     }
 
-    // 3. CHART BUSY HOURS (BAR)
+    // 4. CHART BUSY HOURS (BAR)
     if (chartHourEl) {
         window._chartHour = new Chart(chartHourEl.getContext('2d'), {
             type: 'bar',
@@ -10619,178 +11945,284 @@ function initDemographicCharts(data) {
     }
 }
 
-function printAnalyticsReport() {
-    const content = document.getElementById('analytics-content');
-    const printContainer = document.getElementById('print-container');
-    const appLayout = document.getElementById('app-layout');
-    if (!content || !printContainer) return;
+/**
+ * GENERATE HIGH-RES CHART FOR PRINTING
+ * Renders a chart to a hidden canvas with large fonts for readable A4 reports.
+ */
+function generatePrintChart(type, data, labels, colors) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 600;
+    canvas.height = 600;
+    const ctx = canvas.getContext('2d');
 
-    // CAPTURE KPI
-    const kpiH4s = content.querySelectorAll('h4');
-    if (kpiH4s.length < 5) return showToast("Selesaikan kalkulasi data dulu!", "error");
-
-    const profitVal = kpiH4s[2].innerText;
-    const profitStatus = content.querySelector('.bg-white\\/20')?.innerText || '📈';
-    const retentionVal = kpiH4s[3].innerText;
-    const populationVal = kpiH4s[4].innerText;
-    const convVal = kpiH4s[6]?.innerText || '0%';
-
-    const cleanPats = (state.patients || []).filter(p => {
-        const n = String(p.name || '').trim().toUpperCase();
-        return p.id && n && n !== 'TIDAK TERISI' && n !== '-' && n !== 'GHOST';
+    // Create temporary chart instance
+    const chart = new Chart(ctx, {
+        type: type,
+        data: {
+            labels: labels,
+            datasets: [{
+                data: data,
+                backgroundColor: colors,
+                borderWidth: 2,
+                borderColor: '#ffffff'
+            }]
+        },
+        options: {
+            responsive: false,
+            animation: false,
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: {
+                        font: { size: 24, weight: '900' },
+                        padding: 30,
+                        usePointStyle: true,
+                        boxWidth: 15
+                    }
+                }
+            },
+            cutout: '65%'
+        }
     });
-    const gL = cleanPats.filter(p => (p.gender || '').toUpperCase() === 'L').length;
-    const gP = cleanPats.filter(p => (p.gender || '').toUpperCase() === 'P').length;
 
-    // CHARTS
-    const genderCanvas = document.getElementById('chart-gender');
+    const dataUrl = canvas.toDataURL('image/png', 1.0);
+    chart.destroy();
+    return dataUrl;
+}
+
+function printAnalyticsReport() {
+    const appLayout = document.getElementById('app-layout');
+    const printContainer = document.getElementById('print-container');
+
+    // AUTO-PREPARE DATA IF MISSING
+    if (!window._lastAnalyticsData) {
+        showToast('Menyiapkan laporan...', 'info');
+        // If data is missing, we try to trigger refresh once
+        const dashboardBtn = document.querySelector('[onclick*="switchTab(\'analytics\')"]');
+        if (dashboardBtn) {
+            dashboardBtn.click();
+            setTimeout(printAnalyticsReport, 1500);
+            return;
+        }
+        showToast('Gagal menyiapkan data. Buka Dashboard > Analisis Klinis dulu.', 'error');
+        return;
+    }
+
+    const d = window._lastAnalyticsData;
+
+    // GENERATE HIGH-RES IMAGES FOR PRINT ONLY
+    const printGenderImg = generatePrintChart('doughnut',
+        [d.genderL, d.genderP],
+        ['L', 'P'],
+        ['#6366f1', '#ec4899']
+    );
+
+    const printAgeImg = generatePrintChart('doughnut',
+        [d.ageGroup.child, d.ageGroup.teen, d.ageGroup.adult, d.ageGroup.elderly],
+        ['Anak (0-11)', 'Remaja (12-18)', 'Dewasa (19-55)', 'Lansia (60+)'],
+        ['#10b981', '#6366f1', '#f59e0b', '#ef4444']
+    );
+
     const trendCanvas = document.getElementById('chart-trend');
     const hourCanvas = document.getElementById('chart-hour');
-    if (!genderCanvas || !trendCanvas || !hourCanvas) return showToast("Grafik belum siap!", "error");
+    const hasCharts = trendCanvas && hourCanvas;
+    const trendImg = hasCharts ? trendCanvas.toDataURL('image/png', 1.0) : '';
+    const hourImg = hasCharts ? hourCanvas.toDataURL('image/png', 1.0) : '';
 
-    const genderImg = genderCanvas.toDataURL('image/png', 1.0);
-    const trendImg = trendCanvas.toDataURL('image/png', 1.0);
-    const hourImg = hourCanvas.toDataURL('image/png', 1.0);
+    const formatRp = (num) => 'Rp ' + Math.round(num || 0).toLocaleString('id-ID');
+    const totalAssessments = Object.values(d.dxStats || {}).reduce((s, v) => s + v, 0) || 1;
 
-    // UNIFORM PRO TABLES V16 (9px Standard)
-    const processTableV16 = (html) => {
-        if (!html || html.includes('No Data') || html.includes('Semua Aman'))
-            return '<tr><td style="padding:20px; color:#94a3b8; text-align:center; font-size:10px;">Belum Ada Data</td></tr>';
-
-        return html.replace(/<tr.*?>/g, '<tr style="border-bottom:1px solid #f1f5f9;">')
-            .replace(/<td.*?>(.*?)<\/td>\s*<td.*?>(.*?)<\/td>/g, (m, label, val) => {
-                return `<td style="font-size:10.5px; font-weight:700; color:#334155; padding:8px 0; width:70%; text-transform:uppercase;">${label}</td>
-                        <td style="font-size:11px; font-weight:800; color:#1d4ed8; text-align:right; width:30%;">${val}</td>`;
-            });
+    const makeTopTable = (entries) => {
+        if (!entries || entries.length === 0) return '<tr><td style="padding:12px; color:#94a3b8; text-align:center; font-size:10px;">Belum Ada Data</td></tr>';
+        return entries.map(([label, val]) => {
+            const perc = ((val / totalAssessments) * 100).toFixed(1);
+            return `<tr style="border-bottom:1px solid #f1f5f9;">
+                <td style="font-size:10px; font-weight:700; color:#334155; padding:6px 2px; width:55%; text-transform:uppercase;">${label}</td>
+                <td style="font-size:11px; font-weight:800; color:#1d4ed8; text-align:center; width:20%;">${val}</td>
+                <td style="font-size:10px; font-weight:800; text-align:right; width:25%;"><span style="background:#eff6ff; color:#1d4ed8; padding:2px 6px; border-radius:6px; border:1px solid #dbeafe;">${perc}%</span></td>
+            </tr>`;
+        }).join('');
     };
 
-    const tables = content.querySelectorAll('table');
-    const geoTable = processTableV16(tables[0]?.innerHTML);
-    const dxTable = processTableV16(tables[1]?.innerHTML);
-    const riskTable = processTableV16(tables[2]?.innerHTML);
-    const ivTable = processTableV16(tables[3]?.innerHTML);
+    const makeSimpleTable = (entries, colorHex) => {
+        if (!entries || entries.length === 0) return '<tr><td style="padding:12px; color:#94a3b8; text-align:center; font-size:10px;">Belum Ada Data</td></tr>';
+        return entries.map(([label, val]) =>
+            `<tr style="border-bottom:1px solid #f1f5f9;">
+                <td style="font-size:10px; font-weight:700; color:#334155; padding:6px 2px; text-transform:uppercase;">${label}</td>
+                <td style="font-size:11px; font-weight:900; color:${colorHex}; text-align:right; padding:6px 2px;">${val}</td>
+            </tr>`
+        ).join('');
+    };
 
-    const period = document.getElementById('analytic-from').value && document.getElementById('analytic-to').value ?
-        `${document.getElementById('analytic-from').value} s/d ${document.getElementById('analytic-to').value}` : "SEMUA WAKTU";
+    const riskEntries = Object.entries(d.riskStats || {}).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const profitStatus = d.netProfit >= 0 ? '📈 SURPLUS' : '⚠️ DEFISIT';
 
     printContainer.innerHTML = `
         <style>
             @page { size: A4 portrait; margin: 0; }
             @media print {
                 body { margin: 0; padding: 0; }
-                .printable-report { margin: 0; border: none; height: 100vh; }
+                .printable-report { margin: 0; border: none; height: 100vh; overflow:hidden; }
             }
         </style>
-        <div class="printable-report" style="background:#fff; color:#1e293b; padding:0.7cm 1.2cm; width:21cm; height:29.6cm; font-family: 'Inter', -apple-system, sans-serif; position:relative; box-sizing:border-box; overflow:hidden;">
-            
-            <!-- HEADER PREMIUM (DYNAMIC LOGO) -->
-            <div style="display:flex; justify-content:space-between; align-items:flex-end; border-bottom:3px solid #0f172a; padding-bottom:15px; margin-bottom:20px;">
-                <div style="display:flex; align-items:center; gap:18px;">
-                    ${state.clinicInfo?.logoUrl ? `
-                    <div style="width:60px; height:60px; display:flex; align-items:center; justify-content:center;">
-                        <img src="${state.clinicInfo.logoUrl}" style="max-width:100%; max-height:100%; object-fit:contain;" />
-                    </div>
-                    ` : ''}
+        <div class="printable-report" style="background:#fff; color:#1e293b; padding:0.6cm 1.0cm; width:21cm; height:29.6cm; font-family: 'Inter', sans-serif; position:relative; box-sizing:border-box; display:flex; flex-direction:column; justify-content:space-between;">
+            <div>
+            <!-- HEADER -->
+            <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:3px solid #0f172a; padding-bottom:10px; margin-bottom:15px;">
+                <div style="display:flex; align-items:center; gap:12px;">
+                    ${state.clinicInfo?.logoUrl ? `<img src="${state.clinicInfo.logoUrl}" style="max-height:55px; max-width:55px; object-fit:contain;" />` : ''}
                     <div>
-                        <h1 style="margin:0; font-size:24px; font-weight:900; letter-spacing:-1px; color:#0f172a; line-height:1;">${state.clinicInfo.name || 'FISIOTA CLINIC'}</h1>
-                        <p style="margin:6px 0 0; font-size:10px; font-weight:700; color:#3b82f6; text-transform:uppercase; letter-spacing:1px;">Intelligent Strategic Analytics • V18-CLEAN</p>
+                        <h1 style="margin:0; font-size:22px; font-weight:900; letter-spacing:-1px; color:#0f172a;">${state.clinicInfo.name || 'FISIOTA CLINIC'}</h1>
+                        <p style="margin:1px 0 0; font-size:10px; font-weight:800; color:#2563eb; text-transform:uppercase; letter-spacing:1px;">Strategic Health Analytics Report</p>
                     </div>
                 </div>
                 <div style="text-align:right">
-                    <h2 style="margin:0; font-size:12px; font-weight:900; color: #1e293b;">OFFICIAL CLINICAL REPORT</h2>
-                    <p style="margin:2px 0 0; font-size:9px; font-weight:700; color:#64748b;">PERIODE: ${period}</p>
+                    <h2 style="margin:0; font-size:11px; font-weight:900; color:#1e293b; text-transform:uppercase;">OFFICIAL REPORT</h2>
+                    <p style="margin:2px 0 0; font-size:9px; font-weight:700; color:#64748b;">Periode: ${d.period}</p>
                 </div>
             </div>
 
-            <!-- KPI SECTION - BOLD & CLEAR -->
-            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; margin-bottom:20px;">
-                <div style="border:1.5px solid #e2e8f0; border-radius:16px; padding:12px; text-align:center; background:#f8fafc;">
-                    <p style="margin:0; font-size:8px; font-weight:800; color:#64748b; text-transform:uppercase; margin-bottom:5px;">Profit Bersih</p>
-                    <p style="margin:0; font-size:16px; font-weight:900; color:#059669;">${profitVal}</p>
-                    <span style="font-size:7px; font-weight:900; background:#dcfce7; color:#166534; padding:2px 10px; border-radius:99px; margin-top:4px; display:inline-block;">${profitStatus}</span>
+            <!-- KPI ROW 1 -->
+            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; margin-bottom:12px;">
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; text-align:center; background:#f8fafc;">
+                    <p style="margin:0 0 2px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Gross Income</p>
+                    <p style="margin:0; font-size:13px; font-weight:900; color:#1d4ed8;">${formatRp(d.totalIncome)}</p>
                 </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:16px; padding:12px; text-align:center;">
-                    <p style="margin:0; font-size:8px; font-weight:800; color:#64748b; text-transform:uppercase; margin-bottom:5px;">Retention</p>
-                    <p style="margin:0; font-size:16px; font-weight:900; color:#2563eb;">${retentionVal}</p>
-                    <span style="font-size:7px; font-weight:900; background:#eff6ff; color:#1d4ed8; padding:2px 10px; border-radius:99px; margin-top:4px; display:inline-block;">LOYALTY</span>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; text-align:center;">
+                    <p style="margin:0 0 2px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Total Expense</p>
+                    <p style="margin:0; font-size:13px; font-weight:900; color:#dc2626;">${formatRp(d.totalExpense)}</p>
                 </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:16px; padding:12px; text-align:center;">
-                    <p style="margin:0; font-size:8px; font-weight:800; color:#64748b; text-transform:uppercase; margin-bottom:5px;">Populasi Aktif</p>
-                    <p style="margin:0; font-size:16px; font-weight:900; color:#1e293b;">${populationVal}</p>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; text-align:center; background:#f0fdf4;">
+                    <p style="margin:0 0 2px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Net Profit</p>
+                    <p style="margin:0; font-size:13px; font-weight:900; color:#059669;">${formatRp(d.netProfit)}</p>
                 </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:16px; padding:12px; text-align:center;">
-                    <p style="margin:0; font-size:8px; font-weight:800; color:#64748b; text-transform:uppercase; margin-bottom:5px;">Conversion</p>
-                    <p style="margin:0; font-size:16px; font-weight:900; color:#1e293b;">${convVal}</p>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; text-align:center;">
+                    <p style="margin:0 0 2px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Retention</p>
+                    <p style="margin:0; font-size:13px; font-weight:900; color:#7c3aed;">${d.retentionRate}%</p>
                 </div>
             </div>
 
-            <!-- TREND & JAM (GRAPH) -->
-            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:20px; margin-bottom:20px;">
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; padding:15px; background:#fff;">
-                    <p style="margin:0; font-size:10px; font-weight:900; text-transform:uppercase; margin-bottom:12px; color:#1e3a8a; border-left:4px solid #3b82f6; padding-left:10px;">📉 Kunjungan Harian</p>
-                    <img src="${trendImg}" style="width:100%; height:130px; object-fit:contain;" />
+            <!-- KPI ROW 2 -->
+            <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap:8px; margin-bottom:15px;">
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:7px; text-align:center;">
+                    <p style="margin:0 0 1px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Patients</p>
+                    <p style="margin:0; font-size:15px; font-weight:900; color:#0f172a;">${d.totalPatients}</p>
+                    <small style="font-size:7px; color:#94a3b8;">🆕 ${d.newPatients} Baru</small>
                 </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; padding:15px; background:#fff;">
-                    <p style="margin:0; font-size:10px; font-weight:900; text-transform:uppercase; margin-bottom:12px; color:#1e3a8a; border-left:4px solid #10b981; padding-left:10px;">🕰️ Jam Sibuk Klinik</p>
-                    <img src="${hourImg}" style="width:100%; height:130px; object-fit:contain;" />
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:7px; text-align:center;">
+                    <p style="margin:0 0 1px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Visits</p>
+                    <p style="margin:0; font-size:15px; font-weight:900; color:#2563eb;">${d.totalVisits}</p>
+                    <small style="font-size:7px; color:#94a3b8;">Kunjungan</small>
+                </div>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:7px; text-align:center;">
+                    <p style="margin:0 0 1px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">Conversion</p>
+                    <p style="margin:0; font-size:15px; font-weight:900; color:#059669;">${d.conversionRate}%</p>
+                    <small style="font-size:7px; color:#94a3b8;">Success Rate</small>
+                </div>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:7px; text-align:center;">
+                    <p style="margin:0 0 1px; font-size:8px; font-weight:900; color:#64748b; text-transform:uppercase;">ARPP</p>
+                    <p style="margin:0; font-size:13px; font-weight:900; color:#0f172a;">${formatRp(d.arpp)}</p>
+                    <small style="font-size:7px; color:#94a3b8;">Avg/Visit</small>
                 </div>
             </div>
 
-            <!-- GEO & GENDER -->
-            <div style="display:grid; grid-template-columns: 1.4fr 1fr; gap:20px; margin-bottom:20px;">
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; padding:15px; min-height:220px; background:#fff;">
-                    <p style="margin:0; font-size:10px; font-weight:900; text-transform:uppercase; margin-bottom:15px; color:#1e3a8a; border-left:4px solid #3b82f6; padding-left:10px;">📍 Distribusi Wilayah Pasien</p>
-                    <table style="width:100%; border-collapse:collapse;">
-                        ${geoTable}
-                    </table>
+            <!-- CHARTS ROW 1 -->
+            ${hasCharts ? `
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-bottom:12px;">
+                <div style="border:1px solid #e2e8f0; border-radius:10px; padding:8px;">
+                    <p style="margin:0 0 6px; font-size:9px; font-weight:950; text-transform:uppercase; color:#1e3a8a;">📈 Tren Kunjungan</p>
+                    <img src="${trendImg}" style="width:100%; height:120px; object-fit:contain;" />
                 </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; padding:15px; text-align:center; min-height:220px; background:#fff;">
-                    <p style="margin:0; font-size:10px; font-weight:900; text-transform:uppercase; margin-bottom:15px; color:#1e3a8a; border-left:4px solid #ec4899; padding-left:10px;">📊 Rasio Gender</p>
-                    <div style="display:flex; flex-direction:column; align-items:center;">
-                        <img src="${genderImg}" style="height:120px; width:120px; object-fit:contain; margin-bottom:12px;" />
-                        <div style="font-size:11px; font-weight:800; display:flex; gap:20px; border-top:1px solid #f1f5f9; padding-top:10px; width:100%; justify-content:center;">
-                            <span style="color:#2563eb;">♂ L: ${gL}</span>
-                            <span style="color:#db2777;">♀ P: ${gP}</span>
-                        </div>
+                <div style="border:1px solid #e2e8f0; border-radius:10px; padding:8px;">
+                    <p style="margin:0 0 6px; font-size:9px; font-weight:950; text-transform:uppercase; color:#1e3a8a;">🕰️ Jam Sibuk</p>
+                    <img src="${hourImg}" style="width:100%; height:120px; object-fit:contain;" />
+                </div>
+            </div>
+            
+            <!-- CHARTS ROW 2 (DEMOGRAPHIC) -->
+            <div style="display:grid; grid-template-columns: 1fr 1.2fr; gap:10px; margin-bottom:12px;">
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; display:flex; flex-direction:column; align-items:center;">
+                    <p style="margin:0 0 6px; font-size:9px; font-weight:950; text-transform:uppercase; color:#1e3a8a; width:100%; text-align:left;">📊 Rasio Gender</p>
+                    <img src="${printGenderImg}" style="height:120px; width:120px; object-fit:contain;" />
+                    <div style="font-size:14px; font-weight:900; display:flex; gap:20px; margin-top:6px;">
+                        <span style="color:#6366f1;">♂ L: ${d.genderL}</span>
+                        <span style="color:#ec4899;">♀ P: ${d.genderP}</span>
                     </div>
                 </div>
+                <div style="border:1.2px solid #e2e8f0; border-radius:10px; padding:8px; display:flex; flex-direction:column; align-items:center; background:#f8fafc;">
+                    <p style="margin:0 0 6px; font-size:9px; font-weight:950; text-transform:uppercase; color:#1e3a8a; width:100%; text-align:left;">🎂 Proporsi Usia</p>
+                    <div style="display:flex; align-items:center; gap:10px; width:100%;">
+                        <img src="${printAgeImg}" style="height:120px; width:120px; object-fit:contain;" />
+                        <div style="font-size:9px; font-weight:800; color:#475569; display:flex; flex-direction:column; gap:4px;">
+                            <div style="display:flex; align-items:center; gap:5px;">
+                                <div style="width:10px; height:10px; background:#10b981; border-radius:2px;"></div>
+                                <span>Anak: <b>${d.ageGroup.child}</b></span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:5px;">
+                                <div style="width:10px; height:10px; background:#6366f1; border-radius:2px;"></div>
+                                <span>Remaja: <b>${d.ageGroup.teen}</b></span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:5px;">
+                                <div style="width:10px; height:10px; background:#f59e0b; border-radius:2px;"></div>
+                                <span>Dewasa: <b>${d.ageGroup.adult}</b></span>
+                            </div>
+                            <div style="display:flex; align-items:center; gap:5px;">
+                                <div style="width:10px; height:10px; background:#ef4444; border-radius:2px;"></div>
+                                <span>Lansia: <b>${d.ageGroup.elderly}</b></span>
+                            </div>
+                        </div>
+                    </div>
+                    <p style="font-size:10px; font-weight:900; color:#1e293b; margin-top:4px; text-transform:uppercase; letter-spacing:0.5px;">Standar Kemenkes RI</p>
+                </div>
+            </div>` : ''}
+
+            <!-- DATA TABLES -->
+            <div style="display:grid; grid-template-columns: 1.1fr 1fr 1fr; gap:10px; margin-bottom:12px;">
+                <div style="border:1px solid #e2e8f0; border-radius:10px; overflow:hidden; background:#fff;">
+                    <div style="background:#f1f5f9; padding:6px; border-bottom:1px solid #e2e8f0;"><p style="margin:0; font-size:8px; font-weight:900; color:#1e40af; text-transform:uppercase;">🏆 Top Diagnosa</p></div>
+                    <div style="padding:4px 6px;"><table style="width:100%; border-collapse:collapse;">${makeTopTable(d.topDx)}</table></div>
+                </div>
+                <div style="border:1px solid #e2e8f0; border-radius:10px; overflow:hidden; background:#fff;">
+                    <div style="background:#f1f5f9; padding:6px; border-bottom:1px solid #e2e8f0;"><p style="margin:0; font-size:8px; font-weight:900; color:#059669; text-transform:uppercase;">⚡ Intervensi</p></div>
+                    <div style="padding:4px 6px;"><table style="width:100%; border-collapse:collapse;">${makeSimpleTable(d.topIv, '#059669')}</table></div>
+                </div>
+                <div style="border:1.2px solid #fee2e2; border-radius:10px; overflow:hidden; background:#fff;">
+                    <div style="background:#fef2f2; padding:6px; border-bottom:1.2px solid #fee2e2;"><p style="margin:0; font-size:8px; font-weight:900; color:#dc2626; text-transform:uppercase;">🚨 Red-Flag</p></div>
+                    <div style="padding:4px 6px;"><table style="width:100%; border-collapse:collapse;">${makeSimpleTable(riskEntries, '#dc2626')}</table></div>
+                </div>
             </div>
 
-            <!-- CLINICAL TRIAD (CLEAN) -->
-            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:15px; margin-bottom:30px;">
-                <div style="border:2.5px solid #fee2e2; border-radius:20px; min-height:260px; background:#fff; overflow:hidden;">
-                    <div style="background:#fef2f2; padding:10px; border-bottom:1.5px solid #fee2e2; text-align:center;"><p style="margin:0; font-size:10px; font-weight:900; color:#dc2626;">🚨 RISIKO (RED-FLAG)</p></div>
-                    <div style="padding:12px;"><table style="width:100%; border-collapse:collapse;">${riskTable}</table></div>
-                </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; min-height:260px; background:#fff; overflow:hidden;">
-                    <div style="background:#f8fafc; padding:10px; border-bottom:1.5px solid #e2e8f0; text-align:center;"><p style="margin:0; font-size:10px; font-weight:900; color:#1e40af;">🏆 TOP DIAGNOSA</p></div>
-                    <div style="padding:12px;"><table style="width:100%; border-collapse:collapse;">${dxTable}</table></div>
-                </div>
-                <div style="border:1.5px solid #e2e8f0; border-radius:20px; min-height:260px; background:#fff; overflow:hidden;">
-                    <div style="background:#f8fafc; padding:10px; border-bottom:1.5px solid #e2e8f0; text-align:center;"><p style="margin:0; font-size:10px; font-weight:900; color:#1e40af;">⚡ MODALITAS LAKU</p></div>
-                    <div style="padding:12px;"><table style="width:100%; border-collapse:collapse;">${ivTable}</table></div>
+            <!-- GEOGRAPHIC -->
+            <div style="border:1px solid #e2e8f0; border-radius:10px; overflow:hidden;">
+                <div style="background:#f1f5f9; padding:6px 12px; border-bottom:1px solid #e2e8f0;"><p style="margin:0; font-size:8px; font-weight:900; color:#1e40af; text-transform:uppercase;">📍 Distribusi Wilayah</p></div>
+                <div style="padding:6px 12px; display:grid; grid-template-columns: repeat(5, 1fr); gap:6px;">
+                    ${d.topGeo.map(([r, c]) => `<div style="text-align:center; border:1px solid #f1f5f9; border-radius:6px; padding:4px;"><p style="margin:0; font-size:7px; font-weight:700; color:#64748b; text-transform:uppercase;">${r}</p><p style="margin:1px 0 0; font-size:11px; font-weight:900; color:#1d4ed8;">${c}</p></div>`).join('') || '<p style="color:#94a3b8; font-size:9px;">No data</p>'}
                 </div>
             </div>
+            </div>
 
-            <!-- FOOTER PROFESSIONAL -->
-            <div style="position:absolute; bottom:1cm; left:1.2cm; right:1.2cm; padding-top:15px; border-top:2px solid #f1f5f9; display:flex; justify-content:space-between; font-size:9px; color:#94a3b8; font-weight:700; letter-spacing:0.5px;">
-                <p style="margin:0;">CONFIDENTIAL • FISIOTA ERM STRATEGIC ENGINE</p>
-                <p style="margin:0;">GENERATED: ${new Date().toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</p>
+            <!-- FOOTER -->
+            <div style="padding:8px 0; border-top:1.2px solid #f1f5f9; display:flex; justify-content:space-between; font-size:8px; color:#94a3b8; font-weight:700;">
+                <p style="margin:0;">OFFICIAL CLINIC ANALYTICS • FISIOTA ERM ENGINE</p>
+                <p style="margin:0;">GENERATED: ${d.generatedAt.toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' })}</p>
             </div>
         </div>
-
     `;
 
     // EXECUTE
-    const originalDisplay = appLayout.style.display;
+    const originalDisplay = appLayout.style.display || 'flex';
     appLayout.style.display = 'none';
     printContainer.classList.remove('hidden');
+    printContainer.style.display = 'block';
 
     setTimeout(() => {
         window.print();
-        appLayout.style.display = originalDisplay;
-        printContainer.classList.add('hidden');
-        renderIcons();
+        setTimeout(() => {
+            appLayout.style.display = originalDisplay;
+            printContainer.classList.add('hidden');
+            printContainer.style.display = 'none';
+            renderIcons();
+        }, 500);
     }, 800);
 }
 
@@ -10810,7 +12242,7 @@ const ANAMNESIS_KEYWORD_MAP = {
     'pusing': { code: 'b240', name: 'Sensations associated with hearing/vestibular', cat: 'b' },
     'sesak': { code: 'b440', name: 'Respiration functions', cat: 'b' },
     'bengkak': { code: 'b410', name: 'Heart functions (Edema)', cat: 'b' },
-    
+
     // Activities (d)
     'jalan': { code: 'd450', name: 'Walking', cat: 'd_act' },
     'tangga': { code: 'd455', name: 'Moving around (Stairs)', cat: 'd_act' },
@@ -10824,11 +12256,11 @@ const ANAMNESIS_KEYWORD_MAP = {
 const handleAnamnesisTyping = debounce((text) => {
     const container = document.getElementById('anamnesis-suggestions');
     if (!container) return;
-    
+
     const words = text.toLowerCase().split(/[\s,.]+/);
     const foundCodes = new Set();
     const suggestions = [];
-    
+
     words.forEach(word => {
         if (ANAMNESIS_KEYWORD_MAP[word]) {
             const item = ANAMNESIS_KEYWORD_MAP[word];
@@ -10873,9 +12305,9 @@ function addICFFromSuggestion(key, code, name) {
     // If key is just 'd', resolve to d_act/d_part automatically
     let targetKey = key;
     if (targetKey === 'd') targetKey = getICFCategory(code);
-    
+
     const input = document.getElementById(`form-${targetKey}`);
-    
+
     if (!input) {
         // Jika input tidak ada (masih di step 1), simpan ke tempFormData
         const currentVal = window.tempFormData[targetKey] || "";
@@ -10885,7 +12317,7 @@ function addICFFromSuggestion(key, code, name) {
         } else if (Array.isArray(currentVal)) {
             lines = currentVal;
         }
-        
+
         if (!lines.some(l => l.includes(code))) {
             lines.push(fullText);
             window.tempFormData[targetKey] = Array.isArray(currentVal) ? lines : lines.join('\n');
@@ -10895,7 +12327,7 @@ function addICFFromSuggestion(key, code, name) {
         }
         return;
     }
-    
+
     let currentLines = input.value.split('\n').filter(l => l.trim() !== '');
     if (!currentLines.some(l => l.includes(code))) {
         currentLines.push(fullText);
@@ -10903,7 +12335,7 @@ function addICFFromSuggestion(key, code, name) {
         updateForm(targetKey, newVal);
         input.value = newVal;
         showToast(`Kode ${code} ditambahkan ke ${targetKey.toUpperCase()}!`, 'success');
-        
+
         // Highlight textarea
         input.classList.add('ring-2', 'ring-indigo-400', 'ring-offset-2');
         setTimeout(() => input.classList.remove('ring-2', 'ring-indigo-400', 'ring-offset-2'), 1500);
@@ -10919,7 +12351,7 @@ function addICFFromSuggestion(key, code, name) {
 function renderSpecialTestsList(data) {
     const diag = (data.diagnosis || '').toLowerCase();
     const regionFilter = getRegionFromDiag(diag);
-    
+
     // Default region jika tidak ditemukan
     let targetRegion = 'Cervical'; // Default ke Cervical jika regio tak terdeteksi
     if (regionFilter) targetRegion = regionFilter;
@@ -10933,7 +12365,7 @@ function renderSpecialTestsList(data) {
 
     const listHtml = tests.map(test => {
         const result = currentResults[test.id] || 'N/A'; // N/A, (-), (+)
-        
+
         // Warna status untuk indikator di pinggir kartu
         let statusColor = 'bg-slate-200';
         if (result === '(+)') statusColor = 'bg-rose-500';
@@ -10956,14 +12388,14 @@ function renderSpecialTestsList(data) {
                     <div class="text-[9px] font-bold text-slate-300 uppercase tracking-widest">Status:</div>
                     <div class="flex bg-slate-100 p-1 rounded-xl border border-slate-200/50">
                         ${['N/A', '(-)', '(+)'].map(val => {
-                            const isActive = (result === val);
-                            let activeClass = 'bg-white text-slate-800 shadow-sm ring-1 ring-slate-200';
-                            if (isActive && val === '(+)') activeClass = 'bg-rose-600 text-white shadow-lg shadow-rose-200';
-                            if (isActive && val === '(-)') activeClass = 'bg-emerald-600 text-white shadow-lg shadow-emerald-200';
-                            
-                            return `<button onclick="toggleSpecialTestValue('${test.id}', '${val}', '${targetRegion}')" 
+            const isActive = (result === val);
+            let activeClass = 'bg-white text-slate-800 shadow-sm ring-1 ring-slate-200';
+            if (isActive && val === '(+)') activeClass = 'bg-rose-600 text-white shadow-lg shadow-rose-200';
+            if (isActive && val === '(-)') activeClass = 'bg-emerald-600 text-white shadow-lg shadow-emerald-200';
+
+            return `<button onclick="toggleSpecialTestValue('${test.id}', '${val}', '${targetRegion}')" 
                                     class="text-[10px] px-3 py-1 rounded-lg font-black transition-all ${isActive ? activeClass : 'text-slate-400 hover:text-slate-700 hover:bg-slate-200/50'}">${val}</button>`;
-                        }).join('')}
+        }).join('')}
                     </div>
                 </div>
             </div>
@@ -11002,10 +12434,10 @@ function getRegionFromDiag(diag) {
 
 function toggleSpecialTestValue(testId, val, region) {
     if (!window.tempFormData.special_tests) window.tempFormData.special_tests = {};
-    
+
     // Update data
     window.tempFormData.special_tests[testId] = val;
-    
+
     // Jika terpilih (+), berikan suggestion ICF
     if (val === '(+)') {
         const testData = SPECIAL_TESTS_DB[region].find(t => t.id === testId);
@@ -11017,12 +12449,27 @@ function toggleSpecialTestValue(testId, val, region) {
             });
         }
     }
-    
+
     // Re-render only the list area for speed
     const area = document.getElementById('special-tests-list-area');
     if (area) {
         area.innerHTML = renderSpecialTestsList(window.tempFormData);
     }
-    
+
     showToast(`Test ${testId} diupdate ke ${val}`, 'success');
 }
+
+// --- PWA INSTALLATION HANDLER ---
+let deferredPrompt;
+window.addEventListener('beforeinstallprompt', (e) => {
+    // Prevent the mini-infobar from appearing on mobile
+    // e.preventDefault();
+    // Stash the event so it can be triggered later.
+    deferredPrompt = e;
+    console.log('PWA: beforeinstallprompt event fired');
+    // Optionally: show a custom install button here if needed
+});
+
+window.addEventListener('appinstalled', (evt) => {
+    console.log('PWA: App was installed');
+});
