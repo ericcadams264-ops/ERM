@@ -8822,23 +8822,25 @@ function openSmartICFPicker(key, title) {
                 ${sortedItems.map((item, idx) => {
         const isRec = templateItems.has(item);
         return `
-                        <div class="picker-item-card bg-white p-4 rounded-xl border-2 ${isRec ? 'border-amber-300 bg-amber-50/20' : 'border-slate-200'} hover:border-indigo-400 transition-all shadow-sm group" data-text="${item.toLowerCase()}">
-                        <div class="flex justify-between items-start">
+                        <div class="picker-item-card bg-white p-5 rounded-2xl border-2 ${isRec ? 'border-amber-300 bg-amber-50/20' : 'border-slate-100'} hover:border-indigo-400 transition-all shadow-sm group" data-text="${item.toLowerCase()}">
+                            <div class="flex flex-col md:flex-row justify-between items-start gap-4">
                                 <div class="flex-1">
                                     <div class="flex gap-1 mb-2">
                                         ${isRec ? '<span class="text-[8px] bg-amber-500 text-white font-black px-2 py-0.5 rounded tracking-tighter uppercase shadow-sm">✨ Smart Recommendation</span>' : ''}
                                     </div>
-                                    <h4 class="font-bold text-slate-700 leading-tight mb-2">${item}</h4>
+                                    <h4 class="font-bold text-slate-700 leading-tight text-sm">${item}</h4>
+                                    <!-- Missing Desc Area Fix -->
+                                    <div id="desc-qualifier-${idx}" class="hidden mt-3 p-2 bg-indigo-50 text-[10px] text-indigo-700 rounded-lg border border-indigo-100 italic transition-all animate-in fade-in zoom-in duration-300"></div>
                                 </div>
-                                <div class="flex gap-1 shrink-0 ml-4 h-9" id="qualifier-group-${idx}">
+                                <div class="flex flex-wrap justify-end gap-1.5 shrink-0 max-w-[220px]" id="qualifier-group-${idx}">
                                     ${Object.keys(ICF_QUALIFIERS).map(q => `
                                         <button onclick="selectICFWithQualifier('${key}', '${item.replace(/'/g, "\\'")}', '${q}', ${idx})" 
-                                            class="w-9 h-9 rounded-xl border-2 border-slate-100 flex items-center justify-center text-xs font-black transition-all bg-white text-slate-400 hover:bg-indigo-600 hover:text-white hover:shadow-lg hover:shadow-indigo-200"
+                                            class="w-8 h-8 rounded-lg border-2 border-slate-100 flex items-center justify-center text-[11px] font-black transition-all bg-white text-slate-400 hover:bg-indigo-600 hover:text-white hover:shadow-lg hover:shadow-indigo-200"
                                             title="${ICF_QUALIFIERS[q].label} (${ICF_QUALIFIERS[q].desc})">${q}</button>
                                     `).join('')}
                                 </div>
                             </div>
-                    </div>
+                        </div>
                 `}).join('')}
             </div>
 
@@ -8977,20 +8979,20 @@ function filterPickerItems(query) {
             </div>` + filteredMaster.map((m, i) => {
                 const itemStr = `${m.code} (${m.name})`;
                 return `
-                <div class="bg-indigo-50/30 p-4 rounded-xl border border-indigo-100 shadow-sm hover:border-indigo-400 hover:bg-white transition-all group mb-3">
-                    <div class="flex justify-between items-center">
+                <div class="bg-white p-5 rounded-2xl border-2 border-slate-100 shadow-sm hover:border-indigo-400 hover:shadow-indigo-100/50 transition-all group mb-3 animate-in fade-in duration-300">
+                    <div class="flex flex-col md:flex-row justify-between items-start gap-4">
                         <div class="flex-1">
-                            <span class="text-[8px] bg-indigo-600 text-white font-black px-2 py-0.5 rounded uppercase tracking-tighter shadow-sm mb-1 inline-block">Global Expert Discovery</span>
-                            <h4 class="font-bold text-slate-700 leading-tight">${itemStr}</h4>
+                            <span class="text-[8px] bg-indigo-600 text-white font-black px-2 py-0.5 rounded uppercase tracking-tighter shadow-sm mb-1.5 inline-block">Global Expert Discovery</span>
+                            <h4 class="font-bold text-slate-700 leading-tight text-sm">${itemStr}</h4>
+                            <div id="desc-qualifier-global-${i}" class="hidden mt-3 p-2 bg-emerald-50 text-[10px] text-emerald-700 rounded-lg border border-emerald-100 italic transition-all animate-in fade-in zoom-in duration-300"></div>
                         </div>
-                        <div class="flex gap-1 shrink-0 ml-4 h-9">
+                        <div class="flex flex-wrap justify-end gap-1.5 shrink-0 max-w-[220px]">
                             ${Object.keys(ICF_QUALIFIERS).map(q => `
                                 <button onclick="selectICFWithQualifier('${key}', '${itemStr.replace(/'/g, "\\'")}', '${q}', 'global-${i}')" 
-                                    class="w-9 h-9 rounded-xl border-2 border-slate-100 flex items-center justify-center text-xs font-black transition-all bg-white text-slate-400 hover:bg-indigo-600 hover:text-white hover:shadow-lg hover:shadow-indigo-200">${q}</button>
+                                    class="w-8 h-8 rounded-lg border-2 border-slate-100 flex items-center justify-center text-[11px] font-black transition-all bg-white text-slate-400 hover:bg-indigo-600 hover:text-white hover:shadow-lg hover:shadow-indigo-200">${q}</button>
                             `).join('')}
                         </div>
                     </div>
-                    <div id="desc-qualifier-global-${i}" class="hidden italic text-[9px] text-green-600 font-bold mt-1"></div>
                 </div>
             `}).join('');
             if (window.lucide) lucide.createIcons();
