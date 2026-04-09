@@ -610,25 +610,30 @@ async function checkLicense(silent = false) {
                     }
                 }
 
-                // SYNC BOOKING CONFIG FROM MASTER
-                if (result.alias || result.available_hours) {
+                    // AGGRESSIVE SYNC: Pastikan Alias & Jam tersimpan kuat
                     if (result.alias) {
                         state.bookingConfig.alias = result.alias;
                         localStorage.setItem('erm_booking_alias', result.alias);
                     }
-                    state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : "";
+                    
+                    state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : (state.bookingConfig.availableHours || "");
                     if (result.off_days !== undefined) state.bookingConfig.offDays = String(result.off_days);
                     if (result.custom_holidays !== undefined) state.bookingConfig.customHolidays = String(result.custom_holidays);
+                    
                     if (result.day_config) {
                         try {
                             state.bookingConfig.dayConfig = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
-                        } catch (e) { state.bookingConfig.dayConfig = {}; }
+                        } catch (e) { console.error("DayConfig Parse Error", e); }
                     }
-                    // FINAL FALLBACK: Jika alias masih kosong dari server, paksa ambil dari client_name jika ada
-                    if (!state.bookingConfig.alias && result.client_name) {
-                        state.bookingConfig.alias = result.client_name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+
+                    // FALLBACK DARURAT: Jika alias benar-benar kosong dari server, buat dari Nama Klinik
+                    if (!state.bookingConfig.alias || state.bookingConfig.alias === "") {
+                        const sourceName = result.client_name || state.clinicName || "klinik";
+                        state.bookingConfig.alias = sourceName.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                        localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
                     }
-                    await saveData(); // Persist to IndexedDB
+                    
+                    await saveData(); 
                 }
 
                 // SYNC ARCHIVES
