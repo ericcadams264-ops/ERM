@@ -610,7 +610,8 @@ async function checkLicense(silent = false) {
                     }
                 }
 
-                    // AGGRESSIVE SYNC: Pastikan Alias & Jam tersimpan kuat
+                // SYNC BOOKING CONFIG FROM MASTER
+                if (result.alias || result.available_hours) {
                     if (result.alias) {
                         state.bookingConfig.alias = result.alias;
                         localStorage.setItem('erm_booking_alias', result.alias);
