@@ -3708,11 +3708,11 @@ function renderScheduleView(container) {
             const typeColor = ptType === 'Home Visit' ? 'bg-green-50 border-green-200 text-green-700' : 'bg-blue-50 border-blue-200 text-blue-700';
             const patientName = state.patients.find(p => p.id === a.patientId)?.name.split(' ')[0] || (a.name || 'Pasien');
             const isPending = a.status === 'PENDING';
-            const isUnpaidAlert = !isPaidAppt(a) && (normalizeDate(a.date) <= today());
+            const isUnpaidAlert = !isPaidAppt(a);
             const statusClass = isPending
                 ? 'bg-amber-100 border-amber-300 text-amber-800 ring-1 ring-amber-200 animate-pulse'
                 : (isUnpaidAlert ? 'bg-rose-50 border-rose-200 text-rose-700 ring-1 ring-rose-200 shadow-rose-100' : 'bg-white border-slate-200 text-slate-600');
-            return `<div class="text-[9px] sm:text-[10px] truncate ${statusClass} rounded px-1 py-0.5 font-medium shadow-sm group-hover:border-blue-200 flex items-center gap-0.5 sm:gap-1"><span class="${typeColor} px-0.5 sm:px-1 py-0.5 rounded text-[7px] sm:text-[8px] font-bold flex items-center gap-0.5 shrink-0"><i data-lucide="${typeIcon}" width="7" class="hidden sm:inline"></i><span class="sm:hidden">${ptType === 'Home Visit' ? 'V' : 'K'}</span></span><span class="truncate text-[8px] sm:text-[10px]">${isPending ? '⏳ ' : ''}${isUnpaidAlert ? '📌 ' : ''}${a.time.substring(0, 5)} ${patientName}</span></div>`;
+            return `<div class="text-[9px] sm:text-[10px] truncate ${statusClass} rounded px-1 py-0.5 font-medium shadow-sm group-hover:border-blue-200 flex items-center gap-0.5 sm:gap-1"><span class="${typeColor} px-0.5 sm:px-1 py-0.5 rounded text-[7px] sm:text-[8px] font-bold flex items-center gap-0.5 shrink-0"><i data-lucide="${typeIcon}" width="7" class="hidden sm:inline"></i><span class="sm:hidden">${ptType === 'Home Visit' ? 'V' : 'K'}</span></span><span class="truncate text-[8px] sm:text-[10px]">${isPending ? '⏳ ' : ''}${isUnpaidAlert ? '⚠️ ' : ''}${a.time.substring(0, 5)} ${patientName}</span></div>`;
         }).join('')}
                                 ${dayAppts.length > 3 ? `<div class="text-[9px] sm:text-[10px] text-slate-500 font-bold pl-1 bg-slate-100 rounded px-1">+${dayAppts.length - 3}</div>` : ''}
                             </div>
@@ -3727,6 +3727,19 @@ function renderScheduleView(container) {
                 <div class="flex items-center justify-between flex-wrap gap-3">
                     <h4 class="text-xs font-bold text-slate-500 uppercase">Keterangan:</h4>
                     <div class="flex items-center gap-4 flex-wrap">
+                         <!-- New Legend for Unpaid -->
+                        <div class="flex items-center gap-2">
+                            <span class="bg-rose-50 border border-rose-200 text-rose-700 px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1 shadow-sm">
+                                <i data-lucide="alert-circle" width="10"></i>
+                                <span>Belum Bayar</span>
+                            </span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <span class="bg-amber-100 border border-amber-300 text-amber-800 px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1 shadow-sm">
+                                <i data-lucide="clock" width="10"></i>
+                                <span>Menunggu</span>
+                            </span>
+                        </div>
                         <div class="flex items-center gap-2">
                             <span class="bg-blue-50 border border-blue-200 text-blue-700 px-2 py-1 rounded text-[10px] font-bold flex items-center gap-1">
                                 <i data-lucide="building-2" width="10"></i>
