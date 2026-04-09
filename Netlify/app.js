@@ -610,6 +610,8 @@ async function checkLicense(silent = false) {
                     }
                 }
 
+                // SYNC BOOKING CONFIG FROM MASTER
+                if (result.alias || result.available_hours) {
                     if (result.alias) {
                         state.bookingConfig.alias = result.alias;
                         localStorage.setItem('erm_booking_alias', result.alias);
