@@ -65,10 +65,10 @@ let state = {
     },
     bookingConfig: {
         alias: '',
-        availableHours: '',
-        offDays: '',
+        availableHours: '08:00,09:00,10:00,11:00,13:00,14:00,15:00,16:00', // Default Standard
+        offDays: '0', // Minggu libur default
         customHolidays: '',
-        dayConfig: {}, // Per-day: { "1": { active: true, hours: "...", slots: 1 }, ... }
+        dayConfig: {},
         _dirty: false
     },
     deletedIds: {
@@ -644,28 +644,34 @@ async function checkLicense(silent = false) {
                 }
 
                 // SYNC BOOKING CONFIG FROM MASTER
-                if (result.alias || result.available_hours || result.day_config) {
-                    if (result.alias) {
-                        state.bookingConfig.alias = result.alias;
-                        localStorage.setItem('erm_booking_alias', result.alias);
+                const bAlias = result.alias || result.id_booking || result.booking_id;
+                const bHours = result.available_hours || result.hours || result.jam_buka;
+                const bOff = result.off_days || result.hari_libur;
+                const bHol = result.custom_holidays || result.tanggal_libur;
+                const bDayCfg = result.day_config || result.dayconfig;
+
+                if (bAlias || bHours || bDayCfg) {
+                    if (bAlias) {
+                        state.bookingConfig.alias = String(bAlias).trim();
+                        localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
                     }
                     
-                    if (result.available_hours !== undefined) {
-                      state.bookingConfig.availableHours = String(result.available_hours);
-                      localStorage.setItem('erm_booking_hours', String(result.available_hours));
+                    if (bHours !== undefined && bHours !== null) {
+                      state.bookingConfig.availableHours = String(bHours).trim();
+                      localStorage.setItem('erm_booking_hours', state.bookingConfig.availableHours);
                     }
-                    if (result.off_days !== undefined) {
-                      state.bookingConfig.offDays = String(result.off_days);
-                      localStorage.setItem('erm_booking_off_days', String(result.off_days));
+                    if (bOff !== undefined && bOff !== null) {
+                      state.bookingConfig.offDays = String(bOff).trim();
+                      localStorage.setItem('erm_booking_off_days', state.bookingConfig.offDays);
                     }
-                    if (result.custom_holidays !== undefined) {
-                      state.bookingConfig.customHolidays = String(result.custom_holidays);
-                      localStorage.setItem('erm_booking_holidays', String(result.custom_holidays));
+                    if (bHol !== undefined && bHol !== null) {
+                      state.bookingConfig.customHolidays = String(bHol).trim();
+                      localStorage.setItem('erm_booking_holidays', state.bookingConfig.customHolidays);
                     }
                     
-                    if (result.day_config) {
+                    if (bDayCfg) {
                         try {
-                            const parsed = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                            const parsed = typeof bDayCfg === 'string' ? JSON.parse(bDayCfg) : bDayCfg;
                             state.bookingConfig.dayConfig = parsed;
                             localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
                         } catch (e) { console.error("DayConfig Parse Error", e); }
@@ -2439,26 +2445,29 @@ async function backgroundAutoSync() {
                     if (k === 'CLINIC_PHONE') state.clinicInfo.phone = v;
                     if (k === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = v;
 
-                    // Booking & Slot Configuration
-                    if (k === 'BOOKING_ALIAS') {
+                    // [ROBUST] Booking & Slot Configuration
+                    const isAlias = ['BOOKING_ALIAS', 'ALIAS', 'ID_BOOKING'].includes(k);
+                    const isHours = ['BOOKING_HOURS', 'AVAILABLE_HOURS', 'JAM_BUKA'].includes(k);
+                    const isOff = ['BOOKING_OFFDAYS', 'OFF_DAYS', 'HARI_LIBUR'].includes(k);
+                    const isHol = ['BOOKING_HOLIDAYS', 'CUSTOM_HOLIDAYS', 'TANGGAL_LIBUR'].includes(k);
+                    const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(k);
+
+                    if (isAlias && v) {
                       state.bookingConfig.alias = v;
                       localStorage.setItem('erm_booking_alias', v);
                     }
-                    if (k === 'BOOKING_HOURS') {
+                    if (isHours && v) {
                       state.bookingConfig.availableHours = v;
                       localStorage.setItem('erm_booking_hours', v);
                     }
-                    if (k === 'BOOKING_OFFDAYS') {
-                      state.bookingConfig.offDays = v;
-                      localStorage.setItem('erm_booking_off_days', v);
+                    if (isOff && (v !== undefined && v !== null)) {
+                      state.bookingConfig.offDays = String(v);
+                      localStorage.setItem('erm_booking_off_days', String(v));
                     }
-                    if (k === 'BOOKING_HOLIDAYS') {
+                    if (isHol && v) {
                       state.bookingConfig.customHolidays = v;
                       localStorage.setItem('erm_booking_holidays', v);
                     }
-                    
-                    // Support for Day Config Aliases
-                    const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(k);
                     if (isDayConfig && v) {
                         try {
                             const parsed = typeof v === 'string' ? JSON.parse(v) : v;
@@ -7830,16 +7839,17 @@ function populateBookingFieldsFromState() {
     const aliasInput = document.getElementById('conf-booking-alias');
     if (aliasInput) aliasInput.value = state.bookingConfig.alias || '';
 
-    // Update Default Hours (Checkboxes)
-    const savedHours = (state.bookingConfig.availableHours || '').split(',').map(h => h.trim());
+    // [ROBUST] Default Hours (Checkboxes)
+    const DEFAULT_HOURS = '08:00,09:00,10:00,11:00,13:00,14:00,15:00,16:00';
+    const savedHours = (state.bookingConfig.availableHours || DEFAULT_HOURS).split(',').map(h => h.trim());
     document.querySelectorAll('.booking-hour-check').forEach(chk => {
-        chk.checked = savedHours.includes(chk.value);
+        chk.checked = savedHours.includes(chk.value.trim());
     });
 
     // Update Off Days (Checkboxes)
     const savedOff = (state.bookingConfig.offDays || '').split(',').map(d => d.trim());
     document.querySelectorAll('.off-day-check').forEach(chk => {
-        chk.checked = savedOff.includes(chk.value);
+        chk.checked = savedOff.includes(chk.value.trim());
     });
 
     // Update Advanced Table
@@ -7858,7 +7868,9 @@ function populateBookingFieldsFromState() {
     const holInput = document.getElementById('conf-booking-holidays');
     if (holInput) holInput.value = state.bookingConfig.customHolidays || '';
 
+    // [FIX] Ensure preview is updated
     if (typeof updateBookingLinkPreview === 'function') updateBookingLinkPreview();
+    renderIcons(); // Refresh Lucide icons in case
 }
 
 async function switchConfigTab(tabName) {
