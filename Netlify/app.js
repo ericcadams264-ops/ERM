@@ -2590,6 +2590,7 @@ async function backgroundAutoSync() {
                     });
                 });
             }
+        }
     } catch (error) {
         console.error("Background Sync Failed:", error);
 
