@@ -625,16 +625,8 @@ async function checkLicense(silent = false) {
                     if (!state.bookingConfig.alias && result.client_name) {
                         state.bookingConfig.alias = result.client_name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
                     }
-
                     saveData(); // Persist to IndexedDB
                 }
-            }
-
-            // Expose globally to fix underscore/camelCase mismatch
-            window.check_license = checkLicense;
-            
-            // FORCE UI REFRESH IF IN CONFIG
-            if (state.currentView === 'config') renderConfigView();
 
                 // SYNC ARCHIVES
                 if (result.archives) {
@@ -644,6 +636,13 @@ async function checkLicense(silent = false) {
 
                 updateLicenseCountdown();
                 result.sheet_id = result.sheet_id || localStorage.getItem('erm_sheet_id'); // Fallback
+
+                // Expose globally to fix underscore/camelCase mismatch
+                window.check_license = checkLicense;
+                
+                // FORCE UI REFRESH IF IN CONFIG
+                if (state.currentView === 'config') renderConfigView();
+
                 return result; // RETURN FOR SWITCH YEAR LOGIC
             } else {
                 console.warn("License Check Failed:", result.message);
