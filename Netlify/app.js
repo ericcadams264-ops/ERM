@@ -2504,8 +2504,6 @@ async function backgroundAutoSync() {
                 if (data.users) state.users = mergeArr(state.users || [], data.users, 'users');
             }
 
-            }
-
             // Sync finished, prepare internal state
             if (!window._firstSyncDone) {
                 window._firstSyncDone = true;
@@ -2592,7 +2590,6 @@ async function backgroundAutoSync() {
                     });
                 });
             }
-        }
     } catch (error) {
         console.error("Background Sync Failed:", error);
 
