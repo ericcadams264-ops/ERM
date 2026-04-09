@@ -6851,9 +6851,9 @@ function renderConfigView(container, activeTab = 'identity') {
                                     </thead>
                                     <tbody class="divide-y divide-slate-200">
                                         ${['Mingu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((dayName, idx) => {
-        const dayCfg = (state.bookingConfig.dayConfig && state.bookingConfig.dayConfig[idx]) || { active: null, hours: '', slots: 1 };
+        const dayCfg = (state.bookingConfig.dayConfig && (state.bookingConfig.dayConfig[idx] || state.bookingConfig.dayConfig[String(idx)])) || { active: true, hours: '', slots: 1 };
         const isActive = dayCfg.active === false ? '' : 'checked';
-        const hours = dayCfg.hours || '';
+        const hours = (dayCfg.hours || '').split(',').map(h => h.trim()).filter(h => h).join(', ');
         const slots = dayCfg.slots || 1;
         return `
                                         <tr class="bg-white hover:bg-slate-50 transition-colors">
@@ -7863,9 +7863,12 @@ function populateBookingFieldsFromState() {
         chk.checked = savedOff.includes(chk.value.trim());
     });
 
-    // Update Advanced Table
+    // [FIXED] Update Advanced Table - Support both string and number keys
     for (let i = 0; i < 7; i++) {
-        const dayCfg = (state.bookingConfig.dayConfig && state.bookingConfig.dayConfig[i]) || { active: null, hours: '', slots: 1 };
+        // Try to get data with both number i and string i
+        const dayCfg = (state.bookingConfig.dayConfig && (state.bookingConfig.dayConfig[i] || state.bookingConfig.dayConfig[String(i)])) 
+                       || { active: true, hours: '', slots: 1 };
+                       
         const chk = document.getElementById(`adv-day-active-${i}`);
         const hrs = document.getElementById(`adv-day-hours-${i}`);
         const slt = document.getElementById(`adv-day-slots-${i}`);
@@ -7873,7 +7876,8 @@ function populateBookingFieldsFromState() {
         if (chk) chk.checked = dayCfg.active !== false;
         if (hrs) {
             // Clean up potentially messy space-separated hours from Master Sheet
-            const cleanedHrs = (dayCfg.hours || '').split(',').map(h => h.trim()).filter(h => h).join(', ');
+            const raw = dayCfg.hours || '';
+            const cleanedHrs = raw.split(',').map(h => h.trim()).filter(h => h).join(', ');
             hrs.value = cleanedHrs;
         }
         if (slt) slt.value = dayCfg.slots || 1;
