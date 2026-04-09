@@ -270,11 +270,25 @@ function doGet(e) {
                 }
             }
 
-            let slotsPerTime = 1;
+            // Normalize selectedDate for comparison (Support both yyyy-MM-dd and dd/MM/yyyy)
+            const normalizeDateStr = (s) => {
+                if (!s) return "";
+                s = String(s).trim();
+                // If dd/MM/yyyy
+                if (s.includes("/")) {
+                    let parts = s.split("/");
+                    if (parts.length === 3) {
+                        // Check if year is first or last
+                        if (parts[0].length === 4) return `${parts[0]}-${parts[1].padStart(2, '0')}-${parts[2].padStart(2, '0')}`;
+                        if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+                    }
+                }
+                return s;
+            };
 
-            // Day Mapping: 0=Sun, 1=Mon, ..., 6=Sat
-            const dateParts = (selectedDate || "").split('-');
-            const reqDate = selectedDate ? new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0) : null;
+            const targetDate = normalizeDateStr(selectedDate);
+            const dateParts = targetDate.split('-');
+            const reqDate = dateParts.length === 3 ? new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0) : null;
             const dayIdx = reqDate ? String(reqDate.getDay()) : null;
 
             // ADVANCED CONFIG (day_config)
@@ -335,18 +349,6 @@ function doGet(e) {
                         const colDate = findColumnIndex(apptHeaders, ['date', 'tanggal']);
                         const colTime = findColumnIndex(apptHeaders, ['time', 'jam', 'waktu']);
                         const colAppStatus = findColumnIndex(apptHeaders, ['status']);
-
-                        // Normalize selectedDate for comparison (Support both yyyy-MM-dd and dd/MM/yyyy)
-                        const normalizeDateStr = (s) => {
-                            if (!s) return "";
-                            if (s.includes("-")) return s; // already yyyy-MM-dd
-                            if (s.includes("/")) {
-                                let parts = s.split("/");
-                                if (parts[2].length === 4) return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-                            }
-                            return s;
-                        };
-                        const targetDate = normalizeDateStr(selectedDate);
 
                         const bookedHours = [];
                         if (colDate !== -1 && colTime !== -1) {
