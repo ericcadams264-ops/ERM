@@ -25,14 +25,23 @@ function handlePublicBooking(e, data) {
         if (licSheet) {
             const currentSheetId = ss.getId();
             const licData = licSheet.getDataRange().getValues();
-            const licHeaders = licData[0].map(h => String(h).toLowerCase().replace(/\s/g,''));
-            const colSheetId = licHeaders.indexOf('sheetid');
-            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config', 'jadwal', 'advancedaturjam', 'konfigurasijam', 'slot']);
+            const licHeadersRaw = licData[0];
+            const licHeaders = licHeadersRaw.map(h => String(h).toLowerCase().replace(/[^a-zA-Z0-9]/g, ''));
+            
+            const colSheetId = findColumnIndex(licHeadersRaw, ['sheet_id', 'sheetid', 'idklinik', 'id', 'clinic_id']);
+            const colDayConfig = findColumnIndex(licHeadersRaw, ['day_config', 'aturjam', 'praktek', 'advanced_config', 'jadwal', 'advancedaturjam', 'konfigurasijam', 'slot']);
             
             let rowIdx = -1;
-            for(let i=1; i<licData.length; i++) {
-                // Match by checking if the sheet_id column contains our ID
-                if(String(licData[i][colSheetId] || "").trim().includes(currentSheetId)) { rowIdx = i; break; }
+            
+            if (colSheetId !== -1) {
+                for(let i=1; i<licData.length; i++) {
+                    const rowVal = String(licData[i][colSheetId] || "").trim();
+                    // Match if row value contains our target ID (handles full URLs too)
+                    if(rowVal && (rowVal.includes(currentSheetId) || currentSheetId.includes(rowVal))) { 
+                        rowIdx = i; 
+                        break; 
+                    }
+                }
             }
             
             if (rowIdx !== -1 && colDayConfig !== -1) {
