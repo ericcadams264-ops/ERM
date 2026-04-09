@@ -680,7 +680,6 @@ async function checkLicense(silent = false) {
                     }
                     
                     await saveData(); 
-                }
 
                 // SYNC ARCHIVES
                 if (result.archives) {
