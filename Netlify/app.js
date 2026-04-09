@@ -551,19 +551,19 @@ async function checkLicense(silent = false) {
         state.scriptUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
         state.sheetId = state.sheetId || localStorage.getItem('erm_sheet_id') || getSheetIdFromUrl(state.scriptUrl);
         
-        // [FIX] Only overwrite state if value actually exists in localStorage
+        // [FIX] Robust Hydration: Match even empty strings, only skip if NULL
         const lAlias = localStorage.getItem('erm_booking_alias');
         const lHours = localStorage.getItem('erm_booking_hours');
         const lOff = localStorage.getItem('erm_booking_off_days');
         const lHol = localStorage.getItem('erm_booking_holidays');
         const lDayCfg = localStorage.getItem('erm_booking_day_config');
 
-        if (lAlias) state.bookingConfig.alias = lAlias;
-        if (lHours) state.bookingConfig.availableHours = lHours;
-        if (lOff) state.bookingConfig.offDays = lOff;
-        if (lHol) state.bookingConfig.customHolidays = lHol;
+        if (lAlias !== null) state.bookingConfig.alias = lAlias;
+        if (lHours !== null) state.bookingConfig.availableHours = lHours;
+        if (lOff !== null) state.bookingConfig.offDays = lOff;
+        if (lHol !== null) state.bookingConfig.customHolidays = lHol;
         
-        if (lDayCfg) {
+        if (lDayCfg !== null) {
             try { state.bookingConfig.dayConfig = JSON.parse(lDayCfg); } catch(e) {}
         }
         
@@ -6818,14 +6818,18 @@ function renderConfigView(container, activeTab = 'identity') {
                         <div>
                             <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Jam Buka Default (Cepat)</label>
                             <div class="grid grid-cols-4 gap-2">
-                                ${['06:00', '07:00', '08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00', '22:00'].map(h => {
-        const saved = state.bookingConfig.availableHours || '08:00,09:00,10:00,11:00,13:00,14:00,15:00,16:00';
-        const isChecked = saved.split(',').includes(h) ? 'checked' : '';
-        return `<label class="flex items-center gap-1.5 text-[10px] cursor-pointer hover:bg-slate-50 p-1 rounded border border-slate-100">
+                                ${(() => {
+        // [FIX] No more hardcoded fallbacks that overwrite Master data!
+        const saved = state.bookingConfig.availableHours || '';
+        const savedHours = saved.split(',').map(h => h.trim());
+        return ['06:00', '07:00', '08:00', '09:00', '10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00', '22:00'].map(h => {
+            const isChecked = savedHours.includes(h) ? 'checked' : '';
+            return `<label class="flex items-center gap-1.5 text-[10px] cursor-pointer hover:bg-slate-50 p-1 rounded border border-slate-100">
                                         <input type="checkbox" value="${h}" ${isChecked} onchange="updateBookingLinkPreview()" class="booking-hour-check w-3 h-3 accent-emerald-500">
                                         <span class="font-bold text-slate-700">${h}</span>
                                     </label>`;
-    }).join('')}
+        }).join('');
+    })()}
                             </div>
                             <p class="text-[9px] text-slate-400 mt-1 italic">Jam ini berlaku setiap hari kerja jika tidak diatur khusus di tabel bawah.</p>
                         </div>
@@ -7891,9 +7895,9 @@ async function switchConfigTab(tabName) {
     if (tabName === 'booking' || tabName === 'license') {
         if (typeof checkLicense === 'function') {
             await checkLicense();
-            // [FIX] Instead of renderApp(), just update fields if we are in config view
+            // [FORCE RE-RENDER] After Master sync, we MUST refresh the UI content
             if (state.currentView === 'config') {
-                populateBookingFieldsFromState(); 
+                renderConfigView(document.getElementById('main-content'), tabName);
             }
         }
     }
