@@ -11291,7 +11291,8 @@ function renderPackageTable() {
                     <td class="px-6 py-4 text-right font-bold text-emerald-600">${formatRp(perSession)}</td>
                     <td class="px-6 py-4 text-center">
                         <div class="flex items-center justify-center gap-2">
-                            <button onclick="openPackageModal('${p.id}')" class="text-blue-500 hover:text-blue-700 p-1.5 rounded-lg hover:bg-blue-50 transition-all"><i data-lucide="edit-3" width="16"></i></button>
+                            <button onclick="openPackageModal('${p.id}')" class="text-blue-500 hover:text-blue-700 p-1.5 rounded-lg hover:bg-blue-50 transition-all" title="Edit Paket"><i data-lucide="edit-3" width="16"></i></button>
+                            <button onclick="deletePackage('${p.id}')" class="text-red-500 hover:text-red-700 p-1.5 rounded-lg hover:bg-red-50 transition-all" title="Hapus Paket"><i data-lucide="trash-2" width="16"></i></button>
                         </div>
                     </td>
                 </tr>`;
@@ -11430,7 +11431,8 @@ function renderTreatmentTable() {
                     <td class="px-6 py-4 text-right font-black text-emerald-600">${formatRp(t.price)}</td>
                     <td class="px-6 py-4 text-center">
                         <div class="flex items-center justify-center gap-2">
-                            <button onclick="openTreatmentModal('${t.id}')" class="text-blue-500 p-1.5 hover:bg-blue-50 rounded-lg"><i data-lucide="edit-3" width="14"></i></button>
+                            <button onclick="openTreatmentModal('${t.id}')" class="text-blue-500 p-1.5 hover:bg-blue-50 rounded-lg" title="Edit Tindakan"><i data-lucide="edit-3" width="14"></i></button>
+                            <button onclick="deleteTreatment('${t.id}')" class="text-red-500 p-1.5 hover:bg-red-50 rounded-lg" title="Hapus Tindakan"><i data-lucide="trash-2" width="14"></i></button>
                         </div>
                     </td>
                 </tr>`).join('')}
