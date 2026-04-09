@@ -610,9 +610,10 @@ async function checkLicense(silent = false) {
                     }
                 }
 
-                // SYNC BOOKING CONFIG FROM MASTER
-                if (result.alias || result.available_hours) {
-                    if (result.alias) state.bookingConfig.alias = result.alias;
+                    if (result.alias) {
+                        state.bookingConfig.alias = result.alias;
+                        localStorage.setItem('erm_booking_alias', result.alias);
+                    }
                     state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : "";
                     if (result.off_days !== undefined) state.bookingConfig.offDays = String(result.off_days);
                     if (result.custom_holidays !== undefined) state.bookingConfig.customHolidays = String(result.custom_holidays);
@@ -625,7 +626,7 @@ async function checkLicense(silent = false) {
                     if (!state.bookingConfig.alias && result.client_name) {
                         state.bookingConfig.alias = result.client_name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
                     }
-                    saveData(); // Persist to IndexedDB
+                    await saveData(); // Persist to IndexedDB
                 }
 
                 // SYNC ARCHIVES
@@ -641,7 +642,10 @@ async function checkLicense(silent = false) {
                 window.check_license = checkLicense;
                 
                 // FORCE UI REFRESH IF IN CONFIG
-                if (state.currentView === 'config') renderConfigView();
+                if (state.currentView === 'config') {
+                    console.log("SYNC: Refreshing Config View with alias:", state.bookingConfig.alias);
+                    renderConfigView(document.getElementById('main-content'), state.activeConfigTab);
+                }
 
                 return result; // RETURN FOR SWITCH YEAR LOGIC
             } else {
