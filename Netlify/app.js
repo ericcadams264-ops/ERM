@@ -2430,15 +2430,15 @@ async function backgroundAutoSync() {
                                 if (locStr !== incStr) {
                                     localArr[idx] = inc;
                                     uiNeedsRefresh = true;
-                                    if (category === 'appointments' && inc.status === 'PENDING') hasNewBooking = true;
                                 }
                             }
                             // server lebih lama → SKIP, lokal sudah lebih baru (push sudah dilakukan di Step 1)
                         } else {
                             // Item baru dari server (misal booking dari luar)
+                            const isTrulyNew = category === 'appointments' && !state.appointments.some(a => a.id === inc.id);
                             localArr.push(inc);
                             uiNeedsRefresh = true;
-                            if (category === 'appointments' && inc.status === 'PENDING') hasNewBooking = true;
+                            if (isTrulyNew && inc.status === 'PENDING') hasNewBooking = true;
                         }
                     });
                     return localArr;
@@ -2519,11 +2519,13 @@ async function backgroundAutoSync() {
 
             // Option 1: Auto-Refresh UI for Schedule, Dashboard, or Kasir
             const currentPendingCount = (state.appointments || []).filter(a => a.status === 'PENDING').length;
+            const lastCount = parseInt(localStorage.getItem('erm_last_booking_count') || '0');
             if (uiNeedsRefresh) {
-                if (hasNewBooking || currentPendingCount > (window.lastBookingCount || 0)) {
+                if (hasNewBooking || currentPendingCount > lastCount) {
                     showSyncBanner(true);
                     updateSidebarBadges();
                 }
+                localStorage.setItem('erm_last_booking_count', String(currentPendingCount));
                 window.lastBookingCount = currentPendingCount;
                 if (!hasNewBooking && !showSyncBanner && isSafeToRefresh()) {
                     // SILENT AUTO-REFRESH for generic data: 

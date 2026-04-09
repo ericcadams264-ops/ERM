@@ -270,7 +270,6 @@ function doGet(e) {
                 }
             }
 
-            const defaultHours = ['08:00','09:00','10:00','11:00','12:00','13:00','14:00','15:00','16:00','17:00','18:00','19:00','20:00','21:00','22:00'];
             let slotsPerTime = 1;
 
             // Day Mapping: 0=Sun, 1=Mon, ..., 6=Sat
@@ -282,7 +281,8 @@ function doGet(e) {
             let dayConfig = {};
             if (colDayConfig !== -1 && row[colDayConfig]) {
                 try {
-                    dayConfig = JSON.parse(row[colDayConfig]);
+                    let rawCfg = row[colDayConfig];
+                    dayConfig = typeof rawCfg === 'string' ? JSON.parse(rawCfg) : rawCfg;
                 } catch(e) { Logger.log("Error parsing dayConfig: " + e); }
             }
 
@@ -297,7 +297,7 @@ function doGet(e) {
                     // Fallback to globalHours ONLY if configItem.hours is empty/missing
                     hoursRaw = (configItem.hours && String(configItem.hours).trim() !== "") ? String(configItem.hours) : globalHours;
                     slotsPerTime = Number(configItem.slots) || 1;
-                    Logger.log("DEBUG: Using Day Config for day " + dayIdx + ": " + hoursRaw);
+                    Logger.log("DEBUG: Using Day Config for index " + dayIdx + " (Slots: " + slotsPerTime + ")");
                 } else {
                     hoursRaw = globalHours;
                 }
@@ -305,7 +305,12 @@ function doGet(e) {
                 hoursRaw = globalHours;
             }
 
-            let hours = hoursRaw ? hoursRaw.split(/[,\s;]+/).map(h => normalizeTime(h)).filter(h => h) : defaultHours.map(h => normalizeTime(h));
+            // CLEANUP hoursRaw: Remove any weird characters like ,: that might come from typos
+            if (hoursRaw) {
+                hoursRaw = hoursRaw.replace(/[^0-9,\s:;.-]/g, ''); // Keep numbers, colons, and delimiters
+            }
+
+            let hours = hoursRaw ? hoursRaw.split(/[,\s;]+/).map(h => normalizeTime(h)).filter(h => h && h.length >= 4) : [];
             let sheetId = colSheetId !== -1 ? String(row[colSheetId] || "").trim() : '';
             
             // Robust ID extraction if stored as URL
