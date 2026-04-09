@@ -555,6 +555,7 @@ async function checkLicense(silent = false) {
         state.bookingConfig.alias = localStorage.getItem('erm_booking_alias') || "";
         state.bookingConfig.availableHours = localStorage.getItem('erm_booking_hours') || "";
         state.bookingConfig.offDays = localStorage.getItem('erm_booking_off_days') || "";
+        state.bookingConfig.customHolidays = localStorage.getItem('erm_booking_holidays') || "";
         
         const dayCfgStr = localStorage.getItem('erm_booking_day_config');
         if (dayCfgStr) {
@@ -7823,6 +7824,44 @@ async function testTelegramConnection() {
     }
 }
 
+/**
+ * Surgically updates booking config fields in the DOM without a full re-render.
+ */
+function populateBookingFieldsFromState() {
+    const aliasInput = document.getElementById('conf-booking-alias');
+    if (aliasInput) aliasInput.value = state.bookingConfig.alias || '';
+
+    // Update Default Hours (Checkboxes)
+    const savedHours = (state.bookingConfig.availableHours || '').split(',').map(h => h.trim());
+    document.querySelectorAll('.booking-hour-check').forEach(chk => {
+        chk.checked = savedHours.includes(chk.value);
+    });
+
+    // Update Off Days (Checkboxes)
+    const savedOff = (state.bookingConfig.offDays || '').split(',').map(d => d.trim());
+    document.querySelectorAll('.off-day-check').forEach(chk => {
+        chk.checked = savedOff.includes(chk.value);
+    });
+
+    // Update Advanced Table
+    for (let i = 0; i < 7; i++) {
+        const dayCfg = (state.bookingConfig.dayConfig && state.bookingConfig.dayConfig[i]) || { active: null, hours: '', slots: 1 };
+        const chk = document.getElementById(`adv-day-active-${i}`);
+        const hrs = document.getElementById(`adv-day-hours-${i}`);
+        const slt = document.getElementById(`adv-day-slots-${i}`);
+        
+        if (chk) chk.checked = dayCfg.active !== false;
+        if (hrs) hrs.value = dayCfg.hours || '';
+        if (slt) slt.value = dayCfg.slots || 1;
+    }
+    
+    // Update Holidays
+    const holInput = document.getElementById('conf-booking-holidays');
+    if (holInput) holInput.value = state.bookingConfig.customHolidays || '';
+
+    if (typeof updateBookingLinkPreview === 'function') updateBookingLinkPreview();
+}
+
 async function switchConfigTab(tabName) {
     state.activeConfigTab = tabName;
     
@@ -7830,7 +7869,10 @@ async function switchConfigTab(tabName) {
     if (tabName === 'booking' || tabName === 'license') {
         if (typeof checkLicense === 'function') {
             await checkLicense();
-            if (state.currentView === 'config') renderApp();
+            // [FIX] Instead of renderApp(), just update fields if we are in config view
+            if (state.currentView === 'config') {
+                populateBookingFieldsFromState(); 
+            }
         }
     }
 
