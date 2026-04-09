@@ -676,21 +676,26 @@ async function checkLicense(silent = false) {
                     
                     if (bDayCfg) {
                         try {
-                            // [BULLETPROOF] Sanitize string before parsing
+                            // [ULTRA-ROBUST] Sanitize and catch ANY JSON anomaly
                             let cleanJson = typeof bDayCfg === 'string' ? bDayCfg.trim() : JSON.stringify(bDayCfg);
-                            // Handle cases where Excel might have double-escaped or added weird quotes
-                            if (cleanJson.startsWith('"') && cleanJson.endsWith('"') && cleanJson.length > 2) {
+                            
+                            // Handle potential Excel/Sheets double-stringification
+                            if (cleanJson.startsWith('"') && cleanJson.endsWith('"')) {
                                 cleanJson = cleanJson.substring(1, cleanJson.length - 1).replace(/\\"/g, '"');
                             }
+                            
+                            // Handle single quote JSON (sometimes happens in messy sheets)
+                            if (cleanJson.includes("'") && !cleanJson.includes('"')) {
+                                cleanJson = cleanJson.replace(/'/g, '"');
+                            }
+
                             const parsed = JSON.parse(cleanJson);
                             state.bookingConfig.dayConfig = parsed;
                             localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
                         } catch (e) { 
-                            console.error("DayConfig Parse Error from Master:", e); 
-                            // Try one last attempt at raw assignment if it's already an object
+                            console.error("DayConfig Ultimate Parse Error:", e);
                             if (typeof bDayCfg === 'object' && bDayCfg !== null) {
                                 state.bookingConfig.dayConfig = bDayCfg;
-                                localStorage.setItem('erm_booking_day_config', JSON.stringify(bDayCfg));
                             }
                         }
                     }
