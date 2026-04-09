@@ -247,10 +247,7 @@ function doGet(e) {
                     const dateParts = selectedDate.split('-');
                     // Create date at noon to avoid edge-case shifts
                     const reqDate = new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0); 
-                    const dayOfWeek = Utilities.formatDate(reqDate, TIMEZONE, "e"); // 1 (Sun), 2 (Mon) ... 7 (Sat)
-                    
-                    // Convert to 0-6 (0=Sun, 1=Mon, etc) to match frontend checkboxes
-                    const currentDay = String(Number(dayOfWeek) - 1); 
+                    const currentDay = String(reqDate.getDay()); 
                     
                     if (offDays.includes(currentDay)) {
                         return createJSONOutput({ status: 'closed', message: 'Maaf, klinik libur di hari ini.' });
