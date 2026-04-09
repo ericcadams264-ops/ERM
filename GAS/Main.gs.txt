@@ -290,12 +290,17 @@ function doGet(e) {
             let hoursRaw = "";
             let globalHours = (colHours !== -1 && (row[colHours] === 0 || row[colHours])) ? String(row[colHours]).trim() : "";
             
-            if (dayIdx !== null && dayConfig[dayIdx]) {
-                const configItem = dayConfig[dayIdx];
-                if (configItem.active === false) return createJSONOutput({ status: 'closed', message: 'Maaf, klinik libur di hari ini.' });
-                // Fallback to globalHours ONLY if configItem.hours is empty/missing
-                hoursRaw = (configItem.hours && configItem.hours.trim() !== "") ? configItem.hours : globalHours;
-                slotsPerTime = configItem.slots || 1;
+            if (dayIdx !== null) {
+                const configItem = dayConfig[String(dayIdx)] || dayConfig[Number(dayIdx)];
+                if (configItem) {
+                    if (configItem.active === false) return createJSONOutput({ status: 'closed', message: 'Maaf, klinik libur di hari ini.' });
+                    // Fallback to globalHours ONLY if configItem.hours is empty/missing
+                    hoursRaw = (configItem.hours && String(configItem.hours).trim() !== "") ? String(configItem.hours) : globalHours;
+                    slotsPerTime = Number(configItem.slots) || 1;
+                    Logger.log("DEBUG: Using Day Config for day " + dayIdx + ": " + hoursRaw);
+                } else {
+                    hoursRaw = globalHours;
+                }
             } else {
                 hoursRaw = globalHours;
             }
