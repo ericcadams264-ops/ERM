@@ -219,20 +219,24 @@ function calculateAge(dob) {
 }
 
 // [NEW] Robust guard to prevent disruptive UI resets during background sync
+/**
+ * Robust guard to prevent disruptive UI resets during background sync
+ */
 function isSafeToRefresh() {
     // 1. Don't refresh if any modal is open
     const modal = document.getElementById('modal-container');
     if (modal && !modal.classList.contains('hidden')) return false;
+    if (document.querySelector('.modal-open')) return false;
 
-    // 2. Don't refresh if user is in a view that has active input fields
-    const sensitiveViews = ['assessment_form', 'config', 'patient_form'];
+    // 2. Don't refresh if user is typing or if there are active input fields
+    if (document.activeElement && (
+        ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName) ||
+        document.activeElement.isContentEditable
+    )) return false;
+
+    // 3. Don't refresh if user is in a view that has active input fields
+    const sensitiveViews = ['assessment_form', 'kasir', 'patient_form'];
     if (sensitiveViews.includes(state.currentView)) return false;
-
-    // 3. Don't refresh if the user is currently typing in any input or textarea
-    const activeEl = document.activeElement;
-    if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
-        return false;
-    }
 
     return true;
 }
@@ -2500,33 +2504,12 @@ async function backgroundAutoSync() {
                 if (data.users) state.users = mergeArr(state.users || [], data.users, 'users');
             }
 
-            // After any successful data fetch (Full or Delta)
-            if (!window._firstSyncDone) {
-                window._firstSyncDone = true;
-                if (isSafeToRefresh()) renderApp(); // Re-render to hide loading if necessary
             }
 
-            // Sync Config if available
-            if (data.config && Array.isArray(data.config)) {
-                data.config.forEach(c => {
-                    if (c.key === 'CLINIC_NAME') state.clinicInfo.name = c.value;
-                    if (c.key === 'CLINIC_SUBNAME') state.clinicInfo.subname = c.value;
-                    if (c.key === 'CLINIC_THERAPIST') state.clinicInfo.therapist = c.value;
-                    if (c.key === 'CLINIC_SIPF') state.clinicInfo.sipf = c.value;
-                    if (c.key === 'CLINIC_ADDRESS') state.clinicInfo.address = c.value;
-                    if (c.key === 'CLINIC_NPWP') state.clinicInfo.npwp = c.value;
-                    if (c.key === 'CLINIC_PHONE') state.clinicInfo.phone = c.value;
-                    if (c.key === 'TELEGRAM_TOKEN') state.notificationConfig.telegramToken = c.value;
-                    if (c.key === 'TELEGRAM_CHAT_ID') state.notificationConfig.telegramChatId = c.value;
-                    if (c.key === 'EMAIL_RECEIVER') state.notificationConfig.targetEmail = c.value;
-                    if (c.key === 'EMAIL_SENDER') state.notificationConfig.senderEmail = c.value;
-                    if (c.key === 'MSG_CONFIRM_TEMPLATE') state.notificationConfig.msgConfirm = c.value;
-                    if (c.key === 'MSG_REJECT_TEMPLATE') state.notificationConfig.msgReject = c.value;
-                    if (c.key === 'MSG_REMINDER_TEMPLATE') state.notificationConfig.msgReminder = c.value;
-                });
-                localStorage.setItem('erm_clinic_config', JSON.stringify(state.clinicInfo));
-                localStorage.setItem('erm_notif_config', JSON.stringify(state.notificationConfig));
-                applyBranding();
+            // Sync finished, prepare internal state
+            if (!window._firstSyncDone) {
+                window._firstSyncDone = true;
+                if (isSafeToRefresh()) renderApp(); 
             }
 
             // Apply Hard Limit for Local Storage (Max 2000 per table)
@@ -2573,18 +2556,15 @@ async function backgroundAutoSync() {
                 }
                 localStorage.setItem('erm_last_booking_count', String(currentPendingCount));
                 window.lastBookingCount = currentPendingCount;
-                if (!hasNewBooking && !showSyncBanner && isSafeToRefresh()) {
-                    // SILENT AUTO-REFRESH for generic data: 
-                    // Only if no modal is open and not in config view (to avoid resetting input fields)
-                    if (isSafeToRefresh()) {
-                        console.log("Silent Auto-Refresh (Optimized)...");
-                        // We use a flag to tell renderApp not to use fade-in animations for background refreshes
-                        window._isBackgroundRefresh = true;
-                        document.body.classList.add('is-bg-refresh');
-                        renderApp();
-                        document.body.classList.remove('is-bg-refresh');
-                        window._isBackgroundRefresh = false;
-                    }
+
+                // SILENT AUTO-REFRESH for generic data: 
+                if (isSafeToRefresh()) {
+                    console.log("Silent Auto-Refresh (Optimized)...");
+                    window._isBackgroundRefresh = true;
+                    document.body.classList.add('is-bg-refresh');
+                    renderApp();
+                    document.body.classList.remove('is-bg-refresh');
+                    window._isBackgroundRefresh = false;
                 }
             }
 
@@ -3331,29 +3311,10 @@ window.addEventListener('resize', () => {
  * Check if it is safe to perform background sync OR auto-refresh UI.
  * Prevents disruptive changes while the user is actively filling forms or focusing on inputs.
  */
-function isSafeToRefresh() {
-    // 1. Check for open modals (Assessments, Global Modals, etc.)
-    const modal = document.getElementById('modal-container');
-    const isModalVisible = modal && !modal.classList.contains('hidden');
-    if (document.querySelector('.modal-open') || isModalVisible) return false;
+// Re-declared to allow future extensions, currently points to the robust shared function
+const isSafeToRefreshOLD = isSafeToRefresh; // Placeholder if needed
 
-    // 2. Check for active form views (config is NOT included - users can save from config freely)
-    const sensitiveViews = ['assessment_form', 'kasir', 'patient_form'];
-    if (sensitiveViews.includes(state.currentView)) return false;
-
-    // 3. Check for active focus (User is typing)
-    if (document.activeElement && (
-        document.activeElement.tagName === 'INPUT' ||
-        document.activeElement.tagName === 'TEXTAREA' ||
-        document.activeElement.isContentEditable
-    )) {
-        return false;
-    }
-
-    return true;
-}
-
-// Alias for clarity in sync logic
+// Safe Re-refresh Logic consolidated at the start of the file. 
 const isSafeToAutoSync = isSafeToRefresh;
 
 // --- 6. RENDER APP ---
