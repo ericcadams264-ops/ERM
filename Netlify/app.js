@@ -380,12 +380,28 @@ async function loadData() {
                 state.clinicInfo = globalCfg.info || state.clinicInfo;
                 state.pdfConfig = { ...state.pdfConfig, ...(globalCfg.pdf || {}) };
                 state.notificationConfig = { ...state.notificationConfig, ...(globalCfg.notif || {}) };
-                state.bookingConfig = { ...state.bookingConfig, ...(globalCfg.booking || {}) };
-                if (globalCfg.booking) {
-                    localStorage.setItem('erm_booking_alias', globalCfg.booking.alias || '');
-                    localStorage.setItem('erm_booking_hours', globalCfg.booking.availableHours || '');
-                    localStorage.setItem('erm_booking_off_days', globalCfg.booking.offDays || '');
+                // [FIX] Robust Booking Config Hydration
+                state.bookingConfig = { 
+                    ...state.bookingConfig, 
+                    ...(globalCfg.booking || {}),
+                    // Use localStorage as the most reliable immediate fallback
+                    alias: globalCfg.booking?.alias || localStorage.getItem('erm_booking_alias') || state.bookingConfig.alias,
+                    availableHours: globalCfg.booking?.availableHours || localStorage.getItem('erm_booking_hours') || state.bookingConfig.availableHours,
+                    offDays: globalCfg.booking?.offDays || localStorage.getItem('erm_booking_off_days') || state.bookingConfig.offDays,
+                    customHolidays: globalCfg.booking?.customHolidays || localStorage.getItem('erm_booking_holidays') || state.bookingConfig.customHolidays
+                };
+                
+                // Hydrate dayConfig separately to ensure deep merge
+                const dayCfgStore = globalCfg.booking?.dayConfig || localStorage.getItem('erm_booking_day_config');
+                if (dayCfgStore) {
+                  try {
+                    state.bookingConfig.dayConfig = typeof dayCfgStore === 'string' ? JSON.parse(dayCfgStore) : dayCfgStore;
+                  } catch(e) {}
                 }
+
+                if (state.bookingConfig.alias) localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
+                if (state.bookingConfig.availableHours) localStorage.setItem('erm_booking_hours', state.bookingConfig.availableHours);
+                if (state.bookingConfig.offDays) localStorage.setItem('erm_booking_off_days', state.bookingConfig.offDays);
             }
 
             const deleteLog = configs.find(c => c.id === 'deleted_logs');
@@ -534,6 +550,17 @@ async function checkLicense(silent = false) {
         // Ensure state is populated for immediate background sync
         state.scriptUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
         state.sheetId = state.sheetId || localStorage.getItem('erm_sheet_id') || getSheetIdFromUrl(state.scriptUrl);
+        
+        // [FIX] Ensure booking config is loaded from storage during cache hit
+        state.bookingConfig.alias = localStorage.getItem('erm_booking_alias') || "";
+        state.bookingConfig.availableHours = localStorage.getItem('erm_booking_hours') || "";
+        state.bookingConfig.offDays = localStorage.getItem('erm_booking_off_days') || "";
+        
+        const dayCfgStr = localStorage.getItem('erm_booking_day_config');
+        if (dayCfgStr) {
+            try { state.bookingConfig.dayConfig = JSON.parse(dayCfgStr); } catch(e) {}
+        }
+        
         return { valid: true };
     }
 
@@ -616,21 +643,33 @@ async function checkLicense(silent = false) {
                 }
 
                 // SYNC BOOKING CONFIG FROM MASTER
-                if (result.alias || result.available_hours) {
+                if (result.alias || result.available_hours || result.day_config) {
                     if (result.alias) {
                         state.bookingConfig.alias = result.alias;
                         localStorage.setItem('erm_booking_alias', result.alias);
                     }
                     
-                    state.bookingConfig.availableHours = (result.available_hours === 0 || result.available_hours) ? String(result.available_hours) : (state.bookingConfig.availableHours || "");
-                    if (result.off_days !== undefined) state.bookingConfig.offDays = String(result.off_days);
-                    if (result.custom_holidays !== undefined) state.bookingConfig.customHolidays = String(result.custom_holidays);
+                    if (result.available_hours !== undefined) {
+                      state.bookingConfig.availableHours = String(result.available_hours);
+                      localStorage.setItem('erm_booking_hours', String(result.available_hours));
+                    }
+                    if (result.off_days !== undefined) {
+                      state.bookingConfig.offDays = String(result.off_days);
+                      localStorage.setItem('erm_booking_off_days', String(result.off_days));
+                    }
+                    if (result.custom_holidays !== undefined) {
+                      state.bookingConfig.customHolidays = String(result.custom_holidays);
+                      localStorage.setItem('erm_booking_holidays', String(result.custom_holidays));
+                    }
                     
                     if (result.day_config) {
                         try {
-                            state.bookingConfig.dayConfig = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                            const parsed = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                            state.bookingConfig.dayConfig = parsed;
+                            localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
                         } catch (e) { console.error("DayConfig Parse Error", e); }
                     }
+                }
 
                     // FALLBACK DARURAT: Jika alias benar-benar kosong dari server, buat dari Nama Klinik
                     if (!state.bookingConfig.alias || state.bookingConfig.alias === "") {
@@ -2401,16 +2440,30 @@ async function backgroundAutoSync() {
                     if (k === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = v;
 
                     // Booking & Slot Configuration
-                    if (k === 'BOOKING_ALIAS') state.bookingConfig.alias = v;
-                    if (k === 'BOOKING_HOURS') state.bookingConfig.availableHours = v;
-                    if (k === 'BOOKING_OFFDAYS') state.bookingConfig.offDays = v;
-                    if (k === 'BOOKING_HOLIDAYS') state.bookingConfig.customHolidays = v;
+                    if (k === 'BOOKING_ALIAS') {
+                      state.bookingConfig.alias = v;
+                      localStorage.setItem('erm_booking_alias', v);
+                    }
+                    if (k === 'BOOKING_HOURS') {
+                      state.bookingConfig.availableHours = v;
+                      localStorage.setItem('erm_booking_hours', v);
+                    }
+                    if (k === 'BOOKING_OFFDAYS') {
+                      state.bookingConfig.offDays = v;
+                      localStorage.setItem('erm_booking_off_days', v);
+                    }
+                    if (k === 'BOOKING_HOLIDAYS') {
+                      state.bookingConfig.customHolidays = v;
+                      localStorage.setItem('erm_booking_holidays', v);
+                    }
                     
                     // Support for Day Config Aliases
                     const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(k);
                     if (isDayConfig && v) {
                         try {
-                            state.bookingConfig.dayConfig = typeof v === 'string' ? JSON.parse(v) : v;
+                            const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+                            state.bookingConfig.dayConfig = parsed;
+                            localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
                         } catch (e) { }
                     }
 
@@ -7775,7 +7828,10 @@ async function switchConfigTab(tabName) {
     
     // [AUTO-SYNC] Tarik data Master terbaru saat buka tab booking/license
     if (tabName === 'booking' || tabName === 'license') {
-        if (typeof checkLicense === 'function') await checkLicense();
+        if (typeof checkLicense === 'function') {
+            await checkLicense();
+            if (state.currentView === 'config') renderApp();
+        }
     }
 
     document.querySelectorAll('.config-tab-content').forEach(el => el.classList.add('hidden'));
