@@ -9,7 +9,7 @@ if (typeof window.IMG_ASSETS === 'undefined') {
 
 // --- 1. STATE & GLOBAL VARIABLES ---
 let state = {
-    _version: '5.5',
+    _version: '5.5.1',
     user: null,
     users: [],
     patients: [],
@@ -6577,7 +6577,13 @@ function renderConfigView(container, activeTab = 'identity') {
     container.innerHTML = `
     <div class="fade-in pb-32">
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mb-6">
-            <div class="p-6 border-b border-slate-100"><h2 class="text-2xl font-black text-slate-800">Konfigurasi Sistem</h2><p class="text-slate-500 text-sm">Atur identitas klinik dan tampilan hasil cetak.</p></div>
+            <div class="p-6 border-b border-slate-100 flex justify-between items-center">
+                <div>
+                    <h2 class="text-2xl font-black text-slate-800">Konfigurasi Sistem</h2>
+                    <p class="text-slate-500 text-sm">Atur identitas klinik dan tampilan hasil cetak.</p>
+                </div>
+                <div class="bg-slate-100 text-slate-400 text-[10px] font-mono px-2 py-1 rounded">v${state._version}</div>
+            </div>
             <div class="flex bg-slate-50 overflow-x-auto pb-1">
                 <button onclick="switchConfigTab('identity')" id="tab-btn-identity" class="px-6 py-3 text-sm font-bold text-blue-600 border-b-2 border-blue-600 bg-white transition-colors flex items-center gap-2"><i data-lucide="building-2" width="16"></i> Identitas Klinik</button>
                 <button onclick="switchConfigTab('print')" id="tab-btn-print" class="px-6 py-3 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 transition-colors flex items-center gap-2"><i data-lucide="printer" width="16"></i> Layout Cetak (PDF)</button>
