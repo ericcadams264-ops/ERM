@@ -8878,11 +8878,22 @@ function selectICFWithQualifier(key, item, qualifier, idx) {
     // Get current items as array
     let currentLines = input.value.split('\n').filter(l => l.trim() !== '');
 
-    // Check if item (without qualifier) already exists, if so update it
+    // Check if item (without qualifier) already exists
     const existingIdx = currentLines.findIndex(l => l.includes(item));
+    
+    let isRemoving = false;
+
     if (existingIdx !== -1) {
-        currentLines[existingIdx] = fullText;
+        // [TOGGLE LOGIC] If same qualifier clicked again -> REMOVE
+        if (currentLines[existingIdx] === fullText) {
+            currentLines.splice(existingIdx, 1);
+            isRemoving = true;
+        } else {
+            // Different qualifier -> UPDATE
+            currentLines[existingIdx] = fullText;
+        }
     } else {
+        // New item -> ADD
         currentLines.push(fullText);
     }
 
@@ -8892,20 +8903,31 @@ function selectICFWithQualifier(key, item, qualifier, idx) {
 
     // Visual feedback in modal
     const group = document.getElementById(`qualifier-group-${idx}`);
-    const btns = group.querySelectorAll('button');
-    btns.forEach(b => {
-        b.classList.remove('bg-indigo-600', 'text-white', 'border-indigo-600');
-        if (b.innerText === qualifier) {
-            b.classList.add('bg-indigo-600', 'text-white', 'border-indigo-600');
-        }
-    });
+    // Handle both local recommendations and global search results IDs
+    const currentGroup = group || document.querySelector(`#qualifier-group-global-${idx.replace('global-','')}`);
+    
+    if (currentGroup) {
+        const btns = currentGroup.querySelectorAll('button');
+        btns.forEach(b => {
+            b.classList.remove('bg-indigo-600', 'text-white', 'border-indigo-600', 'shadow-lg', 'shadow-indigo-200');
+            if (!isRemoving && b.innerText === qualifier) {
+                b.classList.add('bg-indigo-600', 'text-white', 'border-indigo-600', 'shadow-lg', 'shadow-indigo-200');
+            }
+        });
+    }
 
     const descArea = document.getElementById(`desc-qualifier-${idx}`);
-    descArea.classList.remove('hidden');
-    descArea.innerHTML = `<i data-lucide="check-circle" width="12" class="inline mb-0.5"></i> <b>TERPILIH:</b> ${qData.label} (${qData.desc})`;
-    lucide.createIcons();
-
-    showToast(`Ditambahkan: ${item} (${qualifier})`, 'success');
+    if (descArea) {
+        if (isRemoving) {
+            descArea.classList.add('hidden');
+            showToast(`Dihapus: ${item}`, 'info');
+        } else {
+            descArea.classList.remove('hidden');
+            descArea.innerHTML = `<i data-lucide="check-circle" width="12" class="inline mb-0.5"></i> <b>TERPILIH:</b> ${qData.label} (${qData.desc})`;
+            lucide.createIcons();
+            showToast(`Ditambahkan: ${item} (.${qualifier})`, 'success');
+        }
+    }
 }
 
 let flattenedICF = null;
