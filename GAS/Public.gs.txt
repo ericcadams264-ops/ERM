@@ -27,7 +27,7 @@ function handlePublicBooking(e, data) {
             const licData = licSheet.getDataRange().getValues();
             const licHeaders = licData[0].map(h => String(h).toLowerCase().replace(/\s/g,''));
             const colSheetId = licHeaders.indexOf('sheetid');
-            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config']);
+            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config', 'jadwal']);
             
             let rowIdx = -1;
             for(let i=1; i<licData.length; i++) {
@@ -37,10 +37,14 @@ function handlePublicBooking(e, data) {
             if (rowIdx !== -1 && colDayConfig !== -1) {
                 const rawCfg = licData[rowIdx][colDayConfig];
                 const dayConfig = typeof rawCfg === 'string' ? JSON.parse(rawCfg) : rawCfg;
-                const d = new Date(data.date);
+                
+                // [FIX] Robust Date Parsing
+                const dateParts = data.date.split('-');
+                const d = new Date(dateParts[0], dateParts[1]-1, dateParts[2], 12, 0, 0); 
                 const dayIdx = d.getDay();
+                
                 const configItem = dayConfig[String(dayIdx)] || dayConfig[Number(dayIdx)];
-                if (configItem && configItem.slots) {
+                if (configItem && (configItem.slots || configItem.slots === 0)) {
                     slotsPerTime = Number(configItem.slots) || 1;
                     Logger.log(`[handlePublicBooking] Advanced Slots found for day ${dayIdx}: ${slotsPerTime}`);
                 }
