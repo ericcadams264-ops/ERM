@@ -16,7 +16,38 @@ function handlePublicBooking(e, data) {
         return createJSONOutput({ status: "error", message: "Data tidak lengkap (Tanggal, Jam, Nama, Kontak wajib diisi)." });
     }
 
-    // 2. Check Availability (Prevent Double Booking)
+    // 2. Check Availability (Prevent Double Booking based on Slots)
+    // [MODIFIED] Check Slots per Time from Master Config
+    let slotsPerTime = 1; // Default
+    try {
+        const ssAdmin = SpreadsheetApp.openById(SHEET_ID || SpreadsheetApp.getActiveSpreadsheet().getId());
+        const licSheet = ssAdmin.getSheetByName(SHEET_NAMES.LICENSES);
+        if (licSheet) {
+            const currentSheetId = ss.getId();
+            const licData = licSheet.getDataRange().getValues();
+            const licHeaders = licData[0].map(h => String(h).toLowerCase().replace(/\s/g,''));
+            const colSheetId = licHeaders.indexOf('sheetid');
+            const colDayConfig = findColumnIndex(licData[0], ['day_config', 'aturjam', 'praktek', 'advanced_config']);
+            
+            let rowIdx = -1;
+            for(let i=1; i<licData.length; i++) {
+                if(String(licData[i][colSheetId]).trim() === currentSheetId) { rowIdx = i; break; }
+            }
+            
+            if (rowIdx !== -1 && colDayConfig !== -1) {
+                const rawCfg = licData[rowIdx][colDayConfig];
+                const dayConfig = typeof rawCfg === 'string' ? JSON.parse(rawCfg) : rawCfg;
+                const d = new Date(data.date);
+                const dayIdx = d.getDay();
+                const configItem = dayConfig[String(dayIdx)] || dayConfig[Number(dayIdx)];
+                if (configItem && configItem.slots) {
+                    slotsPerTime = Number(configItem.slots) || 1;
+                    Logger.log(`[handlePublicBooking] Advanced Slots found for day ${dayIdx}: ${slotsPerTime}`);
+                }
+            }
+        }
+    } catch(e) { Logger.log("Error checking master slots: " + e); }
+
     const apptSheet = ss.getSheetByName(SHEET_NAMES.APPOINTMENTS);
     if (apptSheet && apptSheet.getLastRow() > 1) {
         const rows = apptSheet.getDataRange().getValues();
@@ -24,7 +55,9 @@ function handlePublicBooking(e, data) {
         const colDate = findColumnIndex(headers, ['date', 'tanggal']);
         const colTime = findColumnIndex(headers, ['time', 'jam', 'waktu']);
         const colStatus = findColumnIndex(headers, ['status']);
-        const colPatId = findColumnIndex(headers, ['patientId', 'patient id', 'rm']);
+
+        let filledSlots = 0;
+        const targetTimeNorm = normalizeTime(data.time);
 
         for (let i = 1; i < rows.length; i++) {
             const row = rows[i];
@@ -32,12 +65,14 @@ function handlePublicBooking(e, data) {
             if (rDate instanceof Date) rDate = Utilities.formatDate(rDate, TIMEZONE, "yyyy-MM-dd");
             const rTime = normalizeTime(row[colTime !== -1 ? colTime : 3]);
             const rStatus = colStatus !== -1 ? String(row[colStatus]).toUpperCase().trim() : "";
-            const rPatId = colPatId !== -1 ? String(row[colPatId]).trim() : "";
 
-            // Check if slot same AND status is active
-            if (rDate === data.date && rTime === normalizeTime(data.time) && rStatus !== 'REJECTED' && rStatus !== 'CANCELLED') {
-                return createJSONOutput({ status: "error", message: "Maaf, slot waktu ini sudah terisi." });
+            if (rDate === data.date && rTime === targetTimeNorm && rStatus !== 'REJECTED' && rStatus !== 'CANCELLED') {
+                filledSlots++;
             }
+        }
+
+        if (filledSlots >= slotsPerTime) {
+            return createJSONOutput({ status: "error", message: `Maaf, kuota untuk jam ${data.time} (${slotsPerTime} slot) sudah penuh.` });
         }
     }
 
