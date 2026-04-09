@@ -1257,12 +1257,27 @@ window.testNotifSound = function () {
 function normalizeDate(s) {
     if (!s) return "";
     if (typeof s !== 'string') return s;
-    if (s.includes("-")) return s; // already yyyy-MM-dd
-    if (s.includes("/")) {
-        let parts = s.split("/");
-        if (parts[2] && parts[2].length === 4) {
-            return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+    if (s.includes("-") && s.split("-")[0].length === 4) return s; // already yyyy-mm-dd
+    
+    // Improved Split: handle / or -
+    let parts = s.split(/[\/\-]/);
+    if (parts.length === 3) {
+        let Y, M, D;
+        if (parts[2].length === 4) {
+            Y = parts[2];
+            // Ambiguity Check: IF part[0] > 12 it MUST be Day
+            if (parseInt(parts[0]) > 12) {
+                D = parts[0].padStart(2, '0');
+                M = parts[1].padStart(2, '0');
+            } else {
+                // Default to D/M/Y for ID locale, but more robust
+                D = parts[0].padStart(2, '0');
+                M = parts[1].padStart(2, '0');
+            }
+        } else if (parts[0].length === 4) {
+            Y = parts[0]; M = parts[1]; D = parts[2];
         }
+        if (Y && M && D) return `${Y}-${M.padStart(2, '0')}-${D.padStart(2, '0')}`;
     }
     return s;
 }
@@ -1778,10 +1793,19 @@ async function pullDataFromSheet() {
                     if (key === 'PDF_ACCENT') state.pdfConfig.accentColor = val;
                     if (key === 'PDF_FONT_SIZE') state.pdfConfig.fontSize = val;
 
-                    // 4. Fallback Support (Legacy CLINIC_INFO JSON)
+                    // 4. DAY_CONFIG / SLOT ALIASES
+                    const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(key.toUpperCase());
+                    if (isDayConfig && val) {
+                        try {
+                            state.bookingConfig.dayConfig = typeof val === 'string' ? JSON.parse(val) : val;
+                        } catch (e) { console.error("DayConfig Parse Error", e); }
+                    }
+
+                    // 5. Fallback Support (Legacy CLINIC_INFO JSON)
                     if (key === 'CLINIC_INFO' || key === 'clinic_info') {
                         try {
                             const info = JSON.parse(val);
+                            if (info.day_config) state.bookingConfig.dayConfig = info.day_config;
                             Object.assign(state.clinicInfo, info);
                         } catch (e) { }
                     }
@@ -2368,11 +2392,19 @@ async function backgroundAutoSync() {
                     if (k === 'CLINIC_PHONE') state.clinicInfo.phone = v;
                     if (k === 'CLINIC_MAPS') state.clinicInfo.mapsUrl = v;
 
-                    // Booking
+                    // Booking & Slot Configuration
                     if (k === 'BOOKING_ALIAS') state.bookingConfig.alias = v;
                     if (k === 'BOOKING_HOURS') state.bookingConfig.availableHours = v;
                     if (k === 'BOOKING_OFFDAYS') state.bookingConfig.offDays = v;
                     if (k === 'BOOKING_HOLIDAYS') state.bookingConfig.customHolidays = v;
+                    
+                    // Support for Day Config Aliases
+                    const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(k);
+                    if (isDayConfig && v) {
+                        try {
+                            state.bookingConfig.dayConfig = typeof v === 'string' ? JSON.parse(v) : v;
+                        } catch (e) { }
+                    }
 
                     // Notif
                     if (k === 'TG_CHAT_ID') state.notificationConfig.telegramChatId = v;
@@ -2383,6 +2415,7 @@ async function backgroundAutoSync() {
                     if (k === 'MSG_REJECT') state.notificationConfig.msgReject = v;
                     if (k === 'MSG_REMINDER') state.notificationConfig.msgReminder = v;
                 });
+                saveData(); // Immediate save to keep config in sync
                 uiNeedsRefresh = true;
             }
 
@@ -11436,22 +11469,19 @@ async function deleteTreatment(id) {
     state.treatments = (state.treatments || []).filter(t => t.id !== id);
     if (!state.deletedIds.treatments) state.deletedIds.treatments = [];
     state.deletedIds.treatments.push(id);
+
     await saveData();
     if (state.scriptUrl) syncDelta(false);
-    const container = document.getElementById('treatment-list-container');
-    if (container) { container.innerHTML = renderTreatmentTable(); renderIcons(); }
+    renderConfigView(document.getElementById('main-content'), 'treatments');
     showToast("Tindakan dihapus.");
 }
-
-// --- 16. PROTOCOL / PHYSIO ASSISTANT FUNCTIONS ---
-
 
 async function triggerFullSync() {
     if (!state.scriptUrl) {
         alert("Atur URL Script di menu Konfigurasi terlebih dahulu!");
         return;
     }
-    if (!confirm("Apakah Anda ingin melakukan Sinkronisasi Penuh? \nSemua data lokal akan diperbarui paksa sesuai dengan isi Google Sheet. Ini berguna jika Anda baru saja menghapus baris secara manual di Sheet.")) {
+    if (!confirm("Konfirmasi Sinkronisasi Penuh?\n\nProses ini akan:\n1. Memperbarui Lisensi & Pengaturan Klinik (Master Sheet).\n2. Menarik ulang seluruh data Pasien & Jadwal dari Google Sheet.\n3. Memastikan semua data di aplikasi sama persis dengan di Sheet.")) {
         return;
     }
 
@@ -11460,35 +11490,22 @@ async function triggerFullSync() {
     if (btn) btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin" width="20"></i> Syncing...';
 
     state._syncing = true;
-    const sheetId = getSheetIdFromUrl(state.scriptUrl) || state.sheetId;
+    updateSyncStatusUI('syncing', true); 
 
     try {
-        const url = `${LICENSE_API_URL}?action=pull&sheet_id=${sheetId}&t=${Date.now()}`;
-        const response = await fetch(url);
-        const data = await response.json();
-
-        if (data.status === 'error') {
-            alert("Error: " + data.message);
-            return;
+        localStorage.removeItem('erm_license_last_check'); 
+        if (typeof checkLicense === 'function') {
+            await checkLicense();
         }
-
-        if (data.patients && data.assessments) {
-            state.patients = data.patients || [];
-            state.assessments = sanitizeAssessments(data.assessments || []);
-            state.appointments = data.appointments || [];
-            state.expenses = data.expenses || [];
-            state.packages = data.packages || [];
-            state.treatments = data.treatments || [];
-
-
-            state.deletedIds = { patients: [], assessments: [], appointments: [], expenses: [], packages: [], treatments: [] };
-
-            await saveData();
-            showToast('Sinkronisasi Penuh Berhasil! ✅', 'success');
-            renderApp();
-        }
+        await silentPullRefresh(true);
+        showToast('Sinkronisasi Penuh Berhasil! ✅', 'success');
+        renderApp();
+    } catch (err) {
+        console.error("FullSync Error:", err);
+        showToast('Sinkronisasi Gagal: ' + err.message, 'error');
     } finally {
         state._syncing = false;
+        updateSyncStatusUI(false); 
         if (btn) btn.innerHTML = oriText;
         lucide.createIcons();
     }
