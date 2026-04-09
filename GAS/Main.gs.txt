@@ -229,7 +229,7 @@ function doGet(e) {
         const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'jam tersedia', 'aviliasi']);
         const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur', 'hari libur']);
         const colCustomHolidays = findColumnIndex(headers, ['custom_holidays', 'libur_kustom', 'tanggal_libur']);
-        const colDayConfig = findColumnIndex(headers, ['day_config', 'konfigurasi_harian', 'day config']);
+        const colDayConfig = findColumnIndex(headers, ['day_config', 'day_configs', 'advanced_config', 'dayconfig', 'aturjam', 'praktek']);
         
         if (colAlias === -1) return createJSONOutput({ status: 'error', message: 'Kolom Alias tidak ditemukan di tab Licenses.' });
         if (colStatus === -1) return createJSONOutput({ status: 'error', message: 'Kolom Status tidak ditemukan di tab Licenses.' });
@@ -616,7 +616,7 @@ function doPost(e) {
                 const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia', 'jam tersedia', 'aviliasi']);
                 const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur', 'hari libur']);
                 const colCustomHolidays = findColumnIndex(headers, ['custom_holidays', 'libur_kustom', 'tanggal_libur']);
-                const colDayConfig = findColumnIndex(headers, ['day_config', 'day config']);
+                const colDayConfig = findColumnIndex(headers, ['day_config', 'day_configs', 'advanced_config', 'dayconfig', 'aturjam', 'praktek']);
                 
                 if (colSheetId === -1 || colAlias === -1 || colHours === -1) {
                    return createJSONOutput({ status: 'error', message: 'Kolom database Master tidak lengkap (Cek Sheet id/Alias/Hours).' });
