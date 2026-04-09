@@ -68,7 +68,8 @@ let state = {
         availableHours: '',
         offDays: '',
         customHolidays: '',
-        dayConfig: {} // Per-day: { "1": { active: true, hours: "...", slots: 1 }, ... }
+        dayConfig: {}, // Per-day: { "1": { active: true, hours: "...", slots: 1 }, ... }
+        _dirty: false
     },
     deletedIds: {
         patients: [],
@@ -1510,11 +1511,12 @@ async function syncDelta(blocking = false) {
     const deltaProtocols = filterDelta(state.protocols);
     const deltaUsers = filterDelta(state.users);
     const deltaTreatments = filterDelta(state.treatments);
+    const deltaConfig = state.bookingConfig._dirty ? state.bookingConfig : null;
 
     const hasDelta = deltaPatients.length > 0 || deltaAssessments.length > 0 ||
         deltaAppointments.length > 0 || deltaExpenses.length > 0 ||
         deltaPackages.length > 0 || deltaProtocols.length > 0 ||
-        deltaUsers.length > 0 || deltaTreatments.length > 0;
+        deltaUsers.length > 0 || deltaTreatments.length > 0 || deltaConfig !== null;
 
     // Check for deletes
     const hasDeletes = Object.values(state.deletedIds || {}).some(arr => Array.isArray(arr) && arr.length > 0);
@@ -1544,6 +1546,7 @@ async function syncDelta(blocking = false) {
                 protocols: deltaProtocols,
                 users: deltaUsers,
                 treatments: deltaTreatments,
+                booking_config: deltaConfig,
                 deletedIds: state.deletedIds
             })
         });
@@ -1564,6 +1567,7 @@ async function syncDelta(blocking = false) {
             clearSelected(deltaProtocols);
             clearSelected(deltaUsers);
             clearSelected(deltaTreatments);
+            state.bookingConfig._dirty = false;
 
             // Clear deletes that were sent
             state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], protocols: [], treatments: [] };
@@ -1670,7 +1674,7 @@ function checkDataDirty() {
     const baseDirty = hasDirty(state.patients) || hasDirty(state.assessments) ||
         hasDirty(state.appointments) || hasDirty(state.expenses) ||
         hasDirty(state.packages) || hasDirty(state.protocols) ||
-        hasDirty(state.treatments) || hasDeletes;
+        hasDirty(state.treatments) || hasDeletes || state.bookingConfig._dirty;
 
     const configDirty = state.configUpdatedAt && parseDateSafe(state.configUpdatedAt).getTime() > lastSync.getTime();
     return baseDirty || configDirty;
@@ -2434,8 +2438,12 @@ async function backgroundAutoSync() {
                 state.users = cleanup(data.users || [], state.deletedIds.users);
 
                 // Clear deletion queue on successful Full Pull - ONLY IF WE ARE SURE SERVER IS MASTER
-                // For now, let's NOT wipe it here to be safe, syncDelta will clear it when GAS acknowledges push.
-                // state.deletedIds = { patients: [], assessments: [], appointments: [], expenses: [], packages: [], protocols: [] };
+                state.users.forEach(u => delete u._dirty);
+                state.treatments.forEach(t => delete t._dirty);
+                state.bookingConfig._dirty = false;
+                
+                // Clear deletions only on full success
+                state.deletedIds = { patients: [], assessments: [], appointments: [], users: [], expenses: [], packages: [], protocols: [], treatments: [] };
                 window._firstSyncDone = true;
                 applyBranding(); // Apply updated clinic info
                 if (isSafeToRefresh()) renderApp();
@@ -7532,41 +7540,46 @@ async function saveBookingConfig() {
     state.bookingConfig.availableHours = hours;
     state.bookingConfig.offDays = offDays;
     state.bookingConfig.dayConfig = dayConfig;
-    // customHolidays already updated in state by add/remove functions
+    state.bookingConfig._dirty = true; // [SYNC MARK]
 
     // Sync UI
     updateBookingLinkPreview();
-
-    const payload = {
-        action: 'save_booking_config',
-        sheet_id: state.sheetId || getSheetIdFromUrl(state.scriptUrl),
-        alias: alias,
-        available_hours: hours,
-        off_days: offDays,
-        custom_holidays: customHolidays,
-        day_config: dayConfig
-    };
 
     try {
         btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin" width="16"></i> Menyimpan...`;
         btn.disabled = true;
         lucide.createIcons();
 
-        // [Sync Instant to Master]
+        // [1] Sync to License Master (Mandatory for booking portal)
+        const payload = {
+            action: 'save_booking_config',
+            sheet_id: state.sheetId || getSheetIdFromUrl(state.scriptUrl),
+            alias: alias,
+            available_hours: hours,
+            off_days: offDays,
+            custom_holidays: customHolidays,
+            day_config: dayConfig
+        };
+
         const res = await fetch(LICENSE_API_URL, {
             method: 'POST', mode: 'cors',
             headers: { 'Content-Type': 'text/plain' },
             body: JSON.stringify(payload)
         });
         const result = await res.json();
+        
+        // [2] Trigger Delta Sync to Clinic Sheet (Independent of master success)
+        await saveData();
+        syncDelta(false); 
+
         if (result.status === 'success') {
-            alert('✅ Konfigurasi Booking Berhasil Disimpan & Sinkron Master!');
+            showToast('✅ Konfigurasi Booking Sinkron Master & Sheet!', 'success');
         } else {
             throw new Error(result.message);
         }
     } catch (e) {
-        console.warn("Sync booking config failed, saved locally:", e);
-        alert('Tersimpan secara lokal (Sinkronisasi Master Gagal).');
+        console.warn("Sync booking config to master failed, but saved locally & queued for sheet sync:", e);
+        showToast('Tersimpan di Sheet (Master Server Tertunda)', 'warning');
     } finally {
         btn.innerHTML = originalText;
         btn.disabled = false;

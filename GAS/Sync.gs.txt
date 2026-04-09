@@ -355,6 +355,42 @@ function processIncrementalSync(ss, changes) {
     if (changes.config) updateConfigSheet(ss, changes.config);
     if (changes.users) merge(SHEET_NAMES.USERS, HEADERS.USERS, changes.users);
 
+    // [MOD] Support for Booking Config in Delta Push
+    if (changes.booking_config) {
+        const bc = changes.booking_config;
+        const licSheet = ss.getSheetByName(SHEET_NAMES.LICENSES);
+        if (licSheet) {
+            const rows = licSheet.getDataRange().getValues();
+            const headers = rows[0];
+            const colSheetId = findColumnIndex(headers, ['sheet_id', 'sheet id', 'id_sheet']);
+            const colAlias = findColumnIndex(headers, ['alias', 'alias_klinik']);
+            const colHours = findColumnIndex(headers, ['available_hours', 'jam_tersedia']);
+            const colOffDays = findColumnIndex(headers, ['off_days', 'hari_libur']);
+            const colCustomHolidays = findColumnIndex(headers, ['custom_holidays']);
+            const colDayConfig = findColumnIndex(headers, ['day_config', 'dayconfig']);
+
+            let targetId = String(bc.sheet_id || ss.getId()).trim();
+            const targetAlias = String(bc.alias || "").trim().toLowerCase();
+
+            let foundIndex = -1;
+            for (let i = 1; i < rows.length; i++) {
+                let rowSheetId = String(rows[i][colSheetId] || "").trim();
+                let rowAlias = String(rows[i][colAlias] || "").trim().toLowerCase();
+                if ((targetId !== "" && rowSheetId.includes(targetId)) || (targetAlias !== "" && rowAlias === targetAlias)) {
+                    foundIndex = i; break;
+                }
+            }
+
+            if (foundIndex !== -1) {
+                if (bc.alias) licSheet.getRange(foundIndex + 1, colAlias + 1).setValue(bc.alias);
+                if (colHours !== -1) licSheet.getRange(foundIndex + 1, colHours + 1).setValue(bc.availableHours || "");
+                if (colOffDays !== -1) licSheet.getRange(foundIndex + 1, colOffDays + 1).setValue(bc.offDays || "");
+                if (colCustomHolidays !== -1) licSheet.getRange(foundIndex + 1, colCustomHolidays + 1).setValue(bc.customHolidays || "");
+                if (colDayConfig !== -1 && bc.dayConfig) licSheet.getRange(foundIndex + 1, colDayConfig + 1).setValue(JSON.stringify(bc.dayConfig));
+            }
+        }
+    }
+
     // Handle Deletions
     if (changes.deletedIds) {
         const del = changes.deletedIds;
