@@ -1198,13 +1198,25 @@ function showSyncBanner(isBooking = true) {
         }, 1000);
     }
 
+    const updateLastCount = () => {
+        const count = (state.appointments || []).filter(a => a.status === 'PENDING').length;
+        localStorage.setItem('erm_last_booking_count', String(count));
+        window.lastBookingCount = count;
+    };
+
+    window.updateLastCount = () => {
+        const count = (state.appointments || []).filter(a => a.status === 'PENDING').length;
+        localStorage.setItem('erm_last_booking_count', String(count));
+        window.lastBookingCount = count;
+    };
+
     // 3. Floating Banner
     const existing = document.getElementById('sync-banner');
     if (existing) {
         if (isBooking) {
             existing.querySelector('span').innerText = 'Ada data booking baru! Klik untuk perbarui.';
             const btn = existing.querySelector('button');
-            if (btn) btn.setAttribute('onclick', "this.parentElement.remove(); navigate('schedule');");
+            if (btn) btn.setAttribute('onclick', "updateLastCount(); this.parentElement.remove(); navigate('schedule');");
             existing.classList.remove('hidden');
         }
         return;
@@ -1217,8 +1229,8 @@ function showSyncBanner(isBooking = true) {
     const actionCmd = isBooking ? "navigate('schedule')" : "navigate(state.currentView)";
 
     banner.innerHTML = `
-        <button onclick="this.parentElement.remove(); ${actionCmd};" 
-            class="flex items-center gap-4 bg-blue-600 text-white px-8 py-4 rounded-full shadow-[0_20px_40px_rgba(37,99,235,0.4)] hover:bg-blue-700 transition-all border-2 border-white/20 font-black text-sm tracking-wide transform active:scale-95">
+        <button onclick="updateLastCount(); this.parentElement.remove(); ${actionCmd};" 
+            class="flex items-center gap-4 bg-blue-600 text-white px-8 py-4 rounded-full shadow-[0_20px_40_rgba(37,99,235,0.4)] hover:bg-blue-700 transition-all border-2 border-white/20 font-black text-sm tracking-wide transform active:scale-95">
             <i data-lucide="bell-ring" width="24" class="animate-pulse"></i>
             <span>${text}</span>
         </button>
@@ -2336,6 +2348,7 @@ async function backgroundAutoSync() {
             state.patients = state.patients.filter(p => p && p.id && p.name && p.name.trim() !== "");
 
             let uiNeedsRefresh = false;
+            let hasNewBooking = false;
 
             // [FIXED] Process Config from Server (Identity & Branding)
             if (data.config && Array.isArray(data.config) && state.currentView !== 'config') {
