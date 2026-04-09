@@ -679,17 +679,21 @@ async function checkLicense(silent = false) {
                             // [ULTRA-ROBUST] Sanitize and catch ANY JSON anomaly
                             let cleanJson = typeof bDayCfg === 'string' ? bDayCfg.trim() : JSON.stringify(bDayCfg);
                             
-                            // Handle potential Excel/Sheets double-stringification
-                            if (cleanJson.startsWith('"') && cleanJson.endsWith('"')) {
-                                cleanJson = cleanJson.substring(1, cleanJson.length - 1).replace(/\\"/g, '"');
+                            // Handle potential Excel/Sheets nested stringification (Double/Triple encoded)
+                            let attempts = 0;
+                            while (typeof cleanJson === 'string' && cleanJson.trim().startsWith('{') && attempts < 3) {
+                                try {
+                                    const next = JSON.parse(cleanJson);
+                                    if (typeof next === 'object' && next !== null) {
+                                        cleanJson = next; // It was a stringified object
+                                        break; 
+                                    }
+                                    cleanJson = next;
+                                } catch(e) { break; }
+                                attempts++;
                             }
                             
-                            // Handle single quote JSON (sometimes happens in messy sheets)
-                            if (cleanJson.includes("'") && !cleanJson.includes('"')) {
-                                cleanJson = cleanJson.replace(/'/g, '"');
-                            }
-
-                            const parsed = JSON.parse(cleanJson);
+                            const parsed = typeof cleanJson === 'object' ? cleanJson : JSON.parse(cleanJson);
                             state.bookingConfig.dayConfig = parsed;
                             localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
                         } catch (e) { 
@@ -7684,8 +7688,17 @@ async function saveBookingConfig() {
     }
     await saveData();
 
+    // [URGENT] Lock state locally first to prevent refresh regression
+    localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
+    localStorage.setItem('erm_booking_hours', state.bookingConfig.availableHours);
+    localStorage.setItem('erm_booking_off_days', state.bookingConfig.offDays);
+    localStorage.setItem('erm_booking_holidays', state.bookingConfig.customHolidays);
+    localStorage.setItem('erm_booking_day_config', JSON.stringify(state.bookingConfig.dayConfig));
+    saveData(); // Persistent to IndexedDB
+
     // Pastikan kita punya URL Script untuk sinkronisasi
-    if (state.scriptUrl || localStorage.getItem('erm_script_url')) {
+    const rawUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
+    if (rawUrl) {
         if (btn) {
             btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin" width="16"></i><span>Menghubungkan ke Cloud...</span>';
             btn.disabled = true;
@@ -7693,18 +7706,18 @@ async function saveBookingConfig() {
         }
 
         try {
-            const sheetId = state.sheetId || getSheetIdFromUrl(state.scriptUrl || localStorage.getItem('erm_script_url'));
+            const sheetId = state.sheetId || getSheetIdFromUrl(rawUrl);
 
             if (!sheetId) {
                 alert('⚠️ Sheet ID tidak ditemukan!\nSilahkan isi URL Spreadsheet di tab "Data & User" terlebih dahulu.');
                 return;
             }
 
-            // [Sync Instant]
-            // CRITICAL: Gunakan LICENSE_API_URL (App Script), bukan state.scriptUrl (Sheet)
+            // [Sync Instant to MASTER]
+            // We use fetch with NO-CACHE to ensure we hit the live GAS
             await fetch(LICENSE_API_URL, {
                 method: 'POST',
-                mode: 'cors', // Removed no-cors trap so we can catch GAS errors
+                mode: 'cors',
                 headers: { 'Content-Type': 'text/plain' },
                 body: JSON.stringify({
                     action: 'save_booking_config',
@@ -7712,15 +7725,17 @@ async function saveBookingConfig() {
                     alias: state.bookingConfig.alias,
                     available_hours: state.bookingConfig.availableHours,
                     off_days: state.bookingConfig.offDays,
-                    custom_holidays: state.bookingConfig.customHolidays
+                    custom_holidays: state.bookingConfig.customHolidays,
+                    day_config: JSON.stringify(state.bookingConfig.dayConfig)
                 })
             });
 
-            await new Promise(r => setTimeout(r, 2000));
-            alert('✅ Konfigurasi Booking Berhasil Disimpan & Disinkronkan!\n\nLink booking Anda sudah aktif di Cloud.');
+            // Brief pause to allow GAS to finish writing
+            await new Promise(r => setTimeout(r, 1000));
+            showToast('✅ Sinkronisasi Master Berhasil!', 'success');
         } catch (e) {
             console.error('Sync failed:', e);
-            alert('❌ Gagal sinkron ke Cloud.\nTersimpan Lokal saja. Cek koneksi internet Anda.');
+            showToast('⚠️ Gagal simpan ke Master (Internet?), tapi tersimpan di HP.', 'warning');
         } finally {
             if (btn) {
                 btn.innerHTML = originalText;
@@ -7728,6 +7743,8 @@ async function saveBookingConfig() {
                 lucide.createIcons();
             }
         }
+    } else {
+        showToast('✅ Tersimpan di HP (Belum Terhubung Cloud)', 'success');
     }
     syncDelta(false);
 }

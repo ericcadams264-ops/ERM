@@ -661,7 +661,11 @@ function doPost(e) {
                         licSheet.getRange(foundIndex + 1, colCustomHolidays + 1).setValue(customHolidaysToSave);
                     }
                     if (colDayConfig !== -1 && data.day_config) {
-                        licSheet.getRange(foundIndex + 1, colDayConfig + 1).setValue(JSON.stringify(data.day_config));
+                        // [FIXED] data.day_config is already stringified from the app. 
+                        // Do NOT stringify it again to avoid double-encoding.
+                        let finalVal = data.day_config;
+                        if (typeof finalVal === 'object') finalVal = JSON.stringify(finalVal);
+                        licSheet.getRange(foundIndex + 1, colDayConfig + 1).setValue(finalVal);
                     }
                     return createJSONOutput({ status: 'success', message: 'Update berhasil di baris ' + (foundIndex + 1) });
                 }
