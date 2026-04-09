@@ -4839,7 +4839,17 @@ function renderAssessmentForm(container, useTempData = false) {
                                 </div>
                             </div>
                             <div class="bg-slate-50 p-6 rounded-2xl border border-slate-200 flex-1">
-                                ${renderCheckboxGroup('intervention', data.intervention)}
+                                <!-- Modalitas Suggestions from Master -->
+                                <div id="modality-suggestion-container">
+                                    ${renderModalitySuggestions()}
+                                </div>
+                                
+                                <div class="mt-4">
+                                    <h4 class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+                                        <i data-lucide="list-checks" width="12"></i> Program Terpilih
+                                    </h4>
+                                    ${renderCheckboxGroup('intervention', data.intervention)}
+                                </div>
                                 <div class="mt-6 pt-4 border-t border-slate-200 flex gap-3">
                                     <input type="text" id="custom-intervention" placeholder="+ Tambah intervensi manual (Ketik & Enter)..." class="flex-1 text-sm border-2 border-slate-200 rounded-xl px-4 py-3 focus:border-blue-500 outline-none transition-all shadow-sm" onkeydown="if(event.key === 'Enter') addCustomItem('intervention')">
                                     <button type="button" onclick="addCustomItem('intervention')" class="bg-blue-600 hover:bg-blue-700 text-white px-8 rounded-xl text-sm font-bold transition-all shadow-lg shadow-blue-100">Add Item</button>
@@ -5016,6 +5026,52 @@ function renderTextAreaWithMenu(key, currentValue, title) {
     </div>`;
 }
 
+/**
+ * Suggestions based on Treatments Master
+ */
+function renderModalitySuggestions() {
+    return renderModalitySuggestionsOnly();
+}
+
+/**
+ * Just the inner content of the suggestion bar
+ */
+function renderModalitySuggestionsOnly() {
+    if (!state.treatments || state.treatments.length === 0) return '';
+    
+    // Sort so common ones like IR/US appear first if short names
+    const list = [...state.treatments].sort((a,b) => a.name.length - b.name.length);
+    const selected = window.tempFormData.intervention || [];
+
+    const buttons = list.map(t => {
+        const isSelected = selected.includes(t.name);
+        const activeClass = isSelected ? 'bg-cyan-600 text-white border-cyan-700 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-cyan-400 hover:bg-cyan-50';
+        return `
+            <button type="button" 
+                onclick="toggleModality('${t.name.replace(/'/g, "\\'")}')" 
+                class="px-3 py-1.5 rounded-xl border text-[11px] font-black transition-all flex items-center gap-1.5 ${activeClass}">
+                ${isSelected ? '<i data-lucide="check" width="12"></i>' : '<i data-lucide="plus" width="12" class="opacity-30"></i>'}
+                ${t.name}
+            </button>
+        `;
+    }).join('');
+
+    return `
+        <div class="mb-6">
+            <h4 class="text-[10px] font-black text-cyan-600 uppercase tracking-widest mb-3 flex items-center gap-2">
+                <i data-lucide="zap" width="12"></i> Pilih Modalitas (Dari Master)
+            </h4>
+            <div class="flex flex-wrap gap-2">
+                ${buttons}
+            </div>
+        </div>
+    `;
+}
+
+function toggleModality(name) {
+    toggleFormItem('intervention', name);
+}
+
 function renderCheckboxGroup(key, currentItems) {
     return `<div class="grid grid-cols-1 gap-2" id="group-${key}">${renderListItems(key)}</div>`;
 }
@@ -5158,7 +5214,17 @@ function updateGroupUI(category) {
     if (container) {
         container.innerHTML = renderListItems(category);
         lucide.createIcons();
-    } else {
+    } 
+
+    if (category === 'intervention') {
+        const suggestionContainer = document.getElementById('modality-suggestion-container');
+        if (suggestionContainer) {
+            suggestionContainer.innerHTML = renderModalitySuggestionsOnly();
+            lucide.createIcons();
+        }
+    }
+
+    if (!container && category !== 'intervention') {
         renderAssessmentForm(document.getElementById('main-content'), true);
     }
 }
