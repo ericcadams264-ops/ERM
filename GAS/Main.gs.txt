@@ -302,6 +302,7 @@ function doGet(e) {
 
             // Determine Hours and Slots based on Day Config
             let hoursRaw = "";
+            let slotsPerTime = 1;
             let globalHours = (colHours !== -1 && (row[colHours] === 0 || row[colHours])) ? String(row[colHours]).trim() : "";
             
             if (dayIdx !== null) {
