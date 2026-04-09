@@ -11,8 +11,8 @@ const NETLIFY_URL = "https://appfisio.netlify.app"; // Ganti dengan URL produksi
 
 // --- OAUTH 2.0 GOOGLE CALENDAR CONFIGURATION ---
 // ISI DENGAN CREDENTIALS DARI GOOGLE CLOUD CONSOLE ANDA:
-const OAUTH_CLIENT_ID = "462432839977-2qlsr1tpluiqvi6obpdmpeb5kfdfomn5.apps.googleusercontent.com";
-const OAUTH_CLIENT_SECRET = "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";
+const OAUTH_CLIENT_ID = "[YOUR_GOOGLE_CLIENT_ID]";
+const OAUTH_CLIENT_SECRET = "[YOUR_GOOGLE_CLIENT_SECRET]";
 
 const SHEET_NAMES = {
     PATIENTS: "Patients",
