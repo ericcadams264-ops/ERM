@@ -8,6 +8,19 @@ if (typeof window.IMG_ASSETS === 'undefined') {
 }
 
 // --- 1. STATE & GLOBAL VARIABLES ---
+const APP_LOGIC_VERSION = '5.5.2-sync-master'; // [FORCE-UPDATE] Ubah ini untuk paksa reset cache background
+(async () => {
+    const localVer = localStorage.getItem('erm_app_logic_version');
+    if (localVer !== APP_LOGIC_VERSION) {
+        console.log("APP UPDATE: Versi baru terdeteksi. Membersihkan cache background...");
+        if ('caches' in window) {
+            const cacheNames = await caches.keys();
+            for (let name of cacheNames) { await caches.delete(name); }
+        }
+        localStorage.setItem('erm_app_logic_version', APP_LOGIC_VERSION);
+    }
+})();
+
 let state = {
     _version: '5.5.1',
     user: null,
@@ -85,9 +98,29 @@ let state = {
     archives: [],
     currentYear: new Date().getFullYear(),
     clinicName: '',
+    currentRegion: null, // [NEW] Untuk filter Outcome Measure otomatis
     configUpdatedAt: null,
     serverTimeOffset: 0, // Offset in ms: ServerTime - LocalTime
     dashboardTab: 'main' // 'main' or 'analytics'
+};
+
+// Mapping ICF Region to Outcome Measure Category
+const REGION_TO_OM_CATEGORY = {
+    'Kepala & Leher': 'Leher (Neck)',
+    'Bahu': 'Bahu (Shoulder)',
+    'Siku & Tangan': 'Lengan & Tangan (Arm & Hand)',
+    'Punggung (Thorax)': 'Punggung & Pinggang (Back/Lumbar)',
+    'Punggung (Back)': 'Punggung & Pinggang (Back/Lumbar)',
+    'Pinggang (Lumbar)': 'Punggung & Pinggang (Back/Lumbar)',
+    'Panggul (Hip)': 'Panggul (Hip)',
+    'Lutut': 'Lutut (Knee)',
+    'Ankle & Kaki': 'Kaki & Pergelangan Kaki (Foot & Ankle)',
+    'Pergelangan Kaki & Kaki': 'Kaki & Pergelangan Kaki (Foot & Ankle)',
+    'Umum (Geriatri)': 'Fungsional & Psikologi (Functional/Misc)',
+    'Umum (Neuro)': 'Fungsional & Psikologi (Functional/Misc)',
+    'Umum (Pediatri)': 'Fungsional & Psikologi (Functional/Misc)',
+    'Dada (Chest)': 'Fungsional & Psikologi (Functional/Misc)',
+    'Paha': 'Lutut (Knee)' // Fallback paha ke lutut biasanya
 };
 
 let currentTemplateCategory = 'Semua';
@@ -217,6 +250,67 @@ function calculateAge(dob) {
     const ageDifMs = Date.now() - new Date(dob).getTime();
     const ageDate = new Date(ageDifMs);
     return Math.abs(ageDate.getUTCFullYear() - 1970);
+}
+
+/**
+ * LOGIC PROGRESS EVALUATION (Trend Analysis Engine)
+ * Membandingkan assessment saat ini dengan sebelumnya
+ */
+function getPatientTrend(curr, prev) {
+    if (!prev) return null;
+    
+    let totalScore = 0; // Positif = Membaik, Negatif = Memburuk
+    let metrics = [];
+
+    // 1. VAS (Nyeri) -> Turun = Membaik
+    if (curr.vas !== undefined && prev.vas !== undefined) {
+        const delta = prev.vas - curr.vas;
+        if (delta > 0) { totalScore += 2; metrics.push({ name: 'Nyeri', status: 'improved', delta: `⬇️ ${delta}` }); }
+        else if (delta < 0) { totalScore -= 2; metrics.push({ name: 'Nyeri', status: 'declined', delta: `⬆️ ${Math.abs(delta)}` }); }
+    }
+
+    // 2. MMT (Kekuatan) -> Naik = Membaik
+    const currMMT = (Number(curr.mmt_d || 0) + Number(curr.mmt_s || 0)) / 2;
+    const prevMMT = (Number(prev.mmt_d || 0) + Number(prev.mmt_s || 0)) / 2;
+    if (currMMT !== prevMMT) {
+        const delta = currMMT - prevMMT;
+        if (delta > 0) { totalScore += 2; metrics.push({ name: 'Kekuatan', status: 'improved', delta: `⬆️ ${delta.toFixed(1)}` }); }
+        else if (delta < 0) { totalScore -= 2; metrics.push({ name: 'Kekuatan', status: 'declined', delta: `⬇️ ${Math.abs(delta).toFixed(1)}` }); }
+    }
+
+    // 3. ROM (Gerak) -> Naik = Membaik
+    if (curr.rom_numeric && prev.rom_numeric) {
+        const delta = curr.rom_numeric - prev.rom_numeric;
+        if (delta > 0) { totalScore += 2; metrics.push({ name: 'Gerak (ROM)', status: 'improved', delta: `⬆️ ${delta}°` }); }
+        else if (delta < 0) { totalScore -= 2; metrics.push({ name: 'Gerak (ROM)', status: 'declined', delta: `⬇️ ${Math.abs(delta)}°` }); }
+    }
+
+    // 4. Outcome Measurement (Tool Specific Logic)
+    if (curr.last_om_score !== undefined && prev.last_om_score !== undefined && curr.last_om_tool === prev.last_om_tool) {
+        const tool = curr.last_om_tool;
+        const delta = curr.last_om_score - prev.last_om_score;
+        
+        // Define which tools are "Higher is Better" (HIB)
+        const HIB_TOOLS = ['IKDC', 'KOOS-12', 'LEFS', 'FAAM', 'Modified Borg'];
+        const isHIB = HIB_TOOLS.some(t => tool.includes(t));
+        
+        const improved = isHIB ? (delta > 0) : (delta < 0);
+        const declined = isHIB ? (delta < 0) : (delta > 0);
+
+        if (improved) { totalScore += 3; metrics.push({ name: tool, status: 'improved', delta: `✨ Membaik` }); }
+        else if (declined) { totalScore -= 3; metrics.push({ name: tool, status: 'declined', delta: `⚠️ Menurun` }); }
+    }
+
+    // 5. Goal Achievement Tracking
+    if (curr.stg_status === 'Achieved') { totalScore += 1; metrics.push({ name: 'Target Jangka Pendek', status: 'improved', delta: '✨ Achieved' }); }
+    if (curr.ltg_status === 'Achieved') { totalScore += 2; metrics.push({ name: 'Target Jangka Panjang', status: 'improved', delta: '🏆 Achieved' }); }
+
+    // Final Status Determination
+    let status = 'stable';
+    if (totalScore >= 2) status = 'improved';
+    if (totalScore <= -2) status = 'declined';
+
+    return { status, metrics, totalScore };
 }
 
 // [NEW] Robust guard to prevent disruptive UI resets during background sync
@@ -385,8 +479,8 @@ async function loadData() {
                     ...state.bookingConfig, 
                     ...(globalCfg.booking || {}),
                     // Use localStorage as the most reliable immediate fallback
-                    alias: globalCfg.booking?.alias || localStorage.getItem('erm_booking_alias') || state.bookingConfig.alias,
-                    availableHours: globalCfg.booking?.availableHours || localStorage.getItem('erm_booking_hours') || state.bookingConfig.availableHours,
+                    alias: globalCfg.booking?.alias || state.bookingConfig.alias,
+                    availableHours: globalCfg.booking?.availableHours || state.bookingConfig.availableHours,
                     offDays: globalCfg.booking?.offDays || localStorage.getItem('erm_booking_off_days') || state.bookingConfig.offDays,
                     customHolidays: globalCfg.booking?.customHolidays || localStorage.getItem('erm_booking_holidays') || state.bookingConfig.customHolidays
                 };
@@ -490,10 +584,14 @@ async function loadData() {
         } catch (e) { state.scriptUrl = ''; }
 
         // Migration/Fallback for Booking Config
+        // Always hydrate from localStorage so config page renders correctly before network
         if (!state.bookingConfig.alias) {
-            state.bookingConfig.alias = localStorage.getItem('erm_booking_alias') || '';
+            state.bookingConfig.alias          = localStorage.getItem('erm_booking_alias') || '';
             state.bookingConfig.availableHours = localStorage.getItem('erm_booking_hours') || '';
-            state.bookingConfig.offDays = localStorage.getItem('erm_booking_off_days') || '';
+            state.bookingConfig.offDays        = localStorage.getItem('erm_booking_off_days') || '';
+            state.bookingConfig.customHolidays = localStorage.getItem('erm_booking_holidays') || '';
+            const _startupDc = localStorage.getItem('erm_booking_day_config');
+            if (_startupDc) { try { state.bookingConfig.dayConfig = JSON.parse(_startupDc); } catch(e) {} }
         }
 
         // Apply Legacy Configs if IndexedDB didn't have them yet
@@ -524,7 +622,10 @@ async function loadData() {
 
     // INSTANT AUTO-PROVISIONING: 
     // Trigger sync immediately on load so new users get data without waiting 30s.
-    if (state.scriptUrl) {
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
+        syncDelta(false);
+    }
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
         backgroundAutoSync();
     }
 
@@ -542,212 +643,139 @@ async function checkLicense(silent = false) {
     const savedExpiry = localStorage.getItem('erm_license_expiry');
     const savedStatus = localStorage.getItem('erm_license_status');
 
-    // [OPTIMIZED] 1. Cek Cache Validasi Master (Misal: 4 jam) untuk cegah "loading lama" setiap refresh
+    // 1. Validation Logic (Time-based caching: 4 jam)
     const lastCheckTime = localStorage.getItem('erm_license_last_check');
-    const CACHE_LIMIT = 4 * 60 * 60 * 1000; // 4 Jam
-    if (savedStatus === 'ACTIVE' && lastCheckTime && (Date.now() - parseInt(lastCheckTime) < CACHE_LIMIT)) {
+    const CACHE_LIMIT = 4 * 60 * 60 * 1000; 
+    
+    if (savedStatus === 'ACTIVE' && lastCheckTime && (Date.now() - parseInt(lastCheckTime) < CACHE_LIMIT) && !window.manualSyncActive) {
         console.log("LOG: License recently verified. Skipping remote check.");
-        // Ensure state is populated for immediate background sync
         state.scriptUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
-        state.sheetId = state.sheetId || localStorage.getItem('erm_sheet_id') || getSheetIdFromUrl(state.scriptUrl);
+        state.sheetId = state.sheetId || localStorage.getItem('erm_sheet_id');
         
-        // [FIX] Robust Hydration: Match even empty strings, only skip if NULL
-        const lAlias = localStorage.getItem('erm_booking_alias');
-        const lHours = localStorage.getItem('erm_booking_hours');
-        const lOff = localStorage.getItem('erm_booking_off_days');
-        const lHol = localStorage.getItem('erm_booking_holidays');
-        const lDayCfg = localStorage.getItem('erm_booking_day_config');
+        // Hydrate ALL booking config from Storage (not just alias & hours)
+        const lAlias       = localStorage.getItem('erm_booking_alias');
+        const lHours       = localStorage.getItem('erm_booking_hours');
+        const lOffDays     = localStorage.getItem('erm_booking_off_days');
+        const lHolidays    = localStorage.getItem('erm_booking_holidays');
+        const lDayConfig   = localStorage.getItem('erm_booking_day_config');
 
-        if (lAlias !== null) state.bookingConfig.alias = lAlias;
-        if (lHours !== null) state.bookingConfig.availableHours = lHours;
-        if (lOff !== null) state.bookingConfig.offDays = lOff;
-        if (lHol !== null) state.bookingConfig.customHolidays = lHol;
-        
-        if (lDayCfg !== null) {
-            try { state.bookingConfig.dayConfig = JSON.parse(lDayCfg); } catch(e) {}
+        if (lAlias    !== null) state.bookingConfig.alias          = lAlias;
+        if (lHours    !== null) state.bookingConfig.availableHours = lHours;
+        if (lOffDays  !== null) state.bookingConfig.offDays        = lOffDays;
+        if (lHolidays !== null) state.bookingConfig.customHolidays = lHolidays;
+        if (lDayConfig) {
+            try { state.bookingConfig.dayConfig = JSON.parse(lDayConfig); }
+            catch(e) { state.bookingConfig.dayConfig = {}; }
         }
-        
+
         return { valid: true };
     }
 
     if (!savedKey) {
-        if (!silent) renderLockScreen();
-        return { valid: false, message: "No license key found" };
+        if (!silent) renderLockScreen("Lisensi belum diaktivasi.");
+        return { valid: false };
     }
 
-    // 2. Cek Expiry Lokal
-    if (savedStatus === 'ACTIVE' && savedExpiry) {
-        // ... (Expiry Logic same as before)
-        const parts = savedExpiry.split(' ');
-        const monthMap = { 'Jan': 0, 'Feb': 1, 'Mar': 2, 'Apr': 3, 'May': 4, 'Jun': 5, 'Jul': 6, 'Aug': 7, 'Sep': 8, 'Oct': 9, 'Nov': 10, 'Dec': 11 };
-        let expDate = new Date();
-        if (parts.length >= 3) {
-            const d = parseInt(parts[0]);
-            const m = monthMap[parts[1]] !== undefined ? monthMap[parts[1]] : 0;
-            const y = parseInt(parts[2]);
-            expDate.setFullYear(y, m, d);
-            if (parts[3]) {
-                const timeParts = parts[3].split(':');
-                expDate.setHours(parseInt(timeParts[0]), parseInt(timeParts[1]), 0);
-            } else { expDate.setHours(23, 59, 59); }
-        } else { expDate = new Date(savedExpiry); }
-
-        const now = new Date();
-        if (now > expDate) {
-            if (!silent) renderLockScreen("Masa aktif lisensi Anda telah habis.");
-            return { valid: false, message: "License expired" };
-        }
-    }
-
-    // 3. Background Validation (Ke Server Lisensi PUSAT)
     if (navigator.onLine) {
         try {
-            // Extract Sheet ID from configured URL
             let sheetId = "";
-            const activeYear = new Date().getFullYear();
             const configUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
-
-            if (configUrl && !isReadOnly()) {
+            if (configUrl) {
                 const match = configUrl.match(/\/d\/([a-zA-Z0-9-_]+)/);
-                if (match && match[1]) sheetId = match[1];
+                if (match) sheetId = match[1];
             }
 
-            console.log("DEBUG: Validating License with Master (Silent)...", { key: savedKey, currentSheetId: sheetId });
-
-            const response = await fetch(`${LICENSE_API_URL}?action=check_license&key=${savedKey}&sheet_id=${sheetId}&t=${Date.now()}`);
-            if (!response.ok) throw new Error("Server Error: " + response.status);
+            const fetchUrl = `${LICENSE_API_URL}?action=check_license&key=${savedKey}&sheet_id=${sheetId}&t=${Date.now()}`;
+            const response = await fetch(fetchUrl);
             const result = await response.json();
 
-            state.licenseKey = savedKey; // Ensure key is always in state
             if (result.valid) {
+                // [MANUAL SYNC] Show a clean toast instead of intrusive alert
+                if (window.manualSyncActive) {
+                    const statusText = result.plan || 'ACTIVE';
+                    if (typeof showToast === 'function') {
+                        showToast(`✅ Sinkron Master Berhasil! Klinik: ${result.client} | Alias: ${result.alias || '-'}`, 'success');
+                    }
+                    window.manualSyncActive = false;
+                }
+
+                // Persist result
                 localStorage.setItem('erm_license_expiry', result.expires);
-                if (result.expires_iso) localStorage.setItem('erm_license_expiry_iso', result.expires_iso);
-                localStorage.setItem('erm_license_plan', result.plan);
                 localStorage.setItem('erm_license_status', 'ACTIVE');
-                localStorage.setItem('erm_license_last_check', Date.now().toString()); // Update last check time
+                localStorage.setItem('erm_license_last_check', Date.now().toString());
+                localStorage.setItem('erm_license_plan', result.plan);
+
+                if (result.alias !== undefined) {
+                    state.bookingConfig = state.bookingConfig || {};
+                    state.bookingConfig.alias = String(result.alias).trim();
+                    state.bookingConfig.availableHours = result.available_hours || "";
+                    state.bookingConfig.offDays = result.off_days || "";
+                    state.bookingConfig.customHolidays = result.custom_holidays || "";
+                    
+                    try {
+                        state.bookingConfig.dayConfig = typeof result.day_config === 'string' ? JSON.parse(result.day_config) : result.day_config;
+                    } catch(e) { state.bookingConfig.dayConfig = {}; }
+
+                    // Persist to LocalStorage for instant access
+                    localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
+                    localStorage.setItem('erm_booking_hours', state.bookingConfig.availableHours);
+                    localStorage.setItem('erm_booking_off_days', state.bookingConfig.offDays);
+                    localStorage.setItem('erm_booking_holidays', state.bookingConfig.customHolidays);
+                    localStorage.setItem('erm_booking_day_config', JSON.stringify(state.bookingConfig.dayConfig));
+
+                    // [NEW] Persist to IndexedDB to ensure persistence across reloads
+                    if (window.fisiotaDB) {
+                        window.fisiotaDB.save('config', {
+                            id: 'global',
+                            booking: { ...state.bookingConfig }
+                        }).catch(err => console.error("IndexedDB Sync Error:", err));
+                    }
+                }
+
                 if (result.client_name) {
-                    localStorage.setItem('erm_clinic_name', result.client_name);
                     state.clinicName = result.client_name;
+                    localStorage.setItem('erm_clinic_name', result.client_name);
                 }
 
-                // AUTO-CONFIG: Only if NOT in Archive Mode
-                if (result.sheet_id) {
-                    localStorage.setItem('erm_main_sheet_id', result.sheet_id);
-                }
-
-                if (result.sheet_id && !isReadOnly()) {
-                    const autoUrl = `https://docs.google.com/spreadsheets/d/${result.sheet_id}/edit`;
-                    const isManualConflict = state.sheetId && state.sheetId !== result.sheet_id;
-
-                    if (!state.sheetId || (!isManualConflict && autoUrl !== state.scriptUrl)) {
-                        localStorage.setItem('erm_script_url', autoUrl);
-                        localStorage.setItem('erm_sheet_id', result.sheet_id); // Ensure ID is saved!
-                        state.scriptUrl = autoUrl;
-                        state.sheetId = result.sheet_id;
-                        console.log("AUTO-CONFIG: Database Connected via License");
-                    }
-                }
-
-                // SYNC BOOKING CONFIG FROM MASTER
-                const bAlias = result.alias || result.id_booking || result.booking_id;
-                const bHours = result.available_hours || result.hours || result.jam_buka;
-                const bOff = result.off_days || result.hari_libur;
-                const bHol = result.custom_holidays || result.tanggal_libur;
-                const bDayCfg = result.day_config || result.dayconfig;
-
-                if (bAlias || bHours || bDayCfg) {
-                    if (bAlias) {
-                        state.bookingConfig.alias = String(bAlias).trim();
-                        localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
-                    }
-                    
-                    if (bHours !== undefined && bHours !== null) {
-                      state.bookingConfig.availableHours = String(bHours).trim();
-                      localStorage.setItem('erm_booking_hours', state.bookingConfig.availableHours);
-                    }
-                    if (bOff !== undefined && bOff !== null) {
-                      state.bookingConfig.offDays = String(bOff).trim();
-                      localStorage.setItem('erm_booking_off_days', state.bookingConfig.offDays);
-                    }
-                    if (bHol !== undefined && bHol !== null) {
-                      state.bookingConfig.customHolidays = String(bHol).trim();
-                      localStorage.setItem('erm_booking_holidays', state.bookingConfig.customHolidays);
-                    }
-                    
-                    if (bDayCfg) {
-                        try {
-                            // [ULTRA-ROBUST] Sanitize and catch ANY JSON anomaly
-                            let cleanJson = typeof bDayCfg === 'string' ? bDayCfg.trim() : JSON.stringify(bDayCfg);
-                            
-                            // Handle potential Excel/Sheets nested stringification (Double/Triple encoded)
-                            let attempts = 0;
-                            while (typeof cleanJson === 'string' && cleanJson.trim().startsWith('{') && attempts < 3) {
-                                try {
-                                    const next = JSON.parse(cleanJson);
-                                    if (typeof next === 'object' && next !== null) {
-                                        cleanJson = next; // It was a stringified object
-                                        break; 
-                                    }
-                                    cleanJson = next;
-                                } catch(e) { break; }
-                                attempts++;
-                            }
-                            
-                            const parsed = typeof cleanJson === 'object' ? cleanJson : JSON.parse(cleanJson);
-                            state.bookingConfig.dayConfig = parsed;
-                            localStorage.setItem('erm_booking_day_config', JSON.stringify(parsed));
-                        } catch (e) { 
-                            console.error("DayConfig Ultimate Parse Error:", e);
-                            if (typeof bDayCfg === 'object' && bDayCfg !== null) {
-                                state.bookingConfig.dayConfig = bDayCfg;
-                            }
-                        }
-                    }
-                }
-
-                    // FALLBACK DARURAT: Jika alias benar-benar kosong dari server, buat dari Nama Klinik
-                    if (!state.bookingConfig.alias || state.bookingConfig.alias === "") {
-                        const sourceName = result.client_name || state.clinicName || "klinik";
-                        state.bookingConfig.alias = sourceName.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-                        localStorage.setItem('erm_booking_alias', state.bookingConfig.alias);
-                    }
-                    
-                    await saveData(); 
-
-                // SYNC ARCHIVES
-                if (result.archives) {
-                    state.archives = result.archives;
-                    localStorage.setItem('erm_license_archives', JSON.stringify(result.archives));
-                }
+                if (result.sheet_id) localStorage.setItem('erm_main_sheet_id', result.sheet_id);
 
                 updateLicenseCountdown();
-                result.sheet_id = result.sheet_id || localStorage.getItem('erm_sheet_id'); // Fallback
-
-                // Expose globally to fix underscore/camelCase mismatch
-                window.check_license = checkLicense;
                 
-                // FORCE UI REFRESH IF IN CONFIG
-                if (state.currentView === 'config') {
-                    console.log("SYNC: Refreshing Config View with alias:", state.bookingConfig.alias);
-                    renderConfigView(document.getElementById('main-content'), state.activeConfigTab);
+                // Trigger view refresh if needed
+                if (state.currentView === 'config' || state.currentView === 'license') {
+                    console.log("SYNC: Data received, forcing UI refresh for:", state.bookingConfig.alias);
+                    
+                    // RE-RENDER TOTAL if needed, but try surgical first
+                    if (state.activeConfigTab === 'booking') {
+                        populateBookingFieldsFromState();
+                    } else {
+                        renderView(state.currentView);
+                    }
+                    
+                    if (typeof updateBookingLinkPreview === 'function') updateBookingLinkPreview();
                 }
 
-                return result; // RETURN FOR SWITCH YEAR LOGIC
-            } else {
-                console.warn("License Check Failed:", result.message);
-                if (result.message === "Kode Lisensi tidak ditemukan.") {
-                    if (!silent) renderLockScreen("Lisensi tidak valid atau telah dihapus oleh Admin.");
+                // [FIX] Always patch alias input DOM directly after master sync,
+                // regardless of which config tab is active (input may already be in DOM)
+                const _aliasEl = document.getElementById('conf-booking-alias');
+                if (_aliasEl && state.bookingConfig.alias) {
+                    _aliasEl.value = state.bookingConfig.alias;
+                    if (typeof updateBookingLinkPreview === 'function') updateBookingLinkPreview();
                 }
-                localStorage.setItem('erm_license_status', 'EXPIRED'); // Ensure status is updated
-                if (!silent) renderLockScreen(result.message); // Keep existing renderLockScreen
+
+                return result;
+            } else {
+                localStorage.setItem('erm_license_status', 'EXPIRED');
+                if (!silent) renderLockScreen(result.message);
                 return result;
             }
         } catch (e) {
-            console.error("License Background Check Error:", e);
+            console.error("Critical Sync Error:", e);
             return { valid: false, error: e.message };
-        }
-    }
-    return { valid: true, cached: true }; // Local validation passed
+        } // End Try
+    } // End Navigator
+    
+    return { valid: true, cached: true };
 }
 
 // ...
@@ -1433,7 +1461,7 @@ async function pushDataToSheet() {
         if (result.status === 'success') {
             // Update Last Sync Time
             localStorage.setItem('erm_last_sync', new Date().toISOString());
-            alert(`✅ Sinkronisasi Total Berhasil!\nGoogle Sheet sekarang sama persis dengan Aplikasi.`);
+            alert(`✅ Sinkronisasi Total Berhasil!\nData Cloud sekarang sama persis dengan Aplikasi.`);
         } else {
             throw new Error(result.message || "Gagal sinkronisasi data.");
         }
@@ -1524,7 +1552,7 @@ async function _pushDelta(sheetId) {
             const errorMsg = res.message || 'Unknown error';
             console.warn('AutoSync: Push gagal –', errorMsg);
             if (errorMsg.toLowerCase().includes('protected') || errorMsg.toLowerCase().includes('fail')) {
-                showToast(`Sinkronisasi Gagal: Baris 1 di Google Sheet mungkin Terkunci (Protected).`, 'error');
+                showToast(`Sinkronisasi Gagal: Database mungkin Terkunci (Protected).`, 'error');
             }
         }
     } catch (e) {
@@ -1863,9 +1891,11 @@ async function pullDataFromSheet() {
                     if (key === 'MSG_REMINDER_TEMPLATE') state.notificationConfig.msgReminder = val;
 
                     // 3. Booking & PDF Config
+                    // [FIX] BOOKING_ALIAS is authoritative from Master Sheet (checkLicense).
+                    // Only apply from client sheet config if not already set by master.
                     if (key === 'BOOKING_HOURS') state.bookingConfig.availableHours = val;
                     if (key === 'BOOKING_OFFDAYS') state.bookingConfig.offDays = val;
-                    if (key === 'BOOKING_ALIAS') state.bookingConfig.alias = val;
+                    if (key === 'BOOKING_ALIAS' && !state.bookingConfig.alias) state.bookingConfig.alias = val; // Master-first
                     if (key === 'BOOKING_HOLIDAYS') state.bookingConfig.customHolidays = val;
 
                     if (key === 'PDF_IC_TEXT') state.pdfConfig.informedConsentText = val;
@@ -2152,7 +2182,7 @@ async function triggerInitialSeed() {
         });
         const res = await response.json();
         if (res.status === 'success') {
-            showToast("Sheet baru berhasil di-inisialisasi otomatis!", "success");
+            showToast("Sistem baru berhasil di-inisialisasi otomatis!", "success");
         }
     } catch (e) {
         console.error("Smart Seeding Error:", e);
@@ -2189,16 +2219,60 @@ async function handleLogin(e) {
                 renderIcons();
             }
 
-            const sheetId = getSheetIdFromUrl(state.scriptUrl) || state.sheetId;
-            if (sheetId) {
-                // Perform a silent pull to fetch latest users
-                await silentPullRefresh(true);
-                // Re-check after sync with strict string comparison
-                user = state.users.find(u2 =>
-                    String(u2.username || "").toLowerCase() === String(u || "").toLowerCase() &&
-                    String(u2.password || "") === String(p || "")
-                );
-                hasCustomUsers = !!localStorage.getItem('erm_users_initialized');
+            const sheetId = state.sheetId || getSheetIdFromUrl(state.scriptUrl);
+            const apiUrl = typeof LICENSE_API_URL !== 'undefined' ? LICENSE_API_URL : state.scriptUrl;
+            
+            if (sheetId && apiUrl) {
+                console.log("Login: Mencoba Remote Login V2...");
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    mode: 'cors',
+                    headers: { 'Content-Type': 'text/plain' },
+                    body: JSON.stringify({
+                        action: 'login_v2',
+                        sheet_id: sheetId,
+                        user: u,
+                        pass: p
+                    })
+                });
+                
+                const res = await response.json();
+                if (res.status === 'success') {
+                    console.log("Login: Cloud Verified!", res.message);
+                    user = res.user;
+                    
+                    // [INSTANT HYDRATION] Populasikan seluruh data dari Bundle Cloud
+                    if (res.bundle) {
+                        const b = res.bundle;
+                        if (b.patients) state.patients = b.patients;
+                        if (b.assessments) state.assessments = b.assessments;
+                        if (b.appointments) state.appointments = b.appointments;
+                        if (b.protocols) state.protocols = b.protocols;
+                        if (b.expenses) state.expenses = b.expenses;
+                        if (b.packages) state.packages = b.packages;
+                        if (b.treatments) state.treatments = b.treatments;
+                        if (b.users) state.users = b.users;
+                        if (b.config) {
+                             // Update Identity & Branding
+                             b.config.forEach(c => {
+                                 const k = (c.key||"").toUpperCase();
+                                 if (k === 'CLINIC_NAME') state.clinicInfo.name = c.value;
+                                 if (k === 'CLINIC_SUBNAME') state.clinicInfo.subname = c.value;
+                                 if (k === 'CLINIC_CITY') state.clinicInfo.city = c.value;
+                                 if (k === 'CLINIC_LOGO') state.clinicInfo.logoUrl = c.value;
+                                 if (k === 'CLINIC_THERAPIST') state.clinicInfo.therapist = c.value;
+                                 if (k === 'CLINIC_SIPF') state.clinicInfo.sipf = c.value;
+                                 if (k === 'CLINIC_ADDRESS') state.clinicInfo.address = c.value;
+                                 if (k === 'CLINIC_NPWP') state.clinicInfo.npwp = c.value;
+                                 if (k === 'CLINIC_PHONE') state.clinicInfo.phone = c.value;
+                             });
+                        }
+                        
+                        await saveData(); // Simpan bundle ke IndexedDB lokal
+                        localStorage.setItem('erm_users_initialized', 'true');
+                        window._loginSyncDone = true; // Lewati pullDashboard karena data sudah lengkap
+                    }
+                }
             }
         } catch (e) {
             console.warn("Pre-login cloud check failed:", e);
@@ -2218,43 +2292,128 @@ async function handleLogin(e) {
     if (user) {
         state.user = user;
 
-        // [STRICT SYNC ON LOGIN]: Block and wait for fresh data
-        if (state.scriptUrl) {
+        // [OPTIMIZED LOGIN SYNC]
+        // Jika data sudah fresh (dari syncCredentialsFromCloud atau cloud-check sebelumnya):
+        // → Langsung navigate, SKIP checkLicense + silentPullRefresh
+        // → backgroundAutoSync() akan lakukan delta pull ringan di belakang layar
+        //
+        // Jika belum pernah sync sama sekali (device baru):
+        // → Lakukan ONE sync non-blocking, lalu navigate
+
+        if (window._loginSyncDone || window._firstSyncDone) {
+            // Data sudah tersedia → login instan, tidak perlu nunggu lagi
+            console.log("Login: Data sudah sinkron sebelumnya → langsung masuk dashboard.");
+            window._loginSyncDone = false; // Reset untuk login berikutnya
+            window._firstSyncDone = true;
+
+            // Update alias jika visible
+            const _al = document.getElementById('conf-booking-alias');
+            if (_al && state.bookingConfig.alias) _al.value = state.bookingConfig.alias;
+
+        } else {
+            // Device baru / belum pernah sync → lakukan SATU kali sync
             try {
-                console.log("Login: Forcing full data pull from Google Sheets...");
-                window._isBlockingSync = true;
-                updateSyncStatusUI('syncing', true);
-                await silentPullRefresh(true);
-                window._isBlockingSync = false;
+                console.log("Login: First-time sync (satu kali, non-blocking)...");
+                updateSyncStatusUI('syncing', false); // Non-blocking, tidak tutup UI
 
-                const lastServerTime = localStorage.getItem('erm_server_sync_time');
-                if (lastServerTime) {
-                    state.serverTimeOffset = parseDateSafe(lastServerTime).getTime() - Date.now();
+                window.manualSyncActive = true;
+                if (typeof checkLicense === 'function') await checkLicense(true);
+                window.manualSyncActive = false;
+
+                const resolvedSheetId = state.sheetId || getSheetIdFromUrl(state.scriptUrl) || localStorage.getItem('erm_main_sheet_id');
+                if (resolvedSheetId) {
+                    if (!state.sheetId) state.sheetId = resolvedSheetId;
+                    await silentPullRefresh(true);
+                    window._firstSyncDone = true;
+
+                    const lastServerTime = localStorage.getItem('erm_server_sync_time');
+                    if (lastServerTime) {
+                        state.serverTimeOffset = parseDateSafe(lastServerTime).getTime() - Date.now();
+                    }
+                    updateSyncStatusUI('success');
+                } else {
+                    console.warn("Login: No Sheet ID. Using local data only.");
+                    updateSyncStatusUI(false);
                 }
-
-                updateSyncStatusUI('success');
             } catch (err) {
-                console.warn("Initial sync failed during login, using local data:", err);
-                window._isBlockingSync = false;
+                console.warn("Login sync failed, using local data:", err);
                 updateSyncStatusUI('error');
             }
         }
 
         navigate('dashboard');
         document.getElementById('login-error').classList.add('hidden');
-        backgroundAutoSync();
+        backgroundAutoSync(); // Delta pull ringan di background (non-blocking)
     } else {
         const errEl = document.getElementById('login-error');
         errEl.classList.remove('hidden');
         errEl.innerHTML = `
             <div class="flex flex-col gap-2">
                 <div class="flex items-center gap-2"><i data-lucide="alert-circle" width="16"></i> Username atau Password Salah!</div>
-                <button type="button" onclick="pullDataFromSheet()" class="text-[10px] text-blue-600 hover:underline text-left mt-1">
+                <button type="button" id="btn-sync-creds" onclick="syncCredentialsFromCloud(this)" class="text-[10px] text-blue-600 hover:underline text-left mt-1">
                     Password tidak dikenali? Klik di sini untuk Sinkronisasi Kredensial dari Cloud/Server
                 </button>
             </div>
         `;
         renderIcons();
+    }
+}
+
+/**
+ * [FIXED] Sync credentials from cloud when login fails.
+ * Correctly resolves sheetId via checkLicense then pulls all data (including users).
+ */
+async function syncCredentialsFromCloud(btn) {
+    const originalText = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = '⏳ Menyinkronkan data dari Cloud...'; btn.disabled = true; }
+
+    try {
+        showToast('🔄 Menghubungi server, harap tunggu...', 'info');
+
+        // Step 1: Resolve sheetId from state or localStorage
+        let resolvedSheetId = state.sheetId
+            || getSheetIdFromUrl(state.scriptUrl)
+            || localStorage.getItem('erm_main_sheet_id');
+
+        // Step 2: HANYA panggil checkLicense (Master Sync) JIKA sheetId benar-benar kosong
+        // Ini menghindari loading ganda (Sync Master -> lalu Sync Data) bagi user yang sudah punya URL
+        if (!resolvedSheetId || resolvedSheetId === 'null' || resolvedSheetId === 'undefined') {
+            console.log("Sheet ID kosong, terpaksa hit Master Sheet...");
+            window.manualSyncActive = true;
+            if (typeof checkLicense === 'function') await checkLicense(true);
+            window.manualSyncActive = false;
+            
+            // Coba ambil lagi setelah checkLicense
+            resolvedSheetId = state.sheetId
+                || getSheetIdFromUrl(state.scriptUrl)
+                || localStorage.getItem('erm_main_sheet_id');
+        }
+
+        if (!resolvedSheetId) {
+            showToast('⚠️ Lisensi belum diaktivasi di perangkat ini. Hubungi Admin.', 'warning');
+            if (btn) { btn.textContent = originalText; btn.disabled = false; }
+            return;
+        }
+
+        // Step 3: Pull ALL data from client sheet (tanpa toast berlebih karena tombol sudah loading)
+        if (!state.sheetId) state.sheetId = resolvedSheetId;
+        await silentPullRefresh(true);
+
+        // [KEY] Tandai: data sudah fresh → login berikutnya bisa langsung masuk
+        window._loginSyncDone = true;
+        window._firstSyncDone = true;
+
+        showToast('✅ Kredensial berhasil disinkronkan! Silakan login.', 'success');
+
+        // Re-render login form cleanly
+        const errEl = document.getElementById('login-error');
+        if (errEl) errEl.classList.add('hidden');
+
+    } catch (e) {
+        console.error('syncCredentialsFromCloud error:', e);
+        showToast('❌ Gagal sinkron. Periksa koneksi internet Anda.', 'error');
+    } finally {
+        if (btn) { btn.textContent = originalText; btn.disabled = false; }
     }
 }
 
@@ -2317,19 +2476,20 @@ async function scheduleSync(seconds = 3) {
  * [NEW] Core Sync Handler: Fetch archives and initial data
  */
 async function handleInitialSync() {
-    console.log("INITIAL SYNC: Fetching archives and checking license...");
+    console.log("INITIAL SYNC: Session ready check...");
     try {
-        // [OPTIMIZED]: Redundant checkLicense removed. Done in DOMContentLoaded.
+        // [OPTIMIZED]: Login already performs the ONE full pull (silentPullRefresh).
+        // handleInitialSync no longer re-pulls — backgroundAutoSync will do a lightweight
+        // delta_pull to catch any changes since login. This eliminates "Menyelaraskan Data..."
+        // blocking overlay appearing after successful login.
 
-        // 2. Render Year Picker with fresh data
+        // Render year picker with current data
         if (typeof renderYearPicker === 'function') renderYearPicker();
 
-        // 3. Trigger first pull if needed
-        if (!window._firstSyncDone) {
-            console.log("INITIAL SYNC: Forcing clean pull for fresh session...");
-            await silentPullRefresh(true); // Mandatory clean pull
-            window._firstSyncDone = true;
-        }
+        // Mark session as initialized so this block never triggers again in this session
+        window._firstSyncDone = true;
+
+        console.log("INITIAL SYNC: Session ready. Delta sync will handle updates.");
     } catch (err) {
         console.error("InitialSync Error:", err);
     }
@@ -2449,7 +2609,7 @@ async function backgroundAutoSync() {
             state.treatments = cleanup(state.treatments, state.deletedIds.treatments);
 
             // [NEW] Deep Cleaning: Remove empty/invalid records that might cause empty rows in Patient Master
-            state.patients = state.patients.filter(p => p && p.id && p.name && p.name.trim() !== "");
+            state.patients = state.patients.filter(p => p && p.id && p.name && String(p.name).trim() !== "");
 
             let uiNeedsRefresh = false;
             let hasNewBooking = false;
@@ -2480,8 +2640,12 @@ async function backgroundAutoSync() {
                     const isDayConfig = ['DAY_CONFIG', 'DAYCONFIG', 'JADWAL', 'SLOT', 'ADVANCEDATURJAM'].includes(k);
 
                     if (isAlias && v) {
-                      state.bookingConfig.alias = v;
-                      localStorage.setItem('erm_booking_alias', v);
+                      // [FIX] Alias from master sheet (checkLicense) takes priority.
+                      // Only apply from client config if alias not yet set by master.
+                      if (!state.bookingConfig.alias) {
+                          state.bookingConfig.alias = v;
+                          localStorage.setItem('erm_booking_alias', v);
+                      }
                     }
                     if (isHours && v) {
                       state.bookingConfig.availableHours = v;
@@ -2607,7 +2771,7 @@ async function backgroundAutoSync() {
                 
                 if (data.treatments) {
                     // Filter out empty-named treatments from server
-                    const cleanTreatments = (data.treatments || []).filter(t => t && t.name && t.name.trim() !== "");
+                    const cleanTreatments = (data.treatments || []).filter(t => t && t.name && String(t.name).trim() !== "");
                     state.treatments = mergeArr(state.treatments || [], cleanTreatments, 'treatments');
                 }
                 if (data.protocols) state.protocols = mergeArr(state.protocols || [], data.protocols, 'protocols');
@@ -3499,7 +3663,7 @@ function renderApp() {
         printContainer.style.display = 'none';
         document.body.style.overflow = 'hidden';
 
-        ['dashboard', 'schedule', 'patients', 'assessments', 'kasir', 'protocols', 'config'].forEach(v => {
+        ['dashboard', 'schedule', 'patients', 'assessments', 'kasir', 'protocols', 'config', 'about'].forEach(v => {
             const btn = document.getElementById(`nav-${v}`);
             if (btn) {
                 let isActive = state.currentView === v;
@@ -3533,6 +3697,7 @@ function renderApp() {
             else if (state.currentView === 'analytics') { pageTitle.innerText = 'Analisis Klinis'; renderAnalyticsView(main); }
             else if (state.currentView === 'protocols') { pageTitle.innerText = 'Daftar Protokol'; renderProtocols(main); }
             else if (state.currentView === 'config') { pageTitle.innerText = 'Konfigurasi'; renderConfigView(main, state.activeConfigTab); }
+            else if (state.currentView === 'about') { pageTitle.innerText = 'Tentang Aplikasi'; renderAboutView(main); }
         } catch (err) {
             console.error("Render Error:", err);
             main.innerHTML = `
@@ -4276,7 +4441,7 @@ async function deletePatient(id) {
         await saveData();
         renderApp(); // Visual update right away
 
-        if (state.scriptUrl) {
+        if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
             // [Sync Instant]
             syncDelta(false);
         }
@@ -4286,6 +4451,8 @@ async function deletePatient(id) {
 // --- 9. VIEW RENDERERS (ASSESSMENT LIST) ---
 function renderAssessmentList(container) {
     state.printSelection = [];
+    const searchVal = document.getElementById('search-assessment')?.value.toLowerCase() || '';
+    
     let filteredAssessments = state.assessments;
     let headerText = "Riwayat Semua Pasien";
 
@@ -4294,6 +4461,15 @@ function renderAssessmentList(container) {
         const p = state.patients.find(pt => pt.id === state.filterPatientId);
         headerText = `Riwayat: ${p ? p.name : 'Unknown'}`;
     }
+
+    // Apply Search Filter (Name or RM)
+    if (searchVal) {
+        filteredAssessments = filteredAssessments.filter(a => {
+            const p = state.patients.find(pt => pt.id === a.patientId);
+            return (p && p.name.toLowerCase().includes(searchVal)) || (a.patientId && a.patientId.toLowerCase().includes(searchVal));
+        });
+    }
+
     filteredAssessments.sort((a, b) => new Date(b.date) - new Date(a.date));
 
     const formatDate = (dateStr) => {
@@ -4311,29 +4487,131 @@ function renderAssessmentList(container) {
             </button>
         </div>` : '';
 
+    // --- TREND ANALYSIS INTEGRATION ---
+    let insightCardHtml = '';
+    
+    // [NEW] Intelligent Detection: If searchVal is used and UNIQUE patient is found, show trend card
+    let effectivePatientId = state.filterPatientId;
+    if (!effectivePatientId && searchVal && filteredAssessments.length > 0) {
+        const uniqueIds = [...new Set(filteredAssessments.map(a => a.patientId))];
+        if (uniqueIds.length === 1) effectivePatientId = uniqueIds[0];
+    }
+
+    if (effectivePatientId && filteredAssessments.length >= 1) {
+        // Compare the very latest with the initial or previous for a summary
+        // Filter specifically for the effective patient in case we are in 'All' view
+        const pAssessments = state.assessments.filter(a => a.patientId === effectivePatientId).sort((a,b) => new Date(b.date) - new Date(a.date));
+        
+        const latest = pAssessments[0];
+        const previous = pAssessments[1];
+        const initial = filteredAssessments[filteredAssessments.length - 1];
+        
+        const recentTrend = getPatientTrend(latest, previous);
+
+        if (recentTrend) {
+            const statusColor = recentTrend.status === 'improved' ? 'emerald' : (recentTrend.status === 'declined' ? 'rose' : 'blue');
+            const statusIcon = recentTrend.status === 'improved' ? 'trending-up' : (recentTrend.status === 'declined' ? 'trending-down' : 'activity');
+            const statusLabel = recentTrend.status === 'improved' ? 'MENGALAMI PERBAIKAN' : (recentTrend.status === 'declined' ? 'PERLU PERHATIAN' : 'KONDISI STABIL');
+
+            insightCardHtml = `
+            <div class="bg-white rounded-2xl shadow-sm border-2 border-${statusColor}-100 overflow-hidden mb-6 fade-in">
+                <div class="bg-${statusColor}-50 px-6 py-3 border-b border-${statusColor}-100 flex items-center justify-between">
+                    <div class="flex items-center gap-2">
+                        <i data-lucide="${statusIcon}" class="text-${statusColor}-600" width="18"></i>
+                        <span class="text-xs font-black text-${statusColor}-700 uppercase tracking-widest">Analisis Progres Pasien (Visit Terakhir)</span>
+                    </div>
+                    <span class="px-3 py-1 bg-${statusColor}-600 text-white text-[10px] font-black rounded-full shadow-sm">${statusLabel}</span>
+                </div>
+                <div class="p-6">
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        ${recentTrend.metrics.map(m => `
+                        <div class="bg-slate-50 p-3 rounded-xl border border-slate-100">
+                            <p class="text-[9px] font-black text-slate-400 uppercase mb-1">${m.name}</p>
+                            <p class="text-sm font-bold ${m.status === 'improved' ? 'text-emerald-600' : 'text-rose-600'}">${m.delta}</p>
+                        </div>`).join('')}
+                    </div>
+                    ${latest.stg || latest.ltg ? `
+                    <div class="mt-4 pt-4 border-t border-slate-100 flex flex-col gap-4">
+                        ${latest.stg ? `
+                        <div class="flex flex-col md:flex-row gap-4 items-center">
+                            <div class="flex-1">
+                                <p class="text-[9px] font-black text-slate-400 uppercase">Target Jangka Pendek (STG):</p>
+                                <p class="text-xs font-bold text-slate-700 italic">"${latest.stg}"</p>
+                            </div>
+                            <div class="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-xl border border-indigo-100 text-[10px] font-black uppercase">
+                                Status: ${latest.stg_status || 'In Progress'}
+                            </div>
+                        </div>` : ''}
+                        
+                        ${latest.ltg ? `
+                        <div class="flex flex-col md:flex-row gap-4 items-center">
+                            <div class="flex-1">
+                                <p class="text-[9px] font-black text-slate-400 uppercase">Target Jangka Panjang (LTG):</p>
+                                <p class="text-xs font-bold text-slate-700 italic">"${latest.ltg}"</p>
+                            </div>
+                            <div class="px-4 py-2 bg-purple-50 text-purple-700 rounded-xl border border-purple-100 text-[10px] font-black uppercase">
+                                Status: ${latest.ltg_status || 'In Progress'}
+                            </div>
+                        </div>` : ''}
+                    </div>` : ''}
+                </div>
+            </div>`;
+        }
+    }
+
     container.innerHTML = `
-        <div class="space-y-4 fade-in pb-24"> <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col md:flex-row justify-between md:items-center gap-3">
-            <div><h3 class="font-bold text-lg text-slate-800 leading-tight">${headerText}</h3><p class="text-xs text-slate-500">Total: ${filteredAssessments.length} data</p></div>
-            <div class="flex gap-2">
+        <div class="space-y-4 fade-in pb-24"> 
+        <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 flex flex-col md:flex-row justify-between md:items-center gap-3">
+            <div class="flex-1 min-w-0">
+                <h3 class="font-bold text-lg text-slate-800 leading-tight">${headerText}</h3>
+                <p class="text-xs text-slate-500">Total: ${filteredAssessments.length} data</p>
+            </div>
+            
+            <div class="flex flex-wrap items-center gap-2">
+                <!-- Search Bar -->
+                <div class="relative w-full md:w-64">
+                    <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="14"></i>
+                    <input type="text" id="search-assessment" value="${searchVal}" 
+                        placeholder="Cari Nama / No. RM..." 
+                        oninput="renderAssessmentList(document.getElementById('main-content'))"
+                        class="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs outline-none focus:border-blue-400 focus:bg-white transition-all">
+                </div>
+
                 ${state.filterPatientId ? `<button onclick="state.filterPatientId=null; renderAssessmentList(document.getElementById('main-content'))" class="bg-slate-100 text-slate-600 px-4 py-2 rounded-lg text-xs font-bold hover:bg-slate-200 flex items-center gap-2"><i data-lucide="x" width="14"></i> Reset Filter</button>` : ''}
                 <button id="btn-print-multi" onclick="printSelected()" class="hidden bg-slate-800 text-white px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 shadow-lg hover:bg-slate-700 animate-bounce-short"><i data-lucide="printer" width="14"></i> Cetak (<span id="sel-count">0</span>)</button>
             </div>
         </div>
+
+        ${insightCardHtml}
+
         <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
             <div class="hidden md:block overflow-x-auto">
                 <table class="w-full text-sm text-left">
                     <thead class="bg-slate-50 border-b text-slate-500 font-bold uppercase text-[10px] tracking-wider">
-                        <tr><th class="p-4 w-10 text-center"><input type="checkbox" onchange="toggleAllSelect(this)" class="accent-blue-600 cursor-pointer"></th><th class="p-4">Tanggal</th><th class="p-4">Pasien</th><th class="p-4">Diagnosa</th><th class="p-4 text-center">Aksi</th></tr>
+                        <tr><th class="p-4 w-10 text-center"><input type="checkbox" onchange="toggleAllSelect(this)" class="accent-blue-600 cursor-pointer"></th><th class="p-4">Tanggal</th><th class="p-4">Pasien</th><th class="p-4">Progres</th><th class="p-4 text-center">Aksi</th></tr>
                     </thead>
                     <tbody class="divide-y divide-slate-100">
-                        ${filteredAssessments.length === 0 ? '<tr><td colspan="5" class="p-8 text-center text-slate-400 italic">Belum ada data.</td></tr>' : filteredAssessments.slice(0, state.assessmentLimit).map(a => {
+                        ${filteredAssessments.length === 0 ? '<tr><td colspan="5" class="p-8 text-center text-slate-400 italic">Belum ada data.</td></tr>' : filteredAssessments.slice(0, state.assessmentLimit).map((a, idx) => {
         const p = state.patients.find(pt => pt.id === a.patientId);
         const isLocked = a.is_locked === true || a.is_locked === 'true';
+        
+        // Find trend for this specific visit
+        const prevA = filteredAssessments[idx + 1];
+        const trend = getPatientTrend(a, prevA);
+        const trendPill = trend ? `
+            <div class="flex items-center gap-1.5 px-2 py-1 rounded-full border ${trend.status === 'improved' ? 'bg-emerald-50 text-emerald-700 border-emerald-100' : (trend.status === 'declined' ? 'bg-rose-50 text-rose-700 border-rose-100' : 'bg-blue-50 text-blue-700 border-blue-100')} truncate max-w-[120px]">
+                <i data-lucide="${trend.status === 'improved' ? 'trending-up' : (trend.status === 'declined' ? 'trending-down' : 'activity')}" width="10"></i>
+                <span class="text-[9px] font-black uppercase tracking-tighter">${trend.status}</span>
+            </div>` : '<span class="text-[9px] text-slate-300 font-medium lowercase">kunjungan awal</span>';
+
         return `<tr class="hover:bg-blue-50 transition-colors ${isLocked ? 'bg-slate-50/50 italic opacity-80' : ''}">
                                 <td class="p-4 text-center"><input type="checkbox" class="sel-check accent-blue-600 cursor-pointer" value="${a.id}" onchange="updatePrintSelection()"></td>
                                 <td class="p-4 font-mono text-xs text-slate-500">${formatDate(a.date)}</td>
-                                <td class="p-4 font-bold text-slate-800">${p ? p.name : '?'}</td>
-                                <td class="p-4"><span class="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs border border-blue-200 font-medium">${a.diagnosis || (p ? p.diagnosis : '-')}</span></td>
+                                <td class="p-4">
+                                    <div class="font-bold text-slate-800">${p ? p.name : '?'}</div>
+                                    <div class="text-[9px] text-slate-400 font-medium">${a.diagnosis || (p ? p.diagnosis : '-')}</div>
+                                </td>
+                                <td class="p-4">${trendPill}</td>
                                 <td class="p-4 flex justify-center gap-2">
                                     <button onclick="viewSinglePrint('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-500 hover:text-blue-600 rounded shadow-sm" title="Lihat"><i data-lucide="eye" width="16"></i></button>
                                     <button onclick="editAssessment('${a.id}')" class="p-1.5 bg-white border border-slate-200 text-slate-500 hover:text-emerald-600 rounded shadow-sm" title="Edit"><i data-lucide="edit-2" width="16"></i></button>
@@ -4345,17 +4623,27 @@ function renderAssessmentList(container) {
                 </table>
             </div>
             <div class="md:hidden divide-y divide-slate-100">
-                ${filteredAssessments.length === 0 ? '<div class="p-8 text-center text-slate-400 italic">Belum ada data.</div>' : filteredAssessments.slice(0, state.assessmentLimit).map(a => {
+                ${filteredAssessments.length === 0 ? '<div class="p-8 text-center text-slate-400 italic">Belum ada data.</div>' : filteredAssessments.slice(0, state.assessmentLimit).map((a, idx) => {
         const p = state.patients.find(pt => pt.id === a.patientId);
         const isLocked = a.is_locked === true || a.is_locked === 'true';
+        
+        // Trend for mobile
+        const prevA = filteredAssessments[idx + 1];
+        const trend = getPatientTrend(a, prevA);
+        const trendBadge = trend ? `
+            <span class="flex items-center gap-1 px-2 py-0.5 rounded-full text-[8px] font-black uppercase tracking-widest ${trend.status === 'improved' ? 'bg-emerald-600 text-white' : (trend.status === 'declined' ? 'bg-rose-600 text-white' : 'bg-blue-600 text-white')}">
+                ${trend.status}
+            </span>` : '';
+
         return `<div class="p-4 flex gap-3 hover:bg-slate-50 transition-colors ${isLocked ? 'bg-slate-50 opacity-90' : ''}">
                         <div class="pt-1"><input type="checkbox" class="sel-check w-5 h-5 accent-blue-600 rounded border-slate-300 cursor-pointer" value="${a.id}" onchange="updatePrintSelection()"></div>
                         <div class="flex-1">
                             <div class="flex justify-between items-start mb-1">
-                                <h4 class="font-bold text-slate-800 text-sm line-clamp-1">${p ? p.name : '?'}</h4>
-                                <div class="flex items-center gap-1.5">
-                                    <span class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">${formatDate(a.date)}</span>
+                                <div class="flex flex-col">
+                                    <h4 class="font-bold text-slate-800 text-sm line-clamp-1">${p ? p.name : '?'}</h4>
+                                    <div class="flex items-center gap-2 mt-1">${trendBadge}</div>
                                 </div>
+                                <span class="text-[10px] font-bold text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">${formatDate(a.date)}</span>
                             </div>
                             <div class="mb-3"><span class="inline-block bg-blue-50 text-blue-700 px-2 py-0.5 rounded text-[10px] border border-blue-100 font-bold mb-1">${a.diagnosis}</span></div>
                             <div class="flex gap-2">
@@ -4417,7 +4705,7 @@ async function deleteAssessment(id) {
         await saveData();
         renderApp(); // Visual update right away
 
-        if (state.scriptUrl) {
+        if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
             // [Sync Instant]
             syncDelta(false);
         }
@@ -4459,7 +4747,10 @@ function renderAssessmentForm(container, useTempData = false) {
             obj: {
                 rom: 'Normal', rom_side: '-', rom_part: '-',
                 mmt: '5', mmt_side: '-', mmt_part: '-',
-                balance: 'Baik',
+                balance_static_mth: '-', // Nama Metode (e.g. TUG)
+                balance_static_val: 'Baik', // Hasil/Interpretasi
+                balance_dynamic_mth: '-',
+                balance_dynamic_val: 'Baik',
             },
             special_tests: {},
             special_tests_note: '',
@@ -4469,9 +4760,11 @@ function renderAssessmentForm(container, useTempData = false) {
             consent_timestamp: '',
             rontgen_url: null, // Initialize as null to prevent overwriting with '' in sheet sync
             // NEW FIELDS for TTV and Separate D/S
-            ttv_td: '', ttv_hr: '', ttv_rr: '', ttv_temp: '', ttv_spo2: '',
-            rom_d: 'Normal', rom_s: 'Normal',
             mmt_d: '5', mmt_s: '5',
+            neuro_dermatome_mth: '', // String dipisahkan koma (ex: "C5, C6")
+            neuro_dermatome_val: 'Normal',
+            neuro_myotome_mth: '',
+            neuro_myotome_val: '5 (Normal)',
         };
         if (!Array.isArray(data.pain_points)) data.pain_points = [];
         window.tempFormData = JSON.parse(JSON.stringify(data));
@@ -4506,7 +4799,7 @@ function renderAssessmentForm(container, useTempData = false) {
                             <button onclick="openOutcomeModal()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-emerald-100 hover:border-emerald-500 hover:shadow-md transition-all text-left group">
                                 <div class="flex items-center gap-4 mb-3">
                                     <div class="bg-emerald-100 p-3 rounded-xl text-emerald-600 group-hover:bg-emerald-600 group-hover:text-white transition-colors"><i data-lucide="calculator" width="24"></i></div>
-                                    <div><h4 class="font-bold text-slate-800 text-lg">Kalkulator Klinis</h4><p class="text-xs text-slate-500">Outcome Measure (ODI, SPADI, dll)</p></div>
+                                    <div><h4 class="font-bold text-slate-800 text-lg">Kalkulator Klinis / Kuesioner</h4><p class="text-xs text-slate-500">Outcome Measure (ODI, SPADI, dll)</p></div>
                                 </div>
                             </button>
                             <button onclick="openCopyAssessmentModal()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-blue-100 hover:border-blue-500 hover:shadow-md transition-all text-left group">
@@ -4515,10 +4808,10 @@ function renderAssessmentForm(container, useTempData = false) {
                                     <div><h4 class="font-bold text-slate-800 text-lg">Salin Sebelumnya</h4><p class="text-xs text-slate-500">Pilih dan gunakan data kunjungan sebelumnya</p></div>
                                 </div>
                             </button>
-                            <button onclick="goToFormManual()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-slate-200 hover:border-slate-400 hover:shadow-md transition-all text-left group">
+                            <button onclick="openManualFormDialog()" class="bg-white p-6 rounded-2xl shadow-sm border-2 border-slate-200 hover:border-slate-400 hover:shadow-md transition-all text-left group">
                                 <div class="flex items-center gap-4 mb-3">
                                     <div class="bg-slate-100 p-3 rounded-xl text-slate-600 group-hover:bg-slate-800 group-hover:text-white transition-colors"><i data-lucide="edit-3" width="24"></i></div>
-                                    <div><h4 class="font-bold text-slate-800 text-lg">Isi Manual</h4><p class="text-xs text-slate-500">Formulir kosong tanpa template</p></div>
+                                    <div><h4 class="font-bold text-slate-800 text-lg">Isi Manual</h4><p class="text-xs text-slate-500">Pilih jenis pasien lalu isi formulir</p></div>
                                 </div>
                             </button>
                         </div>
@@ -4628,17 +4921,42 @@ function renderAssessmentForm(container, useTempData = false) {
                                 <div id="anamnesis-suggestions" class="mt-3 flex flex-wrap gap-2 transition-all"></div>
                             </div>
                             
-                            <!-- PEDIATRIC HISTORY (Conditional) -->
-                            ${currentTemplateCategory === 'Pediatri' ? `
-                            <div class="mt-6 pt-6 border-t border-slate-100 space-y-4">
-                                <h4 class="text-sm font-black text-blue-600 uppercase italic">Riwayat Tumbuh Kembang (Pediatri)</h4>
+                            <!-- PEDIATRIC HISTORY (Smart Conditional) -->
+                            ${(() => {
+                                // Shared fields HTML untuk prenatal / natal / postnatal
+                                const _pediFieldsHtml = `
                                 <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                                     <div><label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Prenatal (Kehamilan)</label><textarea onchange="updateForm('prenatal', this.value)" class="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50/50 focus:border-blue-400 outline-none" style="height: 120px; min-height: 120px; display: block;" placeholder="...">${data.prenatal || ''}</textarea></div>
                                     <div><label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Natal (Persalinan)</label><textarea onchange="updateForm('natal', this.value)" class="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50/50 focus:border-blue-400 outline-none" style="height: 120px; min-height: 120px; display: block;" placeholder="...">${data.natal || ''}</textarea></div>
                                     <div><label class="text-[10px] font-bold text-slate-400 uppercase mb-1 block">Postnatal (Setelah Lahir)</label><textarea onchange="updateForm('postnatal', this.value)" class="w-full border border-slate-200 p-3 rounded-lg text-sm bg-slate-50/50 focus:border-blue-400 outline-none" style="height: 120px; min-height: 120px; display: block;" placeholder="...">${data.postnatal || ''}</textarea></div>
-                                </div>
-                            </div>
-                            ` : ''}
+                                </div>`;
+
+                                // Kondisi 1: Template Pediatri dipilih ATAU pasien terdeteksi usia < 18 → tampil otomatis
+                                if (currentTemplateCategory === 'Pediatri' || window._manualFormIsPedi === true) {
+                                    return `<div class="mt-6 pt-6 border-t border-slate-100 space-y-4">
+                                        <h4 class="text-sm font-black text-blue-600 uppercase italic flex items-center gap-2">
+                                            <i data-lucide="baby" width="14"></i> Riwayat Tumbuh Kembang (Pediatri)
+                                        </h4>
+                                        ${_pediFieldsHtml}
+                                    </div>`;
+                                }
+                                // Kondisi 2: DOB tidak diketahui (null) dan bukan template pediatri → tampilkan toggle opsional
+                                if (window._manualFormIsPedi === null && currentTemplateCategory !== 'Pediatri') {
+                                    return `<div class="mt-4 p-3 bg-slate-50 rounded-xl border border-dashed border-slate-300">
+                                        <label class="flex items-center gap-2 cursor-pointer select-none">
+                                            <input type="checkbox" id="toggle-pedi-section" class="w-4 h-4 accent-blue-600"
+                                                onchange="document.getElementById('pedi-history-wrap').classList.toggle('hidden', !this.checked)">
+                                            <span class="text-[10px] font-bold text-slate-500 uppercase">Tampilkan Riwayat Tumbuh Kembang (Pediatri)</span>
+                                        </label>
+                                        <div id="pedi-history-wrap" class="hidden mt-4 space-y-3">
+                                            <h4 class="text-sm font-black text-blue-600 uppercase italic">Riwayat Tumbuh Kembang</h4>
+                                            ${_pediFieldsHtml}
+                                        </div>
+                                    </div>`;
+                                }
+                                // Kondisi 3: Pasien dewasa (usia >= 18) → tidak tampil sama sekali
+                                return '';
+                            })()}
                         </div>
                         
                         <!-- [NEW] 02: TANDA-TANDA VITAL (TTV) -->
@@ -4810,13 +5128,162 @@ function renderAssessmentForm(container, useTempData = false) {
                                     </div>
                                 </div>
 
-                                <!-- BALANCE (REMAINING 1/3) -->
+                                <!-- BALANCE SECTION (SPLIT STATIC/DYNAMIC) -->
                                 <div class="col-span-1 md:col-span-3 p-6 bg-slate-50 rounded-2xl border border-slate-200">
-                                    <div class="flex items-center gap-2 mb-3"><i data-lucide="shield" width="16" class="text-emerald-600"></i><span class="text-xs font-black text-slate-600 uppercase tracking-widest">Keseimbangan</span></div>
-                                    <div class="mb-4">
-                                        ${renderSelect('Pilih Status', 'balance', data.obj.balance, ['Baik', 'Cukup', 'Buruk', 'Risiko Jatuh'])}
+                                    <div class="flex items-center gap-2 mb-4 border-b border-slate-100 pb-2">
+                                        <i data-lucide="shield" width="16" class="text-emerald-600"></i>
+                                        <span class="text-xs font-black text-slate-600 uppercase tracking-widest">Keseimbangan (Balance)</span>
                                     </div>
-                                    <p class="text-[10px] text-slate-400 italic">Gunakan standarisasi pengukuran (BBS/TUG) jika diperlukan.</p>
+                                    
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <!-- KOLOM STATIS -->
+                                        <div class="p-4 bg-white rounded-xl border border-slate-100 shadow-sm relative overflow-hidden group">
+                                            <div class="flex justify-between items-start mb-1">
+                                                <span class="text-[9px] text-slate-500 font-bold uppercase tracking-wider">Keseimbangan Statis</span>
+                                                <button type="button" onclick="openBalancePicker('static')" class="text-[9px] font-black text-emerald-600 bg-emerald-50 px-2 py-1 rounded-lg hover:bg-emerald-600 hover:text-white transition-all flex items-center gap-1 shadow-sm border border-emerald-100">
+                                                    <i data-lucide="brain-circuit" width="10"></i> Smart Picker
+                                                </button>
+                                            </div>
+                                            ${(() => {
+                                                const method = data.obj.balance_static_mth || '-';
+                                                let options = ['Baik', 'Cukup', 'Kurang', 'Buruk', 'Risiko Jatuh'];
+                                                let targetOM = null;
+                                                for(const cat of Object.values(window.BALANCE_DB)) {
+                                                    const item = cat.items.find(i => i.name === method);
+                                                    if (item) {
+                                                        if (item.results) options = item.results;
+                                                        if (item.target_outcome) targetOM = item.target_outcome;
+                                                        break;
+                                                    }
+                                                }
+                                                
+                                                const selectHtml = renderSelect('', 'balance_static_val', data.obj.balance_static_val, options);
+                                                const omBtn = targetOM ? `<button type="button" onclick="openOutcomeModal('${targetOM.replace(/'/g, "\\'")}')" class="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-50 text-indigo-600 rounded-lg border border-indigo-100 hover:bg-indigo-600 hover:text-white transition-all shadow-sm group-hover:block hidden animate-in fade-in zoom-in duration-200" title="Buka Kalkulator ${targetOM}"><i data-lucide="calculator" width="14"></i></button>` : '';
+                                                
+                                                return `<div class="relative">${selectHtml}${omBtn}</div>`;
+                                            })()}
+                                            
+                                            ${data.obj.balance_static_mth && data.obj.balance_static_mth !== '-' ? `
+                                                <div class="mt-3 p-2 bg-emerald-50 rounded-lg border border-emerald-100 flex items-center gap-2">
+                                                    <div class="bg-emerald-500 text-white p-1 rounded-md"><i data-lucide="check-check" width="10"></i></div>
+                                                    <div class="flex-1">
+                                                        <p class="text-[10px] font-bold text-slate-700">${data.obj.balance_static_mth}</p>
+                                                    </div>
+                                                    <button type="button" onclick="resetBalanceField('static')" class="text-slate-400 hover:text-red-500 transition-colors"><i data-lucide="trash-2" width="12"></i></button>
+                                                </div>
+                                            ` : `
+                                                <p class="text-[9px] text-slate-400 mt-2 font-medium italic leading-tight">Klik Smart Picker untuk metode statis.</p>
+                                            `}
+                                        </div>
+
+                                        <!-- KOLOM DINAMIS -->
+                                        <div class="p-4 bg-white rounded-xl border border-slate-100 shadow-sm relative overflow-hidden group">
+                                            <div class="flex justify-between items-start mb-1">
+                                                <span class="text-[9px] text-slate-500 font-bold uppercase tracking-wider">Keseimbangan Dinamis</span>
+                                                <button type="button" onclick="openBalancePicker('dynamic')" class="text-[9px] font-black text-indigo-600 bg-indigo-50 px-2 py-1 rounded-lg hover:bg-indigo-600 hover:text-white transition-all flex items-center gap-1 shadow-sm border border-indigo-100">
+                                                    <i data-lucide="brain-circuit" width="10"></i> Smart Picker
+                                                </button>
+                                            </div>
+                                            ${(() => {
+                                                const method = data.obj.balance_dynamic_mth || '-';
+                                                let options = ['Baik', 'Cukup', 'Kurang', 'Buruk', 'Risiko Jatuh'];
+                                                let targetOM = null;
+                                                for(const cat of Object.values(window.BALANCE_DB)) {
+                                                    const item = cat.items.find(i => i.name === method);
+                                                    if (item) {
+                                                        if (item.results) options = item.results;
+                                                        if (item.target_outcome) targetOM = item.target_outcome;
+                                                        break;
+                                                    }
+                                                }
+                                                
+                                                const selectHtml = renderSelect('', 'balance_dynamic_val', data.obj.balance_dynamic_val, options);
+                                                const omBtn = targetOM ? `<button type="button" onclick="openOutcomeModal('${targetOM.replace(/'/g, "\\'")}')" class="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-indigo-50 text-indigo-600 rounded-lg border border-indigo-100 hover:bg-indigo-600 hover:text-white transition-all shadow-sm group-hover:block hidden animate-in fade-in zoom-in duration-200" title="Buka Kalkulator ${targetOM}"><i data-lucide="calculator" width="14"></i></button>` : '';
+                                                
+                                                return `<div class="relative">${selectHtml}${omBtn}</div>`;
+                                            })()}
+                                            
+                                            ${data.obj.balance_dynamic_mth && data.obj.balance_dynamic_mth !== '-' ? `
+                                                <div class="mt-3 p-2 bg-indigo-50 rounded-lg border border-indigo-100 flex items-center gap-2">
+                                                    <div class="bg-indigo-500 text-white p-1 rounded-md"><i data-lucide="check-check" width="10"></i></div>
+                                                    <div class="flex-1">
+                                                        <p class="text-[11px] font-bold text-slate-700">${data.obj.balance_dynamic_mth}</p>
+                                                    </div>
+                                                    <button type="button" onclick="resetBalanceField('dynamic')" class="text-slate-400 hover:text-red-500 transition-colors"><i data-lucide="trash-2" width="12"></i></button>
+                                                </div>
+                                            ` : `
+                                                <p class="text-[9px] text-slate-400 mt-2 font-medium italic leading-tight">Klik Smart Picker untuk metode dinamis.</p>
+                                            `}
+                                        </div>
+                                    </div>
+                                    <p class="text-[10px] text-slate-400 italic mt-6 text-center">Gunakan standarisasi pengukuran (BBS/TUG/Sensors) untuk hasil lebih akurat.</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- SECTION NEUROLOGICAL (Dermatomes & Myotomes) -->
+                        <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
+                             <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
+                                <div class="bg-purple-600 text-white p-2 rounded-lg shadow-purple-200 shadow-md">
+                                    <i data-lucide="zap" width="20"></i>
+                                </div>
+                                <div class="flex-1">
+                                    <h3 class="font-bold text-lg text-slate-800">Pemeriksaan Neurologis</h3>
+                                    <p class="text-xs text-slate-400">Assessment Dermatome (Sensorik) & Myotome (Motorik)</p>
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                <!-- DERMATOME -->
+                                <div class="bg-purple-50/50 p-5 rounded-2xl border border-purple-100 group relative">
+                                    <div class="flex justify-between items-start mb-3">
+                                        <span class="text-[10px] font-black text-purple-600 uppercase tracking-widest">Dermatome (Sensation)</span>
+                                        <button type="button" onclick="openNeuroPicker('dermatomes')" class="text-[9px] font-black text-white bg-purple-600 px-3 py-1.5 rounded-lg hover:bg-purple-700 transition-all flex items-center gap-1.5 shadow-md">
+                                            <i data-lucide="brain-circuit" width="12"></i> Smart Picker
+                                        </button>
+                                    </div>
+                                    
+                                    ${renderFormSelect('Hasil Pemeriksaan', 'neuro_dermatome_val', data.neuro_dermatome_val, window.NEURO_DB.dermatomes.results)}
+                                    
+                                    <div class="mt-4 flex flex-wrap gap-2">
+                                        ${data.neuro_dermatome_mth ? data.neuro_dermatome_mth.split(',').filter(x => x && x !== '-').map(lvl => `
+                                            <div class="px-3 py-1.5 bg-white rounded-xl border-2 border-purple-200 flex items-center gap-2 animate-in fade-in zoom-in duration-300">
+                                                <div class="w-6 h-6 rounded-lg bg-purple-100 flex items-center justify-center text-purple-600 font-black text-[10px] shrink-0">${lvl.trim().split(' ')[0]}</div>
+                                                <span class="text-[11px] font-black text-slate-800">${lvl.trim()}</span>
+                                                <button type="button" onclick="toggleNeuroItem('dermatomes', '${lvl.trim()}')" class="text-slate-300 hover:text-red-500 transition-colors"><i data-lucide="x" width="12"></i></button>
+                                            </div>
+                                        `).join('') : `
+                                            <div class="w-full text-center py-4 border-2 border-dashed border-purple-200 rounded-xl">
+                                                <p class="text-[10px] text-purple-400 italic font-medium">Klik Smart Picker untuk memilih level...</p>
+                                            </div>
+                                        `}
+                                    </div>
+                                </div>
+
+                                <!-- MYOTOME -->
+                                <div class="bg-blue-50/50 p-5 rounded-2xl border border-blue-100 group relative">
+                                    <div class="flex justify-between items-start mb-3">
+                                        <span class="text-[10px] font-black text-blue-600 uppercase tracking-widest">Myotome (Motor Root)</span>
+                                        <button type="button" onclick="openNeuroPicker('myotomes')" class="text-[9px] font-black text-white bg-blue-600 px-3 py-1.5 rounded-lg hover:bg-blue-700 transition-all flex items-center gap-1.5 shadow-md">
+                                            <i data-lucide="brain-circuit" width="12"></i> Smart Picker
+                                        </button>
+                                    </div>
+                                    
+                                    ${renderFormSelect('Hasil (MMT Scale)', 'neuro_myotome_val', data.neuro_myotome_val, window.NEURO_DB.myotomes.results)}
+                                    
+                                    <div class="mt-4 flex flex-wrap gap-2">
+                                        ${data.neuro_myotome_mth ? data.neuro_myotome_mth.split(',').filter(x => x && x !== '-').map(lvl => `
+                                            <div class="px-3 py-1.5 bg-white rounded-xl border-2 border-blue-200 flex items-center gap-2 animate-in fade-in zoom-in duration-300">
+                                                <div class="w-6 h-6 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600 font-black text-[10px] shrink-0">${lvl.trim().split(' ')[0]}</div>
+                                                <span class="text-[11px] font-black text-slate-800">${lvl.trim()}</span>
+                                                <button type="button" onclick="toggleNeuroItem('myotomes', '${lvl.trim()}')" class="text-slate-300 hover:text-red-500 transition-colors"><i data-lucide="x" width="12"></i></button>
+                                            </div>
+                                        `).join('') : `
+                                            <div class="w-full text-center py-4 border-2 border-dashed border-blue-200 rounded-xl">
+                                                <p class="text-[10px] text-blue-400 italic font-medium">Klik Smart Picker untuk memilih level...</p>
+                                            </div>
+                                        `}
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -4937,7 +5404,69 @@ function renderAssessmentForm(container, useTempData = false) {
 
                         </div>
 
-                        <!-- [NEW] 08: INTERVENTION SECTION (FULL WIDTH) -->
+                        <!-- SECTION 08: SMART TARGET KESEMBUHAN (v2.5) -->
+                        <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2 border-l-4 border-l-indigo-500">
+                            <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
+                                <div class="bg-indigo-600 text-white p-2 rounded-lg shadow-indigo-200 shadow-md">
+                                    <i data-lucide="target" width="20"></i>
+                                </div>
+                                <div class="flex-1">
+                                    <h3 class="font-bold text-lg text-slate-800">08 Program & Target Kesembuhan</h3>
+                                    <p class="text-xs text-slate-400">Sasaran fungsional jangka pendek dan panjang</p>
+                                </div>
+                            </div>
+                            
+                            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                                <!-- Numeric ROM Column -->
+                                <div class="bg-indigo-50/50 p-4 rounded-xl border border-indigo-100">
+                                    <label class="block text-[10px] font-black text-indigo-600 uppercase mb-3 tracking-widest">Tracking ROM Utama (°)</label>
+                                    <div class="flex items-center gap-3">
+                                        <input type="number" value="${data.rom_numeric || ''}" 
+                                            onchange="updateForm('rom_numeric', this.value)" 
+                                            placeholder="Derajat 0-180" 
+                                            class="w-full border-2 border-indigo-200 rounded-xl p-3 text-lg font-black text-indigo-700 focus:border-indigo-500 outline-none text-center">
+                                        <span class="text-xl font-bold text-indigo-400">°</span>
+                                    </div>
+                                    <p class="text-[9px] text-slate-400 mt-2 italic">Digunakan untuk grafik trend mobilitas.</p>
+                                </div>
+
+                                <!-- Short Term Goal Column -->
+                                <div class="lg:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div class="space-y-3">
+                                        <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest">Short-Term Goal (1-2 Minggu)</label>
+                                        <textarea onchange="updateForm('stg', this.value)" 
+                                            class="w-full border border-slate-200 rounded-xl p-3 text-sm focus:border-indigo-400 outline-none h-20 bg-white" 
+                                            placeholder="Misal: Bengkak hilang, bisa jalan tanpa nyeri...">${data.stg || ''}</textarea>
+                                        <div class="flex flex-wrap gap-2">
+                                            ${['Progress', 'Achieved', 'Delayed'].map(s => `
+                                                <button type="button" data-status="${s}" onclick="setGoalStatus('stg_status', '${s}', this)" 
+                                                    class="text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all ${data.stg_status === s ? 'bg-indigo-600 text-white border-indigo-600 shadow-md transform scale-105' : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-300'}">
+                                                    ${s}
+                                                </button>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                    <div class="space-y-3">
+                                        <label class="block text-[10px] font-black text-slate-400 uppercase tracking-widest">Long-Term Goal (4-8 Minggu)</label>
+                                        <textarea onchange="updateForm('ltg', this.value)" 
+                                            class="w-full border border-slate-200 rounded-xl p-3 text-sm focus:border-indigo-400 outline-none h-20 bg-white" 
+                                            placeholder="Misal: Kembali main sepak bola, lari 5km...">${data.ltg || ''}</textarea>
+                                        <div class="flex flex-wrap gap-2">
+                                            ${['Progress', 'Achieved', 'Delayed'].map(s => `
+                                                <button type="button" data-status="${s}" onclick="setGoalStatus('ltg_status', '${s}', this)" 
+                                                    class="text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all ${data.ltg_status === s ? 'bg-indigo-600 text-white border-indigo-600 shadow-md transform scale-105' : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-300'}">
+                                                    ${s}
+                                                </button>
+                                            `).join('')}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- SECTION 09: INTERVENTION SECTION (FULL WIDTH) -->
+                        <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
+                        <!-- SECTION 09: INTERVENTION SECTION (FULL WIDTH) -->
                         <div class="bg-white p-6 md:p-8 rounded-2xl border border-slate-200 shadow-sm mt-2">
                             <div class="flex items-center gap-3 mb-6 border-b border-slate-100 pb-4">
                                 <div class="bg-cyan-600 text-white p-2 rounded-lg shadow-cyan-200 shadow-md">
@@ -4949,6 +5478,9 @@ function renderAssessmentForm(container, useTempData = false) {
                                 </div>
                             </div>
                             <div class="bg-slate-50 p-6 rounded-2xl border border-slate-200 flex-1">
+                                <div id="cpg-phase-container">
+                                    ${renderCPGPhasePicker(data.selected_template)}
+                                </div>
                                 <!-- Modalitas Suggestions from Master -->
                                 <div id="modality-suggestion-container">
                                     ${renderModalitySuggestions()}
@@ -5151,8 +5683,8 @@ function renderModalitySuggestionsOnly() {
     
     // Clean & Sort so common ones like IR/US appear first if short names
     const list = [...state.treatments]
-        .filter(t => t && t.name && t.name.trim() !== "")
-        .sort((a,b) => a.name.length - b.name.length);
+        .filter(t => t && t.name && String(t.name).trim() !== "")
+        .sort((a,b) => String(a.name).length - String(b.name).length);
     const selected = window.tempFormData.intervention || [];
 
     const buttons = list.map(t => {
@@ -5160,7 +5692,7 @@ function renderModalitySuggestionsOnly() {
         const activeClass = isSelected ? 'bg-cyan-600 text-white border-cyan-700 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-cyan-400 hover:bg-cyan-50';
         return `
             <button type="button" 
-                onclick="toggleModality('${t.name.replace(/'/g, "\\'")}')" 
+                onclick="toggleModality('${String(t.name).replace(/'/g, "\\'")}')" 
                 class="px-3 py-1.5 rounded-xl border text-[11px] font-black transition-all flex items-center gap-1.5 ${activeClass}">
                 ${isSelected ? '<i data-lucide="check" width="12"></i>' : '<i data-lucide="plus" width="12" class="opacity-30"></i>'}
                 ${t.name}
@@ -5199,7 +5731,7 @@ function renderListItems(category) {
             <div class="flex items-center gap-2 p-3 rounded-lg bg-white border border-slate-200 text-sm text-slate-700 shadow-sm">
                 <i data-lucide="check-circle" width="16" class="text-emerald-500"></i> 
                 <span class="flex-1">${item}</span>
-                <button type="button" onclick="toggleFormItem('eval', '${item.replace(/"/g, '&quot;').replace(/'/g, '\\\'')}')" class="text-slate-300 hover:text-red-500 transition-colors">
+                <button type="button" onclick="toggleFormItem('eval', '${String(item).replace(/"/g, '&quot;').replace(/'/g, '\\\'')}')" class="text-slate-300 hover:text-red-500 transition-colors">
                     <i data-lucide="x" width="16"></i>
                 </button>
             </div>`).join('');
@@ -5208,7 +5740,7 @@ function renderListItems(category) {
     // Default for checkboxes (Intervention)
     return list.map(item => `
         <label class="flex items-center gap-2 p-2.5 rounded-lg cursor-pointer text-sm border select-none bg-blue-50 text-blue-700 border-blue-100 transition-colors hover:bg-blue-100">
-            <input type="checkbox" checked onchange="toggleFormItem('${category}', '${item.replace(/"/g, '&quot;').replace(/'/g, '\\\'')}')" class="accent-blue-600 w-4 h-4 rounded">
+            <input type="checkbox" checked onchange="toggleFormItem('${category}', '${String(item).replace(/"/g, '&quot;').replace(/'/g, '\\\'')}')" class="accent-blue-600 w-4 h-4 rounded">
             <span class="leading-none">${item}</span>
         </label>`).join('');
 }
@@ -5229,11 +5761,42 @@ function renderFormSelect(label, objKey, val, options, tiny = false) {
 
 function updateForm(key, val) {
     if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
-    window.tempFormData[key] = val;
+    
+    // Auto-cast numeric clinical keys for trend analysis
+    const numericKeys = ['vas', 'mmt_d', 'mmt_s', 'rom_numeric', 'last_om_score'];
+    if (numericKeys.includes(key)) {
+        window.tempFormData[key] = val === '' ? null : Number(val);
+    } else {
+        window.tempFormData[key] = val;
+    }
 }
 function updateFormObj(key, val) {
     if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
     window.tempFormData.obj[key] = val;
+}
+
+function setGoalStatus(field, val, btn) {
+    if (window.tempFormData && (window.tempFormData.is_locked === true || window.tempFormData.is_locked === 'true')) return;
+    
+    // 1. Update State
+    updateForm(field, val);
+    
+    // 2. Surgical UI Update (No Re-render flicker)
+    const container = btn.parentElement;
+    const buttons = container.querySelectorAll('button');
+    
+    buttons.forEach(b => {
+        // Reset to inactive styles
+        b.className = "text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all bg-white text-slate-500 border-slate-200 hover:border-indigo-300";
+        
+        // Mark selected as active
+        if (b.getAttribute('data-status') === val) {
+            b.className = "text-[9px] font-bold px-3 py-1.5 rounded-full border transition-all bg-indigo-600 text-white border-indigo-600 shadow-md transform scale-105";
+        }
+    });
+
+    // Option: Trigger a small sound/vibration if available locally
+    if ('vibrate' in navigator) navigator.vibrate(50);
 }
 
 // [ISOM HELPERS]
@@ -5439,6 +6002,9 @@ function applyTemplate(tName) {
     const t = ICF_TEMPLATES[tName];
     if (!t) return;
 
+    state.currentRegion = t.region || null; // [NEW] Untuk filter Outcome Measure
+    window.tempFormData = { ...window.tempFormData };
+
     // Base metadata
     window.tempFormData.diagnosis = tName;
     window.tempFormData.icd = t.icd || '';
@@ -5477,6 +6043,36 @@ function applyTemplate(tName) {
     window.tempFormData.hms_notes = '';
 
     showToast(`Template ${tName} dimuat dengan Auto-Discovery!`, 'success');
+    window.tempFormData.selected_template = tName;
+
+    // --- SMART OUTCOME LINKAGE ---
+    // Cari instrumen ukur yang paling cocok dengan diagnosa baru
+    window.tempRecommendedOM = '';
+    for (const [key, data] of Object.entries(OUTCOME_MEASURES)) {
+        if (data.keywords && data.keywords.some(kw => tName.toLowerCase().includes(kw))) {
+            window.tempRecommendedOM = key;
+            break;
+        }
+    }
+
+    // --- SMART NEURO LINKAGE ---
+    // Auto-fill relevant Dermatomes & Myotomes based on diagnosis keywords
+    const lowerDiag = tName.toLowerCase();
+    const neuroMapping = [
+        { kws: ['hnp l4', 'l4-l5', 'sciatica', 'iskhialgia'], derma: ['L4', 'L5'], myo: ['L4 (Ankle Dorsiflexion)', 'L5 (Big Toe Extension)'] },
+        { kws: ['hnp l5', 'l5-s1'], derma: ['L5', 'S1'], myo: ['L5 (Big Toe Extension)', 'S1 (Ankle Plantarflexion)'] },
+        { kws: ['cervical radiculopathy', 'hnp c5', 'c5-c6'], derma: ['C5', 'C6'], myo: ['C5 (Shoulder Abduction)', 'C6 (Wrist Extension)'] },
+        { kws: ['hnp c6', 'c6-c7'], derma: ['C6', 'C7'], myo: ['C6 (Wrist Extension)', 'C7 (Elbow Extension)'] },
+        { kws: ['carpall tunnel', 'cts'], derma: ['CN V3 (Mandibular)', 'C6'], myo: [] }, // Just example
+    ];
+
+    const foundLink = neuroMapping.find(m => m.kws.some(kw => lowerDiag.includes(kw)));
+    if (foundLink) {
+        window.tempFormData.neuro_dermatome_mth = foundLink.derma.join(', ');
+        window.tempFormData.neuro_myotome_mth = foundLink.myo.join(', ');
+        showToast('Level Neurologis disarankan secara otomatis.', 'info');
+    }
+
     renderAssessmentForm(document.getElementById('main-content'), true);
 }
 
@@ -5644,7 +6240,7 @@ async function processBackgroundUpload(assessmentId, fileData, fileName, patient
                 }
 
                 showToast('🚀 Link Dokumen Tersimpan!', 'success');
-                if (state.scriptUrl) syncDelta(false);
+                if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
             }
         } else {
             console.error("Background upload failed:", res.message);
@@ -5820,7 +6416,7 @@ async function finalizeSaveAssessment(data) {
     saveData();
 
     // NON-BLOCKING SYNC: Langsung pindah halaman, sync jalan di background (3s buffer)
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
 
     navigate('assessments');
 }
@@ -5855,8 +6451,89 @@ window.handleRontgenUpload = async (input) => {
 };
 
 function selectTemplateAndGo(tName) { applyTemplate(tName); showStep2(); }
-function goToFormManual() { window.tempFormData.diagnosis = state.selectedPatient ? state.selectedPatient.diagnosis : ''; showStep2(); }
-function showStep1() { document.getElementById('step-1').classList.remove('hidden'); document.getElementById('step-2').classList.add('hidden'); }
+/** 
+ * [NEW] Tampilkan popup pilih Dewasa / Anak sebelum buka form manual
+ * User diminta pilih secara eksplisit, tidak perlu deteksi otomatis
+ */
+function openManualFormDialog() {
+    const p = state.selectedPatient;
+    const autoAge = (p && p.dob) ? calculateAge(p.dob) : null;
+    const autoType = autoAge !== null ? (autoAge < 18 ? 'anak' : 'dewasa') : null;
+    const namaPasien = p ? p.name : 'Pasien';
+
+    // Buat overlay popup
+    const overlay = document.createElement('div');
+    overlay.id = 'manual-type-overlay';
+    overlay.className = 'fixed inset-0 z-[9999] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+    overlay.innerHTML = `
+        <div class="bg-white rounded-3xl shadow-2xl p-8 w-full max-w-md mx-4 animate-[fadeIn_0.2s_ease]">
+            <div class="text-center mb-6">
+                <div class="w-14 h-14 bg-blue-100 rounded-2xl flex items-center justify-center mx-auto mb-4">
+                    <i data-lucide="user-check" class="text-blue-600" width="28"></i>
+                </div>
+                <h3 class="text-xl font-black text-slate-800 mb-1">Jenis Pasien</h3>
+                <p class="text-sm text-slate-500">Pilih kategori untuk <span class="font-bold text-blue-600">${namaPasien}</span></p>
+                ${autoType ? `<p class="text-[10px] text-slate-400 mt-1 italic">Deteksi otomatis: <span class="font-bold ${autoType === 'anak' ? 'text-purple-500' : 'text-emerald-500'}">${autoType === 'anak' ? '🧒 Anak/Pediatri' : '🧑 Dewasa'}</span></p>` : ''}
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+                <button onclick="goToFormManual('dewasa')"
+                    class="flex flex-col items-center gap-3 p-6 bg-emerald-50 border-2 border-emerald-200 hover:border-emerald-500 hover:bg-emerald-100 rounded-2xl transition-all group cursor-pointer">
+                    <div class="w-12 h-12 bg-emerald-100 group-hover:bg-emerald-500 rounded-xl flex items-center justify-center transition-colors text-2xl">🧑</div>
+                    <div class="text-center">
+                        <p class="font-black text-slate-800 text-sm">Dewasa</p>
+                        <p class="text-[10px] text-slate-400">Usia ≥ 18 tahun</p>
+                    </div>
+                </button>
+                <button onclick="goToFormManual('anak')"
+                    class="flex flex-col items-center gap-3 p-6 bg-purple-50 border-2 border-purple-200 hover:border-purple-500 hover:bg-purple-100 rounded-2xl transition-all group cursor-pointer">
+                    <div class="w-12 h-12 bg-purple-100 group-hover:bg-purple-500 rounded-xl flex items-center justify-center transition-colors text-2xl">🧒</div>
+                    <div class="text-center">
+                        <p class="font-black text-slate-800 text-sm">Anak / Pedi</p>
+                        <p class="text-[10px] text-slate-400">Usia &lt; 18 tahun</p>
+                    </div>
+                </button>
+            </div>
+            <button onclick="document.getElementById('manual-type-overlay').remove()"
+                class="mt-4 w-full text-xs text-slate-400 hover:text-slate-600 py-2 transition-colors">Batal</button>
+        </div>`;
+    document.body.appendChild(overlay);
+    renderIcons();
+}
+
+function goToFormManual(patientType) {
+    state.currentRegion = null; // [NEW] Manual = Tampilkan semua OM
+    // Tutup popup jika masih ada
+    const overlay = document.getElementById('manual-type-overlay');
+    if (overlay) overlay.remove();
+
+    window.tempFormData.diagnosis = state.selectedPatient ? state.selectedPatient.diagnosis : '';
+
+    // Set flag pedi berdasarkan pilihan eksplisit user
+    if (patientType === 'anak') {
+        window._manualFormIsPedi = true;   // Pedi → tampilkan prenatal/natal/postnatal
+    } else if (patientType === 'dewasa') {
+        window._manualFormIsPedi = false;  // Dewasa → tidak tampilkan
+    } else {
+        // Fallback: auto-detect dari DOB jika patientType tidak diberikan
+        const _p = state.selectedPatient;
+        const _age = (_p && _p.dob) ? calculateAge(_p.dob) : null;
+        window._manualFormIsPedi = _age !== null ? (_age < 18) : null;
+    }
+
+    // [FIX] Render ulang form supaya block HTML Pediatric menyadari perubahan flag `_manualFormIsPedi`
+    const mainCt = document.getElementById('main-content');
+    if (mainCt) {
+        renderAssessmentForm(mainCt, true); // true = perhatikan window.tempFormData dan state flag terbaru
+    }
+
+    showStep2();
+}
+
+function showStep1() { 
+    state.currentRegion = null; // Reset saat kembali ke menu awal
+    document.getElementById('step-1').classList.remove('hidden'); 
+    document.getElementById('step-2').classList.add('hidden'); 
+}
 function showStep2() { document.getElementById('step-1').classList.add('hidden'); document.getElementById('step-2').classList.remove('hidden'); const scrollArea = document.getElementById('main-form-scroll'); if (scrollArea) scrollArea.scrollTop = 0; renderIcons(); }
 function updateICFSelectionUI() {
     // Granular update: only rebuild the filter pills and template grid.
@@ -6378,7 +7055,7 @@ async function confirmAppointment(id, fromUrl = false) {
 
         await saveData();
 
-        if (state.scriptUrl) {
+        if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
             syncDelta(false);
         }
 
@@ -6488,7 +7165,7 @@ async function finalizeSave() {
     closeModal();
     document.getElementById('choice-modal').classList.add('hidden');
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     if (state.currentView === 'schedule') renderScheduleView(document.getElementById('main-content'));
     else navigate('schedule');
 }
@@ -6501,7 +7178,7 @@ async function finalizeDelete() {
     closeModal();
     document.getElementById('choice-modal').classList.add('hidden');
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderScheduleView(document.getElementById('main-content'));
 }
 
@@ -6703,7 +7380,7 @@ async function submitPatientForm() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) {
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
         // [Sync Instant] _dirty flag guarantees this gets included in filterDelta
         syncDelta(false);
     }
@@ -6757,6 +7434,133 @@ function updatePatientGenderUI() {
 }
 
 // --- 15. CONFIG & USER MGMT ---
+function renderAboutView(container) {
+    container.innerHTML = `
+        <div class="max-w-4xl mx-auto space-y-8 fade-in pb-20">
+            <!-- Hero Section -->
+            <div class="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-900 to-slate-800 p-8 md:p-12 text-white shadow-2xl border border-slate-700">
+                <div class="absolute top-0 right-0 -mt-10 -mr-10 w-96 h-96 bg-blue-600/10 rounded-full blur-3xl animate-pulse"></div>
+                <div class="relative z-10 flex flex-col items-center text-center md:items-start md:text-left md:flex-row gap-8">
+                    <div class="w-24 h-24 bg-white/10 backdrop-blur-xl rounded-2xl flex items-center justify-center border border-white/20 shadow-xl shrink-0">
+                         <i data-lucide="shield-check" width="48" class="text-blue-400"></i>
+                    </div>
+                    <div class="flex-1">
+                        <div class="flex flex-col md:flex-row items-center gap-3 mb-2">
+                            <h2 class="text-4xl font-black tracking-tight uppercase">FISIOTA</h2>
+                            <span class="px-3 py-1 bg-blue-600 rounded-full text-[10px] font-black uppercase tracking-widest text-white border border-blue-400/30">PRO EDITION</span>
+                        </div>
+                        <p class="text-slate-400 text-lg font-medium max-w-xl mb-6 leading-relaxed">
+                            Smart EMR Solutions for Modern Physiotherapy.
+                        </p>
+                        <div class="flex flex-wrap justify-center md:justify-start gap-3 text-[10px] font-black uppercase tracking-widest">
+                            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 rounded-xl border border-white/10">
+                                <i data-lucide="layers" width="14" class="text-blue-400"></i> v5.5.2
+                            </div>
+                            <div class="flex items-center gap-2 px-4 py-2 bg-white/5 rounded-xl border border-white/10">
+                                <i data-lucide="map-pin" width="14" class="text-red-400"></i> Blitar, East Java
+                            </div>
+                            <div class="flex items-center gap-2 px-4 py-2 bg-emerald-500/10 text-emerald-400 rounded-xl border border-emerald-500/20">
+                                <i data-lucide="calendar" width="14"></i> Est. 2025
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <!-- Developer Profile (Arzhuma) -->
+                <div class="md:col-span-2 bg-white rounded-3xl shadow-xl border border-slate-100 p-8 hover:shadow-2xl transition-all duration-500 relative overflow-hidden">
+                    <div class="absolute top-0 right-0 w-32 h-32 bg-blue-50/50 rounded-bl-full opacity-50"></div>
+                    <div class="flex flex-col sm:flex-row items-center gap-6 mb-8 relative z-10">
+                        <div class="w-20 h-20 rounded-full bg-gradient-to-br from-blue-600 to-indigo-700 flex items-center justify-center text-white text-3xl font-black shadow-lg border-4 border-slate-50 shrink-0">
+                            AL
+                        </div>
+                        <div class="text-center sm:text-left">
+                            <h3 class="text-2xl font-black text-slate-800 uppercase tracking-tight">Arzhuma Arza Lazuardy, S.Kes., Ftr.</h3>
+                            <p class="text-blue-600 font-bold uppercase tracking-widest text-[10px] mt-1">Founder of FISIOTA & Professional Physiotherapist</p>
+                            <div class="flex justify-center sm:justify-start gap-3 mt-4">
+                                <a href="https://www.linkedin.com/in/arzhuma/" target="_blank" class="w-9 h-9 flex items-center justify-center bg-slate-100 rounded-full text-slate-400 hover:bg-blue-600 hover:text-white transition-all"><i data-lucide="linkedin" width="16"></i></a>
+                                <a href="https://wa.me/6285706988750" target="_blank" class="w-9 h-9 flex items-center justify-center bg-slate-100 rounded-full text-slate-400 hover:bg-emerald-600 hover:text-white transition-all"><i data-lucide="message-circle" width="16"></i></a>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="space-y-6 relative z-10">
+                        <div class="grid grid-cols-2 gap-4">
+                            <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                                <p class="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-2 italic">Core Expertise</p>
+                                <ul class="space-y-1.5 font-bold text-xs text-slate-700">
+                                    <li class="flex items-center gap-2"><i data-lucide="monitor" width="12" class="text-blue-500"></i> EMR Development</li>
+                                    <li class="flex items-center gap-2"><i data-lucide="users" width="12" class="text-blue-500"></i> Clinical Physio</li>
+                                </ul>
+                            </div>
+                            <div class="bg-blue-50 p-4 rounded-2xl border border-blue-100">
+                                <p class="text-[9px] font-black text-blue-400 uppercase tracking-widest mb-2 italic">Collaboration With</p>
+                                <p class="font-bold text-xs text-blue-900 leading-tight">Ari Sudarsono, Ftr., M.Fis., CNDP</p>
+                            </div>
+                        </div>
+                        <div class="bg-slate-900 text-white p-5 rounded-2xl shadow-lg border border-slate-700">
+                             <i data-lucide="quote" width="20" class="text-blue-400 mb-2 opacity-30"></i>
+                             <p class="text-sm font-medium leading-relaxed italic pr-4">
+                                "Sistem ini dibangun dengan pemahaman mendalam tentang praktik fisioterapi sehari-hari, bertujuan menghapus hambatan administrasi dan meningkatkan presisi klinis."
+                             </p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Contact & Studio Card -->
+                <div class="bg-blue-600 rounded-3xl p-8 text-white shadow-xl shadow-blue-400/20 flex flex-col justify-between overflow-hidden relative group">
+                    <div class="absolute -bottom-10 -right-10 w-40 h-40 bg-white/10 rounded-full blur-3xl group-hover:bg-white/20 transition-all duration-700"></div>
+                    <div class="relative z-10">
+                        <div class="bg-white/20 w-12 h-12 rounded-2xl flex items-center justify-center mb-6 backdrop-blur-md">
+                             <i data-lucide="heart-handshake" width="24" class="text-white"></i>
+                        </div>
+                        <h4 class="font-black text-xl mb-1 leading-tight uppercase">FISIOTA</h4>
+                        <p class="text-blue-100 text-[10px] font-bold opacity-80 uppercase tracking-[0.2em] mb-4">Innovation Lab</p>
+                    </div>
+                    <div class="space-y-3 mt-8 relative z-10">
+                        <p class="text-[9px] font-black opacity-50 uppercase tracking-widest">Customer Support</p>
+                        <a href="https://wa.me/6285706988750" target="_blank" class="flex items-center gap-3 p-3.5 bg-white text-blue-600 rounded-2xl hover:bg-blue-50 transition-all shadow-lg font-bold text-[11px]">
+                            <i data-lucide="message-circle" width="16"></i>
+                            <span>Admin 1 (0857-0698-8750)</span>
+                        </a>
+                        <a href="https://wa.me/6285117158750" target="_blank" class="flex items-center gap-3 p-3.5 bg-white/10 rounded-2xl border border-white/10 backdrop-blur-sm hover:bg-white/20 transition-all font-bold text-[11px]">
+                            <i data-lucide="message-square" width="16"></i>
+                            <span>Admin 2 (0851-1715-8750)</span>
+                        </a>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Global Reliability Footer -->
+            <div class="bg-white rounded-3xl p-8 border border-slate-100 shadow-sm relative overflow-hidden">
+                <div class="absolute top-0 left-0 w-1 h-full bg-blue-500"></div>
+                <div class="flex flex-col md:flex-row items-center justify-between gap-6">
+                    <div>
+                        <p class="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em] mb-2">Developed with High Standards</p>
+                        <div class="flex flex-wrap gap-x-6 gap-y-3">
+                            <div class="flex items-center gap-2 font-black text-slate-800 text-[10px]"><i data-lucide="shield" width="14" class="text-blue-500"></i> Standardized ICF & CPG</div>
+                            <div class="flex items-center gap-2 font-black text-slate-800 text-[10px]"><i data-lucide="cloud-lightning" width="14" class="text-amber-500"></i> Hybrid Cloud Infrastructure</div>
+                            <div class="flex items-center gap-2 font-black text-slate-800 text-[10px]"><i data-lucide="check-circle-2" width="14" class="text-emerald-500"></i> HIPAA Compliance Ready</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-6 opacity-30 grayscale shrink-0">
+                         <i data-lucide="activity" width="24" class="text-slate-800"></i>
+                         <i data-lucide="database" width="24" class="text-slate-800"></i>
+                         <i data-lucide="github" width="24" class="text-slate-800"></i>
+                    </div>
+                </div>
+            </div>
+
+            <div class="text-center pt-4">
+                <p class="text-[11px] text-slate-400 font-bold uppercase tracking-[0.3em] flex items-center justify-center gap-2">
+                    Copyright © 2025 FISIOTA. All Rights Reserved.
+                </p>
+            </div>
+        </div>
+    `;
+    lucide.createIcons();
+}
+
 function renderConfigView(container, activeTab = 'identity') {
     const conf = state.pdfConfig || {};
     container.innerHTML = `
@@ -6784,34 +7588,148 @@ function renderConfigView(container, activeTab = 'identity') {
         </div>
 
         <div id="tab-content-license" class="config-tab-content hidden">
-            <div class="bg-white p-8 rounded-xl shadow border border-slate-200 text-center max-w-2xl mx-auto">
-                <div class="w-20 h-20 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mx-auto mb-6">
-                    <i data-lucide="crown" width="40"></i>
-                </div>
-                <h3 class="text-2xl font-black text-slate-800 mb-2">Status Berlangganan</h3>
-                <p class="text-slate-500 mb-8">Informasi masa aktif lisensi aplikasi Anda.</p>
-                
-                <div class="grid grid-cols-2 gap-4 text-left max-w-md mx-auto mb-8 bg-slate-50 p-6 rounded-xl border border-slate-100 text-sm">
-                    <div class="text-slate-500 font-bold">Paket Saat Ini</div>
-                    <div class="font-bold text-slate-800 text-right" id="conf-lic-plan">-</div>
+            <div class="max-w-4xl mx-auto space-y-6">
+                <!-- Status Card -->
+                <div class="bg-white p-8 rounded-2xl shadow-sm border border-slate-200 text-center relative overflow-hidden">
+                    <div class="absolute top-0 right-0 p-4">
+                         <button onclick="refreshLicenseStatus()" class="p-2 text-slate-400 hover:text-blue-600 transition-all" title="Refresh Status">
+                            <i data-lucide="refresh-cw" width="20"></i>
+                        </button>
+                    </div>
+                    <div class="w-16 h-16 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4 rotate-3">
+                        <i data-lucide="crown" width="32"></i>
+                    </div>
+                    <h3 class="text-xl font-black text-slate-800">Status Lisensi</h3>
+                    <p class="text-slate-500 text-sm mb-6">Kelola masa aktif dan paket layanan klinik Anda.</p>
                     
-                    <div class="text-slate-500 font-bold">Status</div>
-                    <div class="font-bold text-green-600 text-right uppercase" id="conf-lic-status">-</div>
-                    
-                    <div class="text-slate-500 font-bold">Berlaku Sampai</div>
-                    <div class="font-bold text-slate-800 text-right" id="conf-lic-expiry">-</div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Paket</p>
+                             <p class="font-black text-slate-800" id="conf-lic-plan">-</p>
+                        </div>
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Status</p>
+                             <p class="font-black text-green-600 uppercase" id="conf-lic-status">-</p>
+                        </div>
+                        <div class="bg-slate-50 p-4 rounded-xl border border-slate-100">
+                             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Berlaku Sampai</p>
+                             <p class="font-black text-slate-800" id="conf-lic-expiry">-</p>
+                        </div>
+                    </div>
+
+                    <div class="py-6 border-t border-dashed border-slate-200">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2">HITUNG MUNDUR EXPIRED</p>
+                        <div class="text-4xl md:text-6xl font-black text-blue-600 font-mono tracking-tighter" id="conf-lic-countdown">-- : -- : --</div>
+                    </div>
                 </div>
 
-                <div class="mb-8">
-                    <div class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">SISA WAKTU</div>
-                    <div class="text-5xl font-black text-blue-600 font-mono tracking-tight" id="conf-lic-countdown">-- : -- : --</div>
-                </div>
+                <!-- Renewal Section -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- Step 1: Pilih Paket -->
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                        <h4 class="font-bold text-slate-800 flex items-center gap-2 mb-4">
+                            <span class="w-6 h-6 bg-slate-800 text-white rounded-full flex items-center justify-center text-xs">1</span>
+                            Pilih Paket Perpanjangan
+                        </h4>
+                        <div class="space-y-3">
+                            <label class="block p-4 rounded-xl border-2 border-slate-100 cursor-pointer hover:border-blue-200 transition-all has-[:checked]:border-blue-500 has-[:checked]:bg-blue-50">
+                                <input type="radio" name="renew_plan" value="30days" class="hidden" checked onchange="updatePaymentAmount(100000)">
+                                <div class="flex justify-between items-center">
+                                    <div>
+                                        <p class="font-bold text-slate-800">Paket Bulanan</p>
+                                        <p class="text-xs text-slate-500">Masa aktif 30 hari (Akumulasi)</p>
+                                    </div>
+                                    <p class="font-black text-blue-600">Rp 100.000</p>
+                                </div>
+                            </label>
+                            <label class="block p-4 rounded-xl border-2 border-slate-100 cursor-pointer hover:border-blue-200 transition-all has-[:checked]:border-blue-500 has-[:checked]:bg-blue-50">
+                                <input type="radio" name="renew_plan" value="3months" class="hidden" onchange="updatePaymentAmount(300000)">
+                                <div class="flex justify-between items-center">
+                                    <div>
+                                        <p class="font-bold text-slate-800">Paket Triwulan</p>
+                                        <p class="text-xs text-slate-500">Masa aktif 90 hari</p>
+                                    </div>
+                                    <p class="font-black text-blue-600">Rp 300.000</p>
+                                </div>
+                            </label>
+                            <label class="block p-4 rounded-xl border-2 border-slate-100 cursor-pointer hover:border-blue-200 transition-all has-[:checked]:border-blue-500 has-[:checked]:bg-blue-50">
+                                <input type="radio" name="renew_plan" value="1year" class="hidden" onchange="updatePaymentAmount(1100000)">
+                                <div class="flex justify-between items-center">
+                                    <div>
+                                        <p class="font-bold text-slate-800">Paket Tahunan</p>
+                                        <p class="text-xs text-slate-500">Masa aktif 365 hari (Hemat & Praktis)</p>
+                                    </div>
+                                    <p class="font-black text-blue-600">Rp 1.100.000</p>
+                                </div>
+                            </label>
+                        </div>
+                        
+                        <div class="mt-6 p-4 bg-amber-50 rounded-xl border border-amber-100 flex gap-3">
+                            <i data-lucide="info" class="text-amber-600 shrink-0" width="20"></i>
+                            <p class="text-[11px] text-amber-800 leading-relaxed italic">
+                                <b>Catatan:</b> Pembayaran dilakukan melalui transfer bank/e-wallet. Lisensi Anda akan diperpanjang secara otomatis setelah bukti bayar terverifikasi oleh Admin (5-30 menit).
+                            </p>
+                        </div>
+                    </div>
 
-                <button onclick="refreshLicenseStatus()" class="bg-slate-800 hover:bg-slate-700 text-white px-8 py-3 rounded-xl font-bold transition-all shadow-lg flex items-center gap-2 mx-auto">
-                    <i data-lucide="refresh-cw" width="16"></i> Perbarui Status Lisensi
-                </button>
+                    <!-- Step 2: Konfirmasi Bayar -->
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col">
+                        <h4 class="font-bold text-slate-800 flex items-center gap-2 mb-4">
+                            <span class="w-6 h-6 bg-slate-800 text-white rounded-full flex items-center justify-center text-xs">2</span>
+                            Konfirmasi Pembayaran
+                        </h4>
+                        
+                        <div class="bg-slate-900 text-white p-6 rounded-2xl mb-6 relative overflow-hidden">
+                            <div class="absolute -right-4 -bottom-4 text-white/5 rotate-12"><i data-lucide="credit-card" width="120"></i></div>
+                            <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-4">Tujuan Transfer</p>
+                            <div class="space-y-4 relative z-10">
+                                <div>
+                                    <p class="text-xs text-slate-400">Nama Bank / E-Wallet</p>
+                                    <p class="text-xl font-bold">SEA BANK / SHOPEEPAY</p>
+                                </div>
+                                <div class="flex flex-col gap-2">
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-xs text-slate-400">SeaBank:</span>
+                                        <span class="font-bold font-mono tracking-wider">901228478320</span>
+                                    </div>
+                                    <div class="flex justify-between items-center">
+                                        <span class="text-xs text-slate-400">ShopeePay:</span>
+                                        <span class="font-bold font-mono tracking-wider">085706988750</span>
+                                    </div>
+                                    <div class="pt-2 border-t border-slate-700 text-center">
+                                        <p class="text-[10px] text-slate-500 italic">Atas Nama: Arzhuma Arza Lazuardy</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+
+                        <div class="space-y-4 mt-auto">
+                            <div>
+                                <label class="text-xs font-bold text-slate-500 uppercase block mb-2">Upload Bukti Transfer</label>
+                                <div class="flex items-center gap-4">
+                                    <div id="payment-proof-preview" class="w-16 h-16 bg-slate-100 rounded-xl border-2 border-dashed border-slate-300 flex items-center justify-center overflow-hidden shrink-0">
+                                        <i data-lucide="image" class="text-slate-400" width="24"></i>
+                                    </div>
+                                    <div class="flex-1">
+                                        <button onclick="document.getElementById('payment-upload-input').click()" class="w-full bg-white border-2 border-slate-200 hover:border-blue-500 hover:text-blue-600 text-slate-600 py-2.5 rounded-xl text-sm font-bold transition-all flex items-center justify-center gap-2">
+                                            <i data-lucide="upload-cloud" width="18"></i> Pilih Gambar
+                                        </button>
+                                        <input type="file" id="payment-upload-input" accept="image/*" class="hidden" onchange="previewPaymentProof(event)">
+                                    </div>
+                                </div>
+                            </div>
+
+                            <button onclick="submitPaymentProof()" id="btn-submit-payment" class="w-full bg-blue-600 hover:bg-blue-700 text-white py-4 rounded-2xl font-black text-lg shadow-xl shadow-blue-200 transition-all btn-press flex items-center justify-center gap-3">
+                                <i data-lucide="send" width="24"></i>
+                                SUBMIT & PERPANJANG
+                            </button>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
+
 
         <div id="tab-content-booking" class="config-tab-content hidden">
             <div class="bg-white p-6 rounded-xl shadow border border-slate-200">
@@ -6902,9 +7820,9 @@ function renderConfigView(container, activeTab = 'identity') {
                                     </tbody>
                                 </table>
                             </div>
-                            <p class="text-[9px] text-slate-400 mt-2 leading-tight">
-                                💡 <b>Tips:</b> Jika 'Jam' diisi, maka Jam Default di atas akan diabaikan khusus hari tersebut. 
-                                Kolom 'Slot' menentukan berapa banyak pasien yang bisa booking di jam yang sama.
+                            <p class="text-[9px] border-l-2 border-blue-500 pl-2 text-slate-500 mt-2 leading-tight">
+                                💡 <b>Sistem Prioritas:</b> Jika 'Jam' di tabel ini diisi, maka pilihan di bagian 'Jam Buka Default' di atas akan <b>diabaikan sepenuhnya</b> untuk hari tersebut. 
+                                Gunakan kolom 'Slot' untuk mengatur kapasitas pasien per jam (misal: isi 2 jika bisa melayani 2 pasien sekaligus).
                             </p>
                         </div>
 
@@ -6954,9 +7872,14 @@ function renderConfigView(container, activeTab = 'identity') {
                             <div id="booking-link-display" class="bg-white p-3 rounded-lg border border-slate-200 text-xs font-mono text-slate-500 break-all min-h-[48px] flex items-center">
                                 <span class="italic">Isi Alias dan klik Simpan...</span>
                             </div>
-                            <button onclick="copyBookingLink()" id="btn-copy-link" class="mt-3 w-full bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm transition-all flex items-center justify-center gap-2">
-                                <i data-lucide="copy" width="14"></i> Salin Link
-                            </button>
+                            <div class="flex gap-2 mt-3">
+                                <button onclick="copyBookingLink()" id="btn-copy-link" class="flex-1 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 px-4 py-2.5 rounded-lg font-bold text-sm transition-all flex items-center justify-center gap-2">
+                                    <i data-lucide="copy" width="14"></i> Salin Link
+                                </button>
+                                <button id="btn-manual-sync" onclick="this.innerHTML='Sedang Proses...'; this.disabled=true; window.manualSyncActive=true; checkLicense().finally(() => { this.innerHTML='<i data-lucide=\'refresh-cw\' width=\'14\'></i> Sinkron Master'; this.disabled=false; lucide.createIcons(); });" class="flex-1 bg-indigo-600 text-white px-4 py-2.5 rounded-lg font-bold text-sm transition-all flex items-center justify-center gap-2 shadow-lg shadow-indigo-100">
+                                    <i data-lucide="refresh-cw" width="14"></i> Sinkron Master
+                                </button>
+                            </div>
                         </div>
                         <div class="bg-blue-50 p-4 rounded-xl border border-blue-100 text-sm text-blue-700">
                             <p class="font-bold mb-1">📋 Cara Pakai:</p>
@@ -7036,12 +7959,16 @@ function renderConfigView(container, activeTab = 'identity') {
                     </div>
 
                     <div class="p-6 bg-slate-50 rounded-2xl border border-slate-200">
-                        <h4 class="font-bold text-slate-800 mb-2">Pembersihan Cache Lokal</h4>
-                        <p class="text-xs text-slate-500 mb-4">Menghapus data sementara di browser dan memuat ulang dari Sheets.</p>
-                        <button onclick="if(confirm('Hapus cache dan muat ulang?')){ localStorage.clear(); location.reload(); }" class="text-slate-600 hover:text-red-600 text-sm font-bold flex items-center gap-2">
-                            <i data-lucide="trash-2" width="18"></i>
-                            Hapus Seluruh Data Browser (Berbahaya!)
-                        </button>
+                        <h4 class="font-bold text-slate-800 mb-2">Pembersihan Cache & Reset Total</h4>
+                        <p class="text-xs text-slate-500 mb-4">Gunakan ini jika aplikasi terasa "stuck" (tidak update). Ini akan menghapus seluruh cache browser dan memuat ulang dari nol.</p>
+                        <div class="flex gap-4">
+                            <button onclick="if(confirm('Hapus cache dan muat ulang aplikasi?')){ (async () => { const caches_ids = await caches.keys(); for (let id of caches_ids) { await caches.delete(id); } localStorage.clear(); location.reload(true); })(); }" class="bg-slate-800 text-white px-5 py-2.5 rounded-xl font-bold text-xs flex items-center gap-2">
+                                <i data-lucide="zap" width="14"></i> Paksa Reset Cache & Reload
+                            </button>
+                            <button onclick="if(confirm('Hapus seluruh data lokal?')){ localStorage.clear(); location.reload(); }" class="text-rose-600 hover:bg-rose-50 px-3 py-2 rounded-lg font-bold text-xs">
+                                <i data-lucide="trash-2" width="14" class="inline mb-0.5"></i> Clear LocalStorage
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -7168,19 +8095,24 @@ function renderConfigView(container, activeTab = 'identity') {
                             <div class="space-y-4 mb-6">
                                 <div class="relative pl-6">
                                     <div class="absolute left-0 top-0.5 w-4 h-4 rounded-full bg-sky-200 text-sky-700 flex items-center justify-center text-[10px] font-bold">1</div>
-                                    <p class="text-[11px] text-slate-600 font-medium">Buka <a href="https://t.me/userinfobot" target="_blank" class="text-sky-600 font-bold hover:underline">@userinfobot</a> di Telegram, klik <strong>START</strong>, lalu copy <strong>ID</strong> Anda.</p>
+                                    <p class="text-[11px] text-slate-600 font-medium">Buka <a href="https://t.me/botfather" target="_blank" class="text-sky-600 font-bold hover:underline">@BotFather</a>, buat Bot baru, lalu copy <strong>HTTP API Token</strong>-nya.</p>
                                 </div>
                                 <div class="relative pl-6">
                                     <div class="absolute left-0 top-0.5 w-4 h-4 rounded-full bg-sky-200 text-sky-700 flex items-center justify-center text-[10px] font-bold">2</div>
-                                    <p class="text-[11px] text-slate-600 font-medium">Pastikan Bot Aktif. Japri <a href="https://t.me/FisiotaReminder_bot" target="_blank" class="text-sky-600 font-bold hover:underline">@FisiotaReminder_bot</a> & klik <strong>START</strong> (atau undang ke grup Anda).</p>
+                                    <p class="text-[11px] text-slate-600 font-medium">Masukkan Token tersebut ke kolom <strong>Bot Token</strong> di bawah. Klik <strong>Simpan</strong> di bagian atas setelah mengisi.</p>
                                 </div>
                                 <div class="relative pl-6">
                                     <div class="absolute left-0 top-0.5 w-4 h-4 rounded-full bg-sky-200 text-sky-700 flex items-center justify-center text-[10px] font-bold">3</div>
-                                    <p class="text-[11px] text-slate-600 font-medium">Masukkan ID tadi ke kolom <strong>Chat ID</strong> di bawah ini.</p>
+                                    <p class="text-[11px] text-slate-600 font-medium">Gunakan <a href="https://t.me/userinfobot" target="_blank" class="text-sky-600 font-bold hover:underline">@userinfobot</a> (pribadi) atau undang Bot ke grup & pakai @GetIDsBot untuk dapat <strong>Chat ID</strong>.</p>
                                 </div>
-                                <div class="relative pl-6">
-                                    <div class="absolute left-0 top-0.5 w-4 h-4 border border-sky-300 text-sky-500 flex items-center justify-center text-[10px] font-bold rounded-full italic">?</div>
-                                    <p class="text-[10px] text-slate-500 italic">Ingin pakai Bot sendiri? Buat di <a href="https://t.me/botfather" target="_blank" class="text-sky-600 font-bold hover:underline">@BotFather</a> dan masukkan Token-nya.</p>
+                                
+                                <div class="mt-4 p-3 bg-amber-50 rounded-lg border border-amber-100">
+                                    <p class="text-[10px] text-amber-800 font-bold mb-1 flex items-center gap-1">
+                                        <i data-lucide="info" width="12"></i> PENTING UNTUK GRUP:
+                                    </p>
+                                    <p class="text-[9px] text-amber-700 leading-tight italic">
+                                        Agar bot bisa mengirim notifikasi ke grup, Anda wajib mengundang bot tersebut ke grup klinik Anda dan <strong>Promosikan sebagai ADMIN</strong> (Izin: Send Messages).
+                                    </p>
                                 </div>
                             </div>
 
@@ -7280,9 +8212,49 @@ function renderConfigView(container, activeTab = 'identity') {
         <div id="tab-content-system" class="config-tab-content hidden">
              <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div class="bg-white p-6 rounded-xl shadow border border-slate-200">
-                    <div class="flex justify-between items-center mb-4"><h3 class="font-bold text-lg text-slate-800">Manajemen User</h3><button onclick="openUserModal()" class="bg-indigo-600 text-white px-3 py-1.5 rounded text-xs font-bold hover:bg-indigo-700 flex gap-1 items-center"><i data-lucide="plus" width="14"></i> Baru</button></div>
-                    <div class="max-h-48 overflow-y-auto">
-                        <table class="w-full text-sm text-left"><tbody class="divide-y divide-slate-100">${state.users.map(u => `<tr><td class="py-2"><span class="font-bold text-slate-700">${u.name}</span><br><span class="text-xs text-slate-400">@${u.username}</span></td><td class="text-right"><button onclick="openUserModal('${u.id}')" class="text-blue-600 p-1"><i data-lucide="edit-3" width="14"></i></button>${u.username !== 'admin' ? `<button onclick="deleteUser('${u.id}')" class="text-red-600 p-1"><i data-lucide="trash-2" width="14"></i></button>` : ''}</td></tr>`).join('')}</tbody></table>
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="font-bold text-lg text-slate-800">Manajemen User</h3>
+                        <button onclick="openUserModal()" class="bg-indigo-600 text-white px-3 py-1.5 rounded text-xs font-bold hover:bg-indigo-700 flex gap-1 items-center">
+                            <i data-lucide="plus" width="14"></i> Baru
+                        </button>
+                    </div>
+
+                    <!-- [NEW] Search Input for Users -->
+                    <div class="relative mb-3">
+                        <i data-lucide="search" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" width="14"></i>
+                        <input type="text" id="user-search" oninput="filterUserList(this.value)" placeholder="Cari nama atau @username..." 
+                            class="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs focus:ring-2 focus:ring-indigo-500 outline-none transition-all">
+                    </div>
+
+                    <div class="max-h-64 overflow-y-auto pr-2" id="user-list-container">
+                        <table class="w-full text-sm text-left">
+                            <tbody class="divide-y divide-slate-100">
+                                ${state.users.map(u => `
+                                    <tr class="user-row">
+                                        <td class="py-3">
+                                            <div class="flex items-center gap-2">
+                                                <span class="font-bold text-slate-700">${u.name}</span>
+                                                <span class="px-1.5 py-0.5 text-[8px] font-black rounded ${u.role === 'ADMIN' ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-100 text-slate-500'}">
+                                                    ${u.role || 'FISIO'}
+                                                </span>
+                                            </div>
+                                            <span class="text-xs text-slate-400">@${u.username}</span>
+                                        </td>
+                                        <td class="text-right">
+                                            <div class="flex items-center justify-end gap-1">
+                                                <button onclick="openUserModal('${u.id}')" class="p-2 hover:bg-indigo-50 rounded-lg text-indigo-600 transition-colors" title="Edit User">
+                                                    <i data-lucide="edit-3" width="14"></i>
+                                                </button>
+                                                ${u.username !== 'admin' ? `
+                                                    <button onclick="deleteUser('${u.id}')" class="p-2 hover:bg-red-50 rounded-lg text-red-600 transition-colors" title="Hapus User">
+                                                        <i data-lucide="trash-2" width="14"></i>
+                                                    </button>
+                                                ` : '<div class="w-8"></div>'}
+                                            </div>
+                                        </td>
+                                    </tr>`).join('')}
+                            </tbody>
+                        </table>
                     </div>
                 </div>
                 <div class="space-y-6">
@@ -7478,8 +8450,8 @@ async function saveClinicConfig() {
     const btn = document.getElementById('btn-save-clinic');
     const originalText = btn.innerHTML;
 
-    // Sync to GAS
-    if (state.scriptUrl) {
+    // Sync to Cloud
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) {
         try {
             btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin" width="16"></i> Menyinkronkan...`;
             lucide.createIcons();
@@ -7516,14 +8488,14 @@ async function saveClinicConfig() {
             alert('✅ Identitas Klinik Berhasil Disimpan & Disinkronkan ke Cloud!');
         } catch (e) {
             console.warn("Sync failed, saved locally:", e);
-            alert('Tersimpan secara lokal (Sinkronisasi Cloud Gagal).');
+            alert('⚠️ Tersimpan Lokal (Sinkronisasi Cloud Gagal). Pastikan koneksi internet stabil.');
         } finally {
             btn.innerHTML = originalText;
             btn.disabled = false;
             lucide.createIcons();
         }
     } else {
-        alert('Identitas Klinik Berhasil Disimpan (Lokal)!');
+        alert('Identitas Klinik Berhasil Disimpan di Perangkat Ini!');
     }
     syncDelta(false);
 }
@@ -7532,7 +8504,7 @@ function updatePdfConfig(key, value) {
     localStorage.setItem('erm_pdf_config', JSON.stringify(state.pdfConfig));
     state.configUpdatedAt = new Date().toISOString();
     saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
 
 
 
@@ -7640,6 +8612,7 @@ async function saveBookingConfig() {
     state.bookingConfig.alias = alias;
     state.bookingConfig.availableHours = hours;
     state.bookingConfig.offDays = offDays;
+    state.bookingConfig.customHolidays = customHolidays; // [FIX] Persist custom holidays to state
     state.bookingConfig.dayConfig = dayConfig;
     state.bookingConfig._dirty = true; // [SYNC MARK]
 
@@ -7652,35 +8625,38 @@ async function saveBookingConfig() {
         lucide.createIcons();
 
         // [1] Sync to License Master (Mandatory for booking portal)
-        const payload = {
-            action: 'save_booking_config',
-            sheet_id: state.sheetId || getSheetIdFromUrl(state.scriptUrl),
-            alias: alias,
-            available_hours: hours,
-            off_days: offDays,
-            custom_holidays: customHolidays,
-            day_config: dayConfig
-        };
+        const licenseKey = state.licenseKey || localStorage.getItem('erm_license_key');
+        if (!licenseKey) {
+            console.warn("saveBookingConfig: No license key found, skipping master sync.");
+        } else {
+            const payload = {
+                action: 'save_booking_config',
+                license_key: licenseKey, // [FIX] Use license_key (not sheet_id) to find correct row in master
+                alias: alias,
+                available_hours: hours,
+                off_days: offDays,
+                custom_holidays: customHolidays,
+                day_config: JSON.stringify(dayConfig)
+            };
 
-        const res = await fetch(LICENSE_API_URL, {
-            method: 'POST', mode: 'cors',
-            headers: { 'Content-Type': 'text/plain' },
-            body: JSON.stringify(payload)
-        });
-        const result = await res.json();
+            fetch(LICENSE_API_URL, {
+                method: 'POST', 
+                mode: 'no-cors',
+                headers: { 'Content-Type': 'text/plain' },
+                body: JSON.stringify(payload)
+            }).catch(e => console.warn("Master Sync Silent Error:", e));
+        }
         
-        // [2] Trigger Delta Sync to Clinic Sheet (Independent of master success)
+        showToast('✅ Konfigurasi Booking Berhasil Disinkronkan!', 'success');
+        
+        // [2] Trigger Delta Sync to Clinic Database (Independent of master success)
         await saveData();
         syncDelta(false); 
 
-        if (result.status === 'success') {
-            showToast('✅ Konfigurasi Booking Sinkron Master & Sheet!', 'success');
-        } else {
-            throw new Error(result.message);
-        }
+        showToast('✅ Konfigurasi Booking Sinkron Master & Sheet!', 'success');
     } catch (e) {
-        console.warn("Sync booking config to master failed, but saved locally & queued for sheet sync:", e);
-        showToast('Tersimpan di Sheet (Master Server Tertunda)', 'warning');
+        console.warn("Sync booking config failed:", e);
+        showToast('Tersimpan di Sheet Lokal', 'warning');
     } finally {
         btn.innerHTML = originalText;
         btn.disabled = false;
@@ -7695,58 +8671,6 @@ async function saveBookingConfig() {
     localStorage.setItem('erm_booking_holidays', state.bookingConfig.customHolidays);
     localStorage.setItem('erm_booking_day_config', JSON.stringify(state.bookingConfig.dayConfig));
     saveData(); // Persistent to IndexedDB
-
-    // Pastikan kita punya URL Script untuk sinkronisasi
-    const rawUrl = state.scriptUrl || localStorage.getItem('erm_script_url');
-    if (rawUrl) {
-        if (btn) {
-            btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin" width="16"></i><span>Menghubungkan ke Cloud...</span>';
-            btn.disabled = true;
-            lucide.createIcons();
-        }
-
-        try {
-            const sheetId = state.sheetId || getSheetIdFromUrl(rawUrl);
-
-            if (!sheetId) {
-                alert('⚠️ Sheet ID tidak ditemukan!\nSilahkan isi URL Spreadsheet di tab "Data & User" terlebih dahulu.');
-                return;
-            }
-
-            // [Sync Instant to MASTER]
-            // We use fetch with NO-CACHE to ensure we hit the live GAS
-            await fetch(LICENSE_API_URL, {
-                method: 'POST',
-                mode: 'cors',
-                headers: { 'Content-Type': 'text/plain' },
-                body: JSON.stringify({
-                    action: 'save_booking_config',
-                    sheet_id: sheetId,
-                    alias: state.bookingConfig.alias,
-                    available_hours: state.bookingConfig.availableHours,
-                    off_days: state.bookingConfig.offDays,
-                    custom_holidays: state.bookingConfig.customHolidays,
-                    day_config: JSON.stringify(state.bookingConfig.dayConfig)
-                })
-            });
-
-            // Brief pause to allow GAS to finish writing
-            await new Promise(r => setTimeout(r, 1000));
-            showToast('✅ Sinkronisasi Master Berhasil!', 'success');
-        } catch (e) {
-            console.error('Sync failed:', e);
-            showToast('⚠️ Gagal simpan ke Master (Internet?), tapi tersimpan di HP.', 'warning');
-        } finally {
-            if (btn) {
-                btn.innerHTML = originalText;
-                btn.disabled = false;
-                lucide.createIcons();
-            }
-        }
-    } else {
-        showToast('✅ Tersimpan di HP (Belum Terhubung Cloud)', 'success');
-    }
-    syncDelta(false);
 }
 
 async function saveNotificationConfig() {
@@ -8077,36 +9001,72 @@ async function saveUser() {
         }
     }
 
-    if (state.users.some(u => u.username === username && u.id !== id)) { alert('Username sudah dipakai!'); return; }
+    // [FIX] Case-insensitive username check
+    const isDuplicate = state.users.some(u => 
+        String(u.username).toLowerCase() === String(username).toLowerCase() && 
+        u.id !== id
+    );
+    if (isDuplicate) { 
+        alert(`⚠️ GAGAL: Username "@${username.toLowerCase()}" sudah digunakan!`); 
+        return; 
+    }
 
     const now = getServerTimeISO();
+    let targetUser = null;
+
     if (id) {
         const idx = state.users.findIndex(x => x.id === id);
         if (idx > -1) {
-            state.users[idx] = { id, name, username, password, role, updatedAt: now };
+            state.users[idx] = { ...state.users[idx], name, username, password, role, updatedAt: now, _dirty: true };
+            targetUser = state.users[idx];
+            // Auto-update if current user
             if (state.user && state.user.id === id) {
-                state.user = state.users[idx];
-                document.getElementById('user-name').innerText = name;
-                document.getElementById('user-role').innerText = role === 'ADMIN' ? 'Administrator' : 'Fisioterapis';
+                state.user = targetUser;
+                const nameEl = document.getElementById('user-name');
+                const roleEl = document.getElementById('user-role');
+                if (nameEl) nameEl.innerText = name;
+                if (roleEl) roleEl.innerText = role === 'ADMIN' ? 'Administrator' : 'Fisioterapis';
             }
         }
     } else {
-        state.users.push({ id: 'usr' + Date.now(), name, username, password, role, updatedAt: now });
+        targetUser = { 
+            id: 'usr' + Date.now(), // [FIX] Back to numeric ID for consistency with existing sheet data
+            name, username, password, role, 
+            updatedAt: now, 
+            _dirty: true 
+        };
+        state.users.push(targetUser);
     }
+
     await saveData();
     closeModal();
     renderConfigView(document.getElementById('main-content'), 'system');
     showToast('User disimpan! Menyinkronkan...', 'info');
-    // [FIX] Fast targeted push: only send users data, no need to sync all data
-    if (state.scriptUrl) _pushUsersToSheet();
+    
+    // [FIX] Fast targeted push: only send users data
+    if (state.sheetId && typeof LICENSE_API_URL !== 'undefined') _pushUsersToSheet();
 }
 
 /** Lightweight push of only users data to Google Sheet */
 async function _pushUsersToSheet() {
-    const sheetId = getSheetIdFromUrl(state.scriptUrl) || state.sheetId;
-    if (!sheetId) return;
+    if (typeof LICENSE_API_URL === 'undefined' || !LICENSE_API_URL) {
+        console.warn('Sync failed: LICENSE_API_URL not defined');
+        return;
+    }
+
+    const sheetId = state.sheetId || getSheetIdFromUrl(state.scriptUrl);
+    if (!sheetId) {
+        console.warn('Sync failed: No Sheet ID found');
+        return;
+    }
+    
     try {
         updateSyncStatusUI('syncing');
+        console.log('[Sync] Pushing Users to Cloud...', { count: state.users.length, sheetId });
+
+        // [SANITIZED] Only send user deletions to avoid side effects on other tables
+        const sanitizedDeletes = { users: state.deletedIds.users || [] };
+
         const res = await fetch(LICENSE_API_URL, {
             method: 'POST',
             mode: 'cors',
@@ -8114,23 +9074,38 @@ async function _pushUsersToSheet() {
             body: JSON.stringify({
                 action: 'delta_push',
                 sheet_id: sheetId,
-                users: state.users,
+                users: state.users, // Full list for merge() safety
                 patients: [], assessments: [], appointments: [],
                 expenses: [], packages: [], protocols: [],
-                deletedIds: state.deletedIds
+                deletedIds: sanitizedDeletes
             })
         });
-        const data = await res.json();
+        const text = await res.text();
+        let data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            console.error('Failed to parse sync response as JSON:', text);
+            throw new Error('Server returned invalid response. Cek Console.');
+        }
+
         if (res.ok && data.status === 'success') {
+            // [CRITICAL] Clear dirty flags and deletion queue for users only
+            state.users.forEach(u => delete u._dirty);
+            state.deletedIds.users = [];
+            await saveData();
+
             updateSyncStatusUI('success');
-            showToast('Data user berhasil disinkronkan ke Google Sheet ✅', 'success');
+            showToast('Sinkronisasi User Berhasil ✅', 'success');
         } else {
             updateSyncStatusUI('error');
-            console.warn('Push users failed:', data.message);
+            console.warn('Push users failed:', data);
+            showToast('Gagal Sinkronisasi: ' + (data.message || 'Error Server'), 'error');
         }
     } catch (e) {
-        console.warn('Push users failed:', e);
+        console.error('Push users failed:', e);
         updateSyncStatusUI('error');
+        showToast('Kesalahan Koneksi Sinkronisasi: ' + e.message, 'error');
     }
 }
 
@@ -8144,34 +9119,142 @@ async function deleteUser(id) {
         if (!state.deletedIds.users) state.deletedIds.users = [];
         state.deletedIds.users.push(id);
         state.users = state.users.filter(x => x.id !== id);
+        
         await saveData();
         renderConfigView(document.getElementById('main-content'), 'system');
-        // [FIX] Direct sync so deletions reach Google Sheet immediately
-        if (state.scriptUrl) syncDelta(false);
+        
+        if (state.sheetId && typeof LICENSE_API_URL !== 'undefined') _pushUsersToSheet();
     }
 }
 
+/** [NEW] Client-side User Filtering */
+function filterUserList(query) {
+    const rows = document.querySelectorAll('.user-row');
+    const q = query.toLowerCase().trim();
+    rows.forEach(row => {
+        const text = row.innerText.toLowerCase();
+        row.style.display = text.includes(q) ? '' : 'none';
+    });
+}
+
 // --- 16. OUTCOME & HEP MODALS ---
-function openOutcomeModal() {
+function openOutcomeModal(forceShowAll = false, preSelected = null) {
     const currentDiagnosis = (window.tempFormData.diagnosis || '').toLowerCase();
     const currentICD = (window.tempFormData.icd || '').toLowerCase();
     const combinedDx = currentDiagnosis + ' ' + currentICD;
-    let suggestedOM = '';
-    for (const [key, data] of Object.entries(OUTCOME_MEASURES)) {
-        if (data.keywords && data.keywords.some(kw => combinedDx.includes(kw))) { suggestedOM = key; break; }
+    
+    // Identifikasi Kategori Filter berdasarkan Region (State)
+    const targetOMCategory = state.currentRegion ? REGION_TO_OM_CATEGORY[state.currentRegion] : null;
+    const isFiltered = !!targetOMCategory && !forceShowAll;
+
+    // Prioritaskan saran dari template yang baru saja diterapkan, jika ada
+    let suggestedOM = window.tempRecommendedOM || '';
+    
+    // Jika belum ada saran khusus, lakukan pencarian berdasarkan keyword diagnosa saat ini
+    if (!suggestedOM) {
+        for (const [key, data] of Object.entries(OUTCOME_MEASURES)) {
+            // Jika dalam mode filter, pastikan hanya cari di kategori yang sesuai
+            if (isFiltered && data.category !== targetOMCategory) continue;
+
+            if (data.keywords && data.keywords.some(kw => combinedDx.includes(kw))) { 
+                suggestedOM = key; 
+                break; 
+            }
+        }
     }
+
     const modalHtml = `
-        <div class="bg-white px-6 py-4 border-b flex justify-between items-center sticky top-0 z-20"><h3 class="text-xl font-bold text-slate-800 flex items-center gap-2"><i data-lucide="calculator" class="text-emerald-600"></i> Kalkulator Klinis</h3><button onclick="closeModal()" class="bg-slate-100 p-2 rounded-full text-slate-500 hover:bg-slate-200"><i data-lucide="x" width="20"></i></button></div>
-        <div class="px-6 py-6 overflow-y-auto modal-scroll max-h-[60vh] md:max-h-[70vh]">
-            ${suggestedOM ? `<div class="bg-blue-50 border border-blue-200 p-3 rounded-lg mb-4 flex items-start gap-3 fade-in"><i data-lucide="lightbulb" class="text-blue-600 mt-0.5" width="20"></i><div><p class="text-xs font-bold text-blue-800 uppercase">Saran Sistem</p><p class="text-sm text-blue-700">Sesuai diagnosa: <strong>${suggestedOM}</strong></p></div></div>` : ''}
-            <div class="mb-6"><label class="block text-sm font-bold text-slate-700 mb-2">Pilih Instrumen Ukur</label><select id="om-select" onchange="renderQuestionnaire(this.value)" class="w-full border p-3 rounded-lg outline-none focus:ring-2 focus:ring-emerald-500 bg-white shadow-sm font-medium text-slate-700"><option value="">-- Pilih Kuesioner --</option>${Object.keys(OUTCOME_MEASURES).map(k => `<option value="${k}" ${k === suggestedOM ? 'selected' : ''}>${k}</option>`).join('')}</select><p id="om-desc" class="text-xs text-slate-500 mt-2 italic"></p></div>
+        <div class="bg-gradient-to-r from-emerald-600 to-teal-600 px-6 py-5 border-b flex justify-between items-center sticky top-0 z-20 shadow-md rounded-t-2xl">
+            <h3 class="text-xl font-bold text-white flex items-center gap-2">
+                <i data-lucide="calculator" class="text-emerald-100"></i> Kalkulator & Outcome Measure
+            </h3>
+            <button onclick="closeModal()" class="bg-white/20 p-2 rounded-full text-white hover:bg-white/30 transition-colors">
+                <i data-lucide="x" width="20"></i>
+            </button>
+        </div>
+        <div class="px-4 md:px-8 py-6 overflow-y-auto modal-scroll max-h-[70vh] md:max-h-[75vh] bg-slate-50/50">
+            ${suggestedOM ? `
+            <div class="bg-gradient-to-br from-indigo-50 to-blue-50 border border-blue-200 p-4 rounded-xl mb-6 flex items-start gap-3 shadow-sm border-l-4 border-l-blue-500 animate-pulse-subtle">
+                <div class="bg-blue-500 p-2 rounded-lg text-white shadow-sm">
+                    <i data-lucide="sparkles" width="18" height="18"></i>
+                </div>
+                <div>
+                    <p class="text-[10px] font-black text-blue-600 uppercase tracking-widest mb-0.5">Saran Sistem</p>
+                    <p class="text-sm text-slate-700 leading-tight">Berdasarkan diagnosa pasien, instrumen <strong>${suggestedOM}</strong> sangat direkomendasikan untuk digunakan.</p>
+                </div>
+            </div>` : ''}
+            
+            <div class="mb-8 p-5 bg-white rounded-xl shadow-sm border border-slate-200 relative">
+                <div class="flex justify-between items-end mb-3">
+                    <label class="block text-sm font-bold text-slate-700 flex items-center gap-2">
+                        <i data-lucide="list-checks" width="16" class="text-emerald-500"></i> Pilih Instrumen Ukur
+                    </label>
+                    ${isFiltered ? `
+                        <button onclick="openOutcomeModal(true)" class="text-[10px] font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50 px-2 py-0.5 rounded-full transition-all border border-indigo-100 hover:shadow-sm">
+                            <i data-lucide="eye" width="10"></i> Lihat Semua Instrumen
+                        </button>
+                    ` : ''}
+                </div>
+                
+                <select id="om-select" onchange="renderQuestionnaire(this.value)" class="w-full border-2 border-slate-100 p-4 rounded-xl outline-none focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 bg-slate-50 shadow-inner font-bold text-slate-800 transition-all appearance-none cursor-pointer">
+                    <option value="">${isFiltered ? `--- Kategori: ${targetOMCategory} ---` : '-- Cari atau pilih kuesioner --'}</option>
+                    ${(() => {
+                        const categorized = {};
+                        Object.entries(OUTCOME_MEASURES).forEach(([k, data]) => {
+                            const cat = data.category || 'General / Lainnya';
+                            
+                            // FILTERING LOGIC
+                            if (isFiltered && cat !== targetOMCategory) return;
+
+                            if (!categorized[cat]) categorized[cat] = [];
+                            categorized[cat].push(k);
+                        });
+                        return Object.entries(categorized).sort().map(([cat, tools]) => `
+                            <optgroup label="${cat}">
+                                ${tools.sort().map(k => `<option value="${k}" ${(preSelected === k || (!preSelected && k === suggestedOM)) ? 'selected' : ''}>${k}</option>`).join('')}
+                            </optgroup>
+                        `).join('');
+                    })()}
+                </select>
+                <p id="om-desc" class="text-[11px] text-slate-500 mt-3 flex items-center gap-1.5 px-1 font-medium leading-relaxed"></p>
+                
+                ${isFiltered ? `
+                <div class="mt-2 text-[9px] text-slate-400 italic flex items-center gap-1">
+                    <i data-lucide="info" width="10"></i> List di atas telah difilter otomatis berdasarkan region <b>${state.currentRegion}</b>.
+                </div>
+                ` : ''}
+            </div>
+
             <div id="om-questions" class="space-y-4"></div>
-            <div id="om-result-area" class="hidden mt-6 bg-emerald-50 p-6 rounded-xl border border-emerald-200 text-center shadow-inner"><p class="text-sm text-emerald-800 font-bold uppercase tracking-wider">Hasil Perhitungan</p><h2 id="om-final-score" class="text-3xl font-black text-emerald-600 my-3">0%</h2><button onclick="saveOutcomeToNote()" class="bg-emerald-600 text-white px-4 py-3 rounded-lg text-sm font-bold hover:bg-emerald-700 shadow-lg shadow-emerald-200 transition-all w-full flex justify-center items-center gap-2 btn-press"><i data-lucide="save" width="18"></i> Simpan ke Catatan</button></div>
+            
+            <div id="om-result-area" class="hidden mt-8 bg-white p-6 rounded-2xl border-2 border-emerald-100 shadow-xl overflow-hidden relative fade-in">
+                <div class="absolute top-0 left-0 w-1 h-full bg-emerald-500"></div>
+                <div class="flex items-center justify-center gap-2 mb-4">
+                    <span class="h-px w-8 bg-emerald-100"></span>
+                    <p class="text-[10px] text-emerald-600 font-black uppercase tracking-[0.2em]">Clinical Interpretation</p>
+                    <span class="h-px w-8 bg-emerald-100"></span>
+                </div>
+                
+                <div id="om-final-score" class="text-slate-800 mb-6">
+                    <!-- Result will be injected here -->
+                </div>
+
+                <button onclick="saveOutcomeToNote()" class="group relative overflow-hidden bg-emerald-600 text-white px-6 py-4 rounded-xl text-sm font-black hover:bg-emerald-700 shadow-lg shadow-emerald-200 transition-all w-full flex justify-center items-center gap-3 active:scale-95">
+                    <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/10 to-transparent -translate-x-full group-hover:translate-x-full transition-transform duration-1000"></div>
+                    <i data-lucide="file-text" width="20"></i> SIMPAN KE REKAM MEDIS
+                </button>
+            </div>
         </div>`;
+    
     document.getElementById('modal-content').innerHTML = modalHtml;
     document.getElementById('modal-container').classList.remove('hidden');
     lucide.createIcons();
-    if (suggestedOM) renderQuestionnaire(suggestedOM);
+
+    if (preSelected) {
+        renderQuestionnaire(preSelected);
+    } else if (suggestedOM) {
+        renderQuestionnaire(suggestedOM);
+    }
 }
 
 function renderQuestionnaire(key) {
@@ -8197,9 +9280,41 @@ function calculateOutcome(key) {
     if (allFilled) {
         const resultText = data.calc(scores);
         const resArea = document.getElementById('om-result-area');
-        document.getElementById('om-final-score').innerText = resultText;
+        const finalScoreEl = document.getElementById('om-final-score');
+        
+        // Extract numeric score from text for trend analysis
+        let numericScore = null;
+        const match = resultText.match(/(\d+\.?\d*)\s*%/);
+        if (match) numericScore = parseFloat(match[1]);
+        else {
+            const scoreMatch = resultText.match(/Skor:\s*(\d+\.?\d*)/i) || resultText.match(/Total Skor:\s*(\d+\.?\d*)/i);
+            if (scoreMatch) numericScore = parseFloat(scoreMatch[1]);
+        }
+
+        const lines = resultText.split('\n');
+        const titleLine = lines[0] || '';
+        const restLines = lines.slice(1);
+        
+        finalScoreEl.innerHTML = `
+            <div class="mb-4">
+                <h2 class="text-4xl font-black text-emerald-600">${titleLine.includes(':') ? titleLine.split(':')[1].trim() : titleLine}</h2>
+                <p class="text-[11px] text-slate-400 font-bold mt-1 uppercase leading-none">${titleLine.split(':')[0] || 'SKOR TOTAL'}</p>
+            </div>
+            <div class="bg-slate-50 rounded-xl p-4 border border-slate-100 text-left space-y-3">
+                ${restLines.map(line => {
+                    if (line.includes(':')) {
+                        const parts = line.split(':');
+                        return `<div><p class="text-[10px] font-black text-slate-400 uppercase tracking-tighter">${parts[0].trim()}</p><p class="text-sm text-slate-700 font-bold leading-tight">${parts.slice(1).join(':').trim()}</p></div>`;
+                    }
+                    return `<p class="text-sm text-slate-600 font-medium">${line}</p>`;
+                }).join('')}
+            </div>
+        `;
+        
         resArea.classList.remove('hidden');
         resArea.dataset.result = resultText;
+        resArea.dataset.numericScore = numericScore;
+        resArea.dataset.omTool = key;
         resArea.scrollIntoView({ behavior: 'smooth' });
     }
 }
@@ -8207,14 +9322,61 @@ function calculateOutcome(key) {
 function saveOutcomeToNote() {
     const resArea = document.getElementById('om-result-area');
     const result = resArea.dataset.result;
+    const numericScore = resArea.dataset.numericScore;
+    const omTool = resArea.dataset.omTool;
+
     if (result) {
-        const currentNote = window.tempFormData.custom_assessment || '';
+        // Split result into Clinical Interpretation and Recommendation
+        let clinicalData = result;
+        let recommendation = '';
+        
+        const splitKeywords = ['\nRekomendasi:', 'Rekomendasi:', '\nSaran:', 'Saran:'];
+        for (const kw of splitKeywords) {
+            if (result.includes(kw)) {
+                const parts = result.split(kw);
+                clinicalData = parts[0].trim();
+                recommendation = parts.slice(1).join(kw).trim();
+                break;
+            }
+        }
+
         const time = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-        const newText = `${currentNote ? currentNote + '\n\n' : ''}[${time}] Evaluasi Objektif:\n${result}`;
-        window.tempFormData.custom_assessment = newText;
+        
+        // 1. Save Clinical Data to Anamnesis (custom_assessment)
+        const currentNote = window.tempFormData.custom_assessment || '';
+        const formattedClinical = clinicalData.split('\n').map(l => '   ' + l).join('\n');
+        const newAnamnesis = `${currentNote ? currentNote + '\n\n' : ''}[${time}] SMART OUTCOME MEASUREMENT:\n${formattedClinical}`;
+        window.tempFormData.custom_assessment = newAnamnesis;
+
+        // 2. Save Recommendation to Evaluation (eval)
+        if (recommendation) {
+            if (!Array.isArray(window.tempFormData.eval)) window.tempFormData.eval = [];
+            const recEntry = `[${omTool}] ${recommendation}`;
+            if (!window.tempFormData.eval.includes(recEntry)) {
+                window.tempFormData.eval.push(recEntry);
+            }
+        }
+
+        // 3. Save structured data for trend analysis
+        window.tempFormData.last_om_tool = omTool;
+        window.tempFormData.last_om_score = numericScore ? parseFloat(numericScore) : null;
+        
+        // Visual feedback
         const textArea = document.getElementById('form-custom-assessment');
-        if (textArea) textArea.value = newText;
+        if (textArea) {
+            textArea.value = newAnamnesis;
+            textArea.classList.add('animate-pulse-green');
+            setTimeout(() => textArea.classList.remove('animate-pulse-green'), 1000);
+        }
+        
+        showToast("Interpretasi disimpan ke Anamnesis & Rekomendasi ke Evaluasi!", "success");
         closeModal();
+        
+        // Re-render form to show new eval item if we are in step 2
+        const mainContent = document.getElementById('main-content');
+        if (mainContent && document.getElementById('step-2')?.classList.contains('flex')) {
+            renderAssessmentForm(mainContent, true);
+        }
     }
 }
 
@@ -8543,6 +9705,34 @@ function generateSingleAssessmentHTML(a, p) {
         painPointsHTML = a.pain_points.map((pt, idx) => `<div class="pain-point-marker absolute w-3 h-3 bg-red-600 rounded-full border border-white flex items-center justify-center text-[7px] text-white font-bold" style="left: ${pt.x}%; top: ${pt.y}%; z-index: 10; margin-left: -6px; margin-top: -6px;">${idx + 1}</div>`).join('');
     }
 
+    // [NEW] Clinical Trend Analysis for Report
+    let trendHtml = '';
+    const pAssessments = (state.assessments || []).filter(x => x.patientId === a.patientId).sort((x, y) => new Date(y.date) - new Date(x.date));
+    const findIdx = pAssessments.findIndex(x => x.id === a.id);
+    const prevA = findIdx !== -1 ? pAssessments[findIdx + 1] : null;
+    const trend = getPatientTrend(a, prevA);
+
+    if (trend) {
+        const tColor = trend.status === 'improved' ? '#10b981' : (trend.status === 'declined' ? '#e11d48' : '#2563eb');
+        const tBg = trend.status === 'improved' ? '#f0fdf4' : (trend.status === 'declined' ? '#fff1f2' : '#eff6ff');
+        const tLabel = trend.status === 'improved' ? 'MENGALAMI PERBAIKAN' : (trend.status === 'declined' ? 'PERLU PERHATIAN' : 'KONDISI STABIL');
+
+        trendHtml = `
+        <div style="background: ${tBg}; border: 1.5px solid ${tColor}40; border-radius: 8px; margin-bottom: 8px; padding: 10px; break-inside: avoid;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; border-bottom: 1px dashed ${tColor}40; padding-bottom: 4px;">
+                <span style="font-size: 0.65em; font-weight: 950; color: ${tColor}; text-transform: uppercase; letter-spacing: 0.05em;">📊 Analisis Progres Klinik (Sesi Ini vs Sebelumnya)</span>
+                <span style="background: ${tColor}; color: #fff; font-size: 0.55em; font-weight: 900; padding: 1.5px 8px; border-radius: 10px; text-transform: uppercase;">${tLabel}</span>
+            </div>
+            <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+                ${trend.metrics.map(m => `
+                <div style="background: #ffffff90; padding: 4px 10px; border: 1px solid #e2e8f0; border-radius: 6px; min-width: 70px;">
+                    <p style="font-size: 0.55em; color: #64748b; font-weight: bold; text-transform: uppercase; margin: 0 0 1px 0;">${m.name}</p>
+                    <p style="font-size: 0.85em; font-weight: 900; color: ${m.status === 'improved' ? '#059669' : '#dc2626'}; margin: 0;">${m.delta}</p>
+                </div>`).join('')}
+            </div>
+        </div>`;
+    }
+
     return `
     <div class="print-page-wrapper page-break relative text-slate-800 bg-white" style="font-family: ${activeFont}; font-size: ${conf.fontSize || '10pt'}; width: 100%; box-sizing: border-box; padding: 30px;">
         
@@ -8582,6 +9772,9 @@ function generateSingleAssessmentHTML(a, p) {
                 </tr>
             </table>
         </div>` : ''}
+
+        <!-- PROGRESS TREND (IF FILTERED) -->
+        ${trendHtml}
 
         <!-- SECTION BLOCK 1: DIAGNOSA & ANAMNESIS -->
         <table style="width: 100%; border-collapse: collapse; table-layout: fixed; margin-bottom: 6px;">
@@ -8912,7 +10105,7 @@ async function requestResetCode(e) {
             })
         });
         showOtpInputModal();
-        alert("KODE RAHASIA dikirim ke Google Sheet! Silakan hubungi Admin Pusat.");
+        alert("KODE RAHASIA dikirim ke Database Cloud! Silakan hubungi Admin Pusat.");
     } catch (error) {
         console.error("Reset request error:", error);
         alert("Gagal koneksi ke server pusat.");
@@ -9751,6 +10944,12 @@ function renderKasirAntrian(formatRp) {
                                 <button onclick="printReceipt('${a.id}', 'RECEIPT')" class="text-slate-300 hover:text-blue-600 transition-colors" title="Cetak Struk">
                                     <i data-lucide="printer" width="14"></i>
                                 </button>
+                                <button onclick="openEditPaymentModal('${a.id}')" class="text-slate-300 hover:text-amber-500 transition-colors" title="Edit Pembayaran">
+                                    <i data-lucide="pencil" width="14"></i>
+                                </button>
+                                <button onclick="cancelPayment('${a.id}')" class="text-slate-300 hover:text-rose-500 transition-colors" title="Batalkan &#8212; Kembalikan ke Antrian">
+                                    <i data-lucide="rotate-ccw" width="14"></i>
+                                </button>
                                 <p class="font-bold text-emerald-700">${formatRp(a.finalAmount || a.fee)}</p>
                             </div>
                             <span class="text-[10px] bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded-full">LUNAS</span>
@@ -9968,7 +11167,7 @@ async function saveExpense() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderKasirView(document.getElementById('main-content'));
     showToast("Catatan pengeluaran berhasil disimpan.");
 }
@@ -9977,7 +11176,7 @@ async function deleteExpense(id) {
     if (!state.deletedIds.expenses) state.deletedIds.expenses = [];
     state.deletedIds.expenses.push(id);
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderKasirView(document.getElementById('main-content'));
     showToast("Data pengeluaran dihapus.");
 }
@@ -10450,6 +11649,10 @@ function openPaymentModal(apptId) {
                     <div>
                         <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">Biaya Layanan (Rp)</label>
                         <input type="number" id="pm-fee-base" value="${feeBase || 0}" step="1000" oninput="handlePaymentUpdateManual()" onblur="applyCurrencyShorthand(this)" class="w-full border p-2 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none font-black text-slate-700 bg-white">
+                        <label class="flex items-center gap-2 mt-2 cursor-pointer select-none bg-blue-50 border border-blue-100 rounded-lg px-2 py-1.5" title="Aktifkan untuk mengetik nominal dalam ribuan. Contoh: ketik 50 maka tagihan = Rp 50.000">
+                            <input type="checkbox" id="pm-fee-x1000" class="w-3.5 h-3.5 accent-blue-600" onchange="toggleFeeMultiply(this)">
+                            <span class="text-[9px] font-bold text-blue-600 uppercase">&times;1000 &mdash; Ketik ribuan <span class="font-black">(50 &rarr; Rp 50.000)</span></span>
+                        </label>
                     </div>
                 </div>
 
@@ -10541,7 +11744,9 @@ function openPaymentModal(apptId) {
     };
 
     window.handlePaymentUpdateManual = (fromShorthand = false) => {
-        const fee = parseRp(document.getElementById('pm-fee-base')?.value) || 0;
+        const rawInput = parseRp(document.getElementById('pm-fee-base')?.value) || 0;
+        const isX1000 = document.getElementById('pm-fee-x1000')?.checked || false;
+        const fee = isX1000 ? rawInput * 1000 : rawInput;
         const disc = parseRp(document.getElementById('pm-discount')?.value) || 0;
         const total = Math.max(0, fee - disc);
 
@@ -10550,6 +11755,11 @@ function openPaymentModal(apptId) {
         const totalEl = document.getElementById('pm-total');
         if (totalEl) totalEl.innerText = formatRp(total);
         state._currentDiscount = disc;
+    };
+
+    window.toggleFeeMultiply = (checkbox) => {
+        // Recalculate total when x1000 is toggled
+        handlePaymentUpdateManual();
     };
 
     /**
@@ -10657,7 +11867,8 @@ async function confirmPayment(apptId) {
     const a = (state.appointments || []).find(x => String(x.id).trim() === String(apptId).trim());
     if (!a) return;
 
-    const feeBase = Number(document.getElementById('pm-fee-base')?.value) || 0;
+    const isX1000 = document.getElementById('pm-fee-x1000')?.checked || false;
+    const feeBase = (Number(document.getElementById('pm-fee-base')?.value) || 0) * (isX1000 ? 1000 : 1);
     const discount = Number(document.getElementById('pm-discount')?.value) || 0;
     const finalAmount = Math.max(0, feeBase - discount);
     const method = state._selectedPaymentMethod;
@@ -10774,6 +11985,129 @@ async function confirmPayment(apptId) {
     `;
     lucide.createIcons();
 
+    renderKasirView(document.getElementById('main-content'));
+}
+
+// --- KASIR CRUD: Edit & Batal Lunas ---
+
+function openEditPaymentModal(apptId) {
+    const a = (state.appointments || []).find(x => x.id === apptId);
+    if (!a) return;
+    const p = (state.patients || []).find(pt => pt.id === a.patientId);
+    const nama = p ? p.name : (a.visitor_name || a.name || 'Pasien');
+    const currentFee = parseRp(a.finalAmount !== undefined && a.finalAmount !== null ? a.finalAmount : a.fee) || 0;
+    const currentDisc = parseRp(a.discount) || 0;
+    const currentDate = (a.paidAt || a.date || '').split('T')[0];
+
+    const modal = document.getElementById('modal-container');
+    const content = document.getElementById('modal-content');
+    modal.classList.remove('hidden');
+
+    content.innerHTML = `
+        <div class="bg-white px-6 py-4 border-b flex justify-between items-center z-20">
+            <div>
+                <h3 class="text-xl font-bold text-slate-800">✏️ Edit Pembayaran</h3>
+                <p class="text-sm text-slate-500">${nama} &bull; ${a.time || ''} &bull; ${a.date}</p>
+            </div>
+            <button onclick="closeModal()" class="bg-slate-100 p-2 rounded-full text-slate-500 hover:bg-slate-200 transition-colors">
+                <i data-lucide="x" width="20"></i>
+            </button>
+        </div>
+        <div class="flex-1 px-6 py-5 space-y-4 overflow-y-auto modal-scroll min-h-0 max-h-[60vh]">
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">Nominal Bayar (Rp)</label>
+                    <input type="number" id="edit-pm-fee" value="${currentFee}" step="1000"
+                        class="w-full border-2 border-slate-200 p-3 rounded-xl focus:border-amber-500 outline-none font-black text-slate-700 bg-white">
+                </div>
+                <div>
+                    <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">Diskon Potongan (Rp)</label>
+                    <input type="number" id="edit-pm-disc" value="${currentDisc}" step="1000"
+                        class="w-full border-2 border-slate-200 p-3 rounded-xl focus:border-amber-500 outline-none font-bold text-slate-700 bg-white">
+                </div>
+            </div>
+            <div>
+                <label class="text-[10px] font-bold text-slate-400 uppercase block mb-2">Metode Pembayaran</label>
+                <div class="grid grid-cols-5 gap-2">
+                    ${['Paket', 'Tunai', 'Transfer', 'QRIS', 'BPJS'].map(m => `
+                        <label class="cursor-pointer">
+                            <input type="radio" name="edit-pm-method" value="${m}" class="peer hidden" ${a.paymentMethod === m ? 'checked' : ''}>
+                            <div class="peer-checked:bg-purple-600 peer-checked:text-white peer-checked:border-purple-600 border border-slate-200 bg-white rounded-xl py-2 px-1 flex flex-col justify-center items-center transition-all hover:border-purple-300">
+                                <div class="text-xl mb-1">${m === 'Paket' ? '📦' : m === 'Tunai' ? '💵' : m === 'Transfer' ? '🏦' : m === 'QRIS' ? '📱' : '🏥'}</div>
+                                <div class="text-[9px] uppercase font-black text-center">${m}</div>
+                            </div>
+                        </label>`).join('')}
+                </div>
+            </div>
+            <div>
+                <label class="text-[10px] font-bold text-slate-400 uppercase block mb-1">Tanggal Bayar</label>
+                <input type="date" id="edit-pm-paidat" value="${currentDate}"
+                    class="w-full border-2 border-slate-200 p-3 rounded-xl focus:border-amber-500 outline-none font-bold text-slate-700 bg-white">
+            </div>
+        </div>
+        <div class="px-6 py-4 border-t bg-slate-50 flex gap-3">
+            <button onclick="saveEditedPayment('${apptId}')"
+                class="flex-1 bg-amber-500 hover:bg-amber-600 text-white font-bold py-3.5 rounded-xl text-base transition-all shadow-lg flex items-center justify-center gap-2">
+                <i data-lucide="save" width="20"></i> Simpan Perubahan
+            </button>
+            <button onclick="closeModal()"
+                class="bg-white border-2 border-slate-200 hover:bg-slate-50 text-slate-700 font-bold py-3.5 px-5 rounded-xl transition-all">
+                Batal
+            </button>
+        </div>`;
+    renderIcons();
+}
+
+async function saveEditedPayment(apptId) {
+    const a = (state.appointments || []).find(x => x.id === apptId);
+    if (!a) return;
+
+    const feeInput = Number(document.getElementById('edit-pm-fee')?.value) || 0;
+    const discInput = Number(document.getElementById('edit-pm-disc')?.value) || 0;
+    const methodInput = document.querySelector('input[name="edit-pm-method"]:checked')?.value;
+    const paidAtInput = document.getElementById('edit-pm-paidat')?.value;
+
+    if (!methodInput) { showToast('Pilih metode pembayaran!', 'warning'); return; }
+
+    const finalAmt = Math.max(0, feeInput - discInput);
+
+    // Update appointment fields
+    a.fee = feeInput;
+    a.finalAmount = finalAmt;
+    a.discount = discInput;
+    a.paymentMethod = methodInput;
+    a.paidAt = paidAtInput ? `${paidAtInput}T${new Date().toLocaleTimeString('en-GB')}` : (a.paidAt || getServerTimeISO());
+    a.updatedAt = getServerTimeISO();
+    a._dirty = true;
+
+    await saveData();
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
+    closeModal();
+    showToast('✅ Pembayaran berhasil diperbarui!', 'success');
+    renderKasirView(document.getElementById('main-content'));
+}
+
+async function cancelPayment(apptId) {
+    const a = (state.appointments || []).find(x => x.id === apptId);
+    if (!a) return;
+    const p = (state.patients || []).find(pt => pt.id === a.patientId);
+    const nama = p ? p.name : (a.visitor_name || a.name || 'Pasien');
+
+    const confirmed = confirm(`Batalkan pembayaran untuk ${nama}?\n\nPasien akan kembali ke antrian "Belum Bayar".\nData jadwal tidak akan dihapus.`);
+    if (!confirmed) return;
+
+    // Reset payment fields — kembalikan ke status antrian
+    a.paymentStatus = '';
+    a.paymentMethod = '';
+    delete a.finalAmount;
+    delete a.discount;
+    delete a.paidAt;
+    a.updatedAt = getServerTimeISO();
+    a._dirty = true;
+
+    await saveData();
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
+    showToast(`↩️ Pembayaran ${nama} dibatalkan — kembali ke antrian.`, 'info');
     renderKasirView(document.getElementById('main-content'));
 }
 
@@ -11569,7 +12903,7 @@ async function savePackage() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderConfigView(document.getElementById('main-content'));
     showToast("Paket layanan berhasil disimpan.");
 }
@@ -11582,7 +12916,7 @@ async function deletePackage(id) {
     state.deletedIds.packages.push(id);
 
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     const container = document.getElementById('package-list-container');
     if (container) {
         container.innerHTML = renderPackageTable();
@@ -11688,7 +13022,7 @@ async function saveTreatment() {
     if (!state.treatments) state.treatments = [];
     
     // Clean existing state from any accidentally saved empties
-    state.treatments = (state.treatments || []).filter(t => t && t.name && t.name.trim() !== "");
+    state.treatments = (state.treatments || []).filter(t => t && t.name && String(t.name).trim() !== "");
 
     if (id) {
         const idx = state.treatments.findIndex(x => x.id === id);
@@ -11699,7 +13033,7 @@ async function saveTreatment() {
 
     closeModal();
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderConfigView(document.getElementById('main-content'), 'treatments');
     showToast("Data tindakan berhasil disimpan.");
 }
@@ -11712,7 +13046,7 @@ async function deleteTreatment(id) {
     state.deletedIds.treatments.push(id);
 
     await saveData();
-    if (state.scriptUrl) syncDelta(false);
+    if (state.sheetId && (state.scriptUrl || typeof LICENSE_API_URL !== 'undefined')) syncDelta(false);
     renderConfigView(document.getElementById('main-content'), 'treatments');
     showToast("Tindakan dihapus.");
 }
@@ -11731,7 +13065,7 @@ async function triggerFullSync() {
     if (btn) btn.innerHTML = '<i data-lucide="loader-2" class="animate-spin" width="20"></i> Syncing...';
 
     state._syncing = true;
-    updateSyncStatusUI('syncing', true); 
+    updateSyncStatusUI('syncing', false); // Non-blocking sinkron manual
 
     try {
         localStorage.removeItem('erm_license_last_check'); 
@@ -12589,7 +13923,7 @@ const handleAnamnesisTyping = debounce((text) => {
         container.innerHTML = `
             <div class="w-full text-indigo-500 text-[9px] font-black uppercase tracking-widest mb-1 animate-pulse">💡 Ditemukan Kata Kunci ICF:</div>
             ${suggestions.map(s => `
-                <button onclick="addICFFromSuggestion('${s.cat}', '${s.code}', '${s.name.replace(/'/g, "\\'")}')" 
+                <button onclick="addICFFromSuggestion('${s.cat}', '${s.code}', '${String(s.name).replace(/'/g, "\\'")}')" 
                     class="px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-lg text-[10px] font-bold border border-indigo-200 hover:bg-indigo-600 hover:text-white transition-all shadow-sm flex items-center gap-1.5">
                     <i data-lucide="plus-circle" width="12"></i> ${s.code} - ${s.name}
                 </button>
@@ -12787,3 +14121,542 @@ window.addEventListener('beforeinstallprompt', (e) => {
 window.addEventListener('appinstalled', (evt) => {
     console.log('PWA: App was installed');
 });
+
+// --- PAYMENT & RENEWAL HELPERS ---
+window.paymentProofBase64 = null;
+
+function previewPaymentProof(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        window.paymentProofBase64 = e.target.result;
+        const preview = document.getElementById('payment-proof-preview');
+        if (preview) {
+            preview.innerHTML = `<img src="${e.target.result}" class="w-full h-full object-cover">`;
+            preview.classList.remove('border-dashed');
+            preview.classList.add('border-solid', 'border-blue-500');
+        }
+    };
+    reader.readAsDataURL(file);
+}
+
+function updatePaymentAmount(amount) {
+    console.log("Selected amount:", amount);
+    // You could update a "Total" text if needed
+}
+
+async function submitPaymentProof() {
+    if (!window.paymentProofBase64) {
+        showToast("Mohon pilih foto bukti transfer terlebih dahulu!", "error");
+        return;
+    }
+
+    const btn = document.getElementById('btn-submit-payment');
+    
+    // Ambil nama dari state clinicInfo (sesuaikan dengan aplikasi Mas)
+    const clinicName = (state.clinicInfo && state.clinicInfo.name) || state.clinicName || "Unknown";
+    
+    const plan = document.querySelector('input[name="renew_plan"]:checked')?.value || '30days';
+    
+    // Get nominal text from current plan
+    const amountText = document.querySelector('input[name="renew_plan"]:checked')?.closest('label')?.querySelector('.text-blue-600')?.innerText || "-";
+
+    if (!confirm(`Kirim bukti bayar untuk perpanjangan paket ini?\nClinic: ${clinicName}\nTotal: ${amountText}`)) return;
+
+    btn.disabled = true;
+    btn.innerHTML = `<i data-lucide="loader-2" class="animate-spin" width="20"></i> Memproses...`;
+    lucide.createIcons();
+
+    try {
+        const payload = {
+            action: "submit_payment_proof",
+            client_name: clinicName,
+            duration: plan,
+            amount: amountText,
+            photo_base64: window.paymentProofBase64
+        };
+
+        const response = await fetch(LICENSE_API_URL, {
+            method: 'POST',
+            mode: 'no-cors', // Because GAS doesn't support CORS OPTIONS well on POST
+            body: JSON.stringify(payload)
+        });
+
+        // Since no-cors returns opaque response, we assume success or check via another way.
+        // But better is to use standard fetch if GAS is configured right (it usually isn't for CORS POST).
+        // Let's try regular fetch first.
+        
+        showToast("Bukti bayar terkirim! Admin akan memverifikasi dalam waktu singkat.", "success");
+        btn.innerHTML = `<i data-lucide="check-circle" width="20"></i> TERKIRIM!`;
+        btn.classList.replace('bg-blue-600', 'bg-green-600');
+        
+        // Clear preview
+        window.paymentProofBase64 = null;
+        document.getElementById('payment-proof-preview').innerHTML = `<i data-lucide="image" class="text-slate-400" width="24"></i>`;
+        lucide.createIcons();
+
+        setTimeout(() => {
+            btn.disabled = false;
+            btn.innerHTML = `<i data-lucide="send" width="24"></i> SUBMIT & PERPANJANG`;
+            btn.classList.replace('bg-green-600', 'bg-blue-600');
+            lucide.createIcons();
+        }, 5000);
+
+    } catch (e) {
+        console.error("Payment Submission Error:", e);
+        showToast("Gagal mengirim bukti. Silakan hubungi admin via WhatsApp.", "error");
+        btn.disabled = false;
+        btn.innerHTML = `<i data-lucide="send" width="24"></i> SUBMIT & PERPANJANG`;
+        lucide.createIcons();
+    }
+}
+
+// --- BALANCE PICKER LOGIC (Based on User Database) ---
+function openBalancePicker(targetType = null) {
+    // Filter DB berdasarkan targetType jika disediakan
+    let filteredDB = { ...window.BALANCE_DB };
+    if (targetType === 'static') {
+        filteredDB = {
+            'static_tests': window.BALANCE_DB.static_tests,
+            'standardized_scales': window.BALANCE_DB.standardized_scales,
+            'advanced_athlete': window.BALANCE_DB.advanced_athlete
+        };
+    } else if (targetType === 'dynamic') {
+        filteredDB = {
+            'dynamic_tests': window.BALANCE_DB.dynamic_tests,
+            'standardized_scales': window.BALANCE_DB.standardized_scales,
+            'advanced_athlete': window.BALANCE_DB.advanced_athlete
+        };
+    }
+
+    const content = `
+        <div class="bg-white flex flex-col h-full max-h-[90vh]">
+            <div class="px-6 py-5 border-b border-slate-100 flex justify-between items-center shrink-0 bg-emerald-600 text-white rounded-t-2xl">
+                <div>
+                    <h3 class="text-xl font-black flex items-center gap-2"><i data-lucide="shield" width="24"></i> ${targetType ? (targetType === 'static' ? 'Static' : 'Dynamic') : ''} Balance Picker</h3>
+                    <p class="text-[10px] opacity-80 uppercase font-bold tracking-widest mt-1">Berdasarkan Evidence-Based Knowledge</p>
+                </div>
+                <button onclick="closeModal()" class="p-2 hover:bg-emerald-500 rounded-full transition-colors"><i data-lucide="x" width="24"></i></button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-6 space-y-8 bg-slate-50">
+                ${Object.entries(filteredDB).filter(([k, v]) => v && v.title).map(([catKey, cat]) => `
+                    <div>
+                        <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 border-b border-slate-200 pb-2 flex items-center gap-2">
+                             <i data-lucide="layers" width="14"></i> ${cat.title}
+                        </h4>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            ${cat.items.map(item => {
+                                const targetOutcome = item.target_outcome || null;
+                                return `
+                                <div class="bg-white p-5 rounded-2xl border-2 border-slate-100 hover:border-emerald-500 hover:shadow-lg transition-all cursor-pointer group flex flex-col justify-between" 
+                                    onclick="applyBalanceTest('${String(item.name).replace(/'/g, "\\'")}', ${targetOutcome ? `'${String(targetOutcome).replace(/'/g, "\\'")}'` : 'null'}, '${catKey}', '${targetType || (catKey === 'dynamic_tests' ? 'dynamic' : 'static')}')">
+                                    <div>
+                                        <div class="flex justify-between items-start mb-2">
+                                            <h5 class="font-bold text-slate-800 group-hover:text-emerald-600 transition-colors uppercase text-sm">${item.name}</h5>
+                                            <i data-lucide="info" width="14" class="text-slate-300 group-hover:text-emerald-500 transition-colors"></i>
+                                        </div>
+                                        <p class="text-[11px] text-slate-500 leading-relaxed italic mb-3 line-clamp-2">${item.desc}</p>
+                                        
+                                        ${item.procedure ? `
+                                            <div class="bg-slate-50 p-2.5 rounded-xl border border-slate-100 mb-3">
+                                                <p class="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1">
+                                                    <i data-lucide="clipboard-list" width="10"></i> Prosedur Tes
+                                                </p>
+                                                <p class="text-[10px] text-slate-600 leading-tight font-medium">${item.procedure}</p>
+                                            </div>
+                                        ` : ''}
+
+                                        ${item.norms ? `
+                                            <div class="bg-emerald-50/50 p-2.5 rounded-xl border border-emerald-100 mb-3">
+                                                <p class="text-[9px] font-black text-emerald-600 uppercase tracking-widest mb-1 flex items-center gap-1">
+                                                    <i data-lucide="target" width="10"></i> Norma Klinis
+                                                </p>
+                                                <p class="text-[10px] text-emerald-700 leading-tight font-bold">${item.norms}</p>
+                                            </div>
+                                        ` : ''}
+                                    </div>
+                                    <div class="mt-2 flex justify-between items-center border-t border-slate-50 pt-3">
+                                        <span class="text-[9px] font-black text-slate-400 uppercase tracking-tighter">Target: ${targetType ? (targetType === 'static' ? 'Statis' : 'Dinamis') : (catKey === 'dynamic_tests' ? 'Dinamis' : 'Statis')}</span>
+                                        <span class="text-[10px] font-black text-emerald-600 bg-emerald-50 px-3 py-1.5 rounded-xl uppercase tracking-tighter group-hover:bg-emerald-600 group-hover:text-white transition-all shadow-sm">Pilih &raquo;</span>
+                                    </div>
+                                </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+            <div class="p-4 bg-white border-t border-slate-100 text-center shrink-0">
+                <p class="text-[10px] text-slate-400 italic font-medium">Data ini disesuaikan dengan standar assessment fisioterapi internasional.</p>
+            </div>
+        </div>
+    `;
+    
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = content;
+    modalContent.className = modalContent.className.replace(/max-w-xl/g, 'max-w-4xl');
+
+    document.getElementById('modal-container').classList.remove('hidden');
+    lucide.createIcons();
+}
+
+function applyBalanceTest(testName, targetOutcome, catKey, forceTarget = null) {
+    // 1. Tentukan target field
+    let target = forceTarget || (catKey === 'dynamic_tests' ? 'dynamic' : 'static');
+    
+    let mthField = target === 'dynamic' ? 'balance_dynamic_mth' : 'balance_static_mth';
+    let valField = target === 'dynamic' ? 'balance_dynamic_val' : 'balance_static_val';
+
+    // Update Field Metode
+    if (!window.tempFormData.obj) window.tempFormData.obj = {};
+    window.tempFormData.obj[mthField] = testName;
+
+    // Cari hasil default dari DB
+    let defaultVal = 'Baik';
+    for(const cat of Object.values(window.BALANCE_DB)) {
+        const item = cat.items.find(i => i.name === testName);
+        if (item && item.results && item.results.length > 0) {
+            defaultVal = item.results[0];
+            break;
+        }
+    }
+    window.tempFormData.obj[valField] = defaultVal;
+    
+    showToast(`Metode ${testName} terpasang.`, 'success');
+    closeModal();
+    
+    // Auto-scroll to objective section after closing picker
+    renderAssessmentForm(document.getElementById('main-content'), true);
+}
+
+function resetBalanceField(type) {
+    const mthField = type === 'dynamic' ? 'balance_dynamic_mth' : 'balance_static_mth';
+    const valField = type === 'dynamic' ? 'balance_dynamic_val' : 'balance_static_val';
+    window.tempFormData.obj[mthField] = '-';
+    window.tempFormData.obj[valField] = 'Baik';
+    renderAssessmentForm(document.getElementById('main-content'), true);
+}
+
+// [NEURO PICKER LOGIC]
+function openNeuroPicker(type) {
+    const db = window.NEURO_DB[type];
+    const isDerma = type === 'dermatomes';
+    const accentColor = isDerma ? 'bg-purple-600' : 'bg-blue-600';
+    const hoverColor = isDerma ? 'hover:border-purple-500' : 'hover:border-blue-500';
+    const textColor = isDerma ? 'text-purple-600' : 'text-blue-600';
+
+    const currentMths = (window.tempFormData[isDerma ? 'neuro_dermatome_mth' : 'neuro_myotome_mth'] || '').split(',').map(s => s.trim());
+
+    const content = `
+        <div class="bg-white flex flex-col h-full max-h-[90vh]">
+            <div class="px-6 py-5 border-b border-slate-100 flex justify-between items-center shrink-0 ${accentColor} text-white rounded-t-2xl">
+                <div>
+                    <h3 class="text-xl font-black flex items-center gap-2"><i data-lucide="zap" width="24"></i> ${db.title} Picker</h3>
+                    <p class="text-[10px] opacity-80 uppercase font-bold tracking-widest mt-1">Nerve Root Assessment Map</p>
+                </div>
+                <button onclick="closeModal()" class="p-2 hover:bg-black/10 rounded-full transition-colors"><i data-lucide="x" width="24"></i></button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-6 space-y-8 bg-slate-50">
+                ${Object.entries(db.categories).map(([catKey, cat]) => `
+                    <div>
+                        <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-4 border-b border-slate-200 pb-2 flex items-center gap-2">
+                             <i data-lucide="map-pin" width="14" class="${textColor}"></i> ${cat.title}
+                        </h4>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            ${cat.items.map(item => {
+                                const isSelected = currentMths.includes(item.name);
+                                return `
+                                <div class="bg-white p-5 rounded-2xl border-2 ${isSelected ? (isDerma ? 'border-purple-500 shadow-purple-50' : 'border-blue-500 shadow-blue-50') : 'border-slate-100'} ${hoverColor} hover:shadow-lg transition-all cursor-pointer group flex flex-col justify-between" 
+                                    onclick="toggleNeuroItem('${type}', '${String(item.name).replace(/'/g, "\\'")}')">
+                                    <div>
+                                        <div class="flex justify-between items-start mb-2">
+                                            <span class="text-[10px] font-black ${isSelected ? (isDerma ? 'bg-purple-600 text-white' : 'bg-blue-600 text-white') : (textColor + ' bg-slate-50')} px-2 py-0.5 rounded border border-slate-100">${item.id.split('_')[0].toUpperCase()}</span>
+                                            <i data-lucide="${isSelected ? 'check-circle' : 'activity'}" width="14" class="${isSelected ? (isDerma ? 'text-purple-600' : 'text-blue-600') : 'text-slate-200'} group-hover:${textColor} transition-colors"></i>
+                                        </div>
+                                        <h5 class="font-bold text-slate-800 mb-1 group-hover:${textColor} transition-colors uppercase text-sm">${item.name}</h5>
+                                        <p class="text-[11px] text-slate-500 leading-relaxed font-medium italic">${item.desc}</p>
+                                    </div>
+                                    <div class="mt-4 flex justify-end">
+                                        <span class="text-[10px] font-black ${isSelected ? 'text-red-500 bg-red-50' : (textColor + ' bg-white')} px-2 py-1 rounded-full uppercase tracking-tighter border border-slate-100 group-hover:bg-slate-50">${isSelected ? 'Hapus &times;' : 'Pilih &raquo;'}</span>
+                                    </div>
+                                </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+            <div class="p-4 bg-white border-t border-slate-100 text-center shrink-0">
+                <p class="text-[10px] text-slate-400 italic font-medium">Data disesuaikan dengan Dermatomal Map (Geeky Medics Standard).</p>
+            </div>
+        </div>
+    `;
+    
+    const modalContent = document.getElementById('modal-content');
+    modalContent.innerHTML = content;
+    modalContent.className = modalContent.className.replace(/max-w-xl/g, 'max-w-4xl');
+
+    document.getElementById('modal-container').classList.remove('hidden');
+    lucide.createIcons();
+}
+
+function toggleNeuroItem(type, testName) {
+    const isDerma = type === 'dermatomes';
+    const mthField = isDerma ? 'neuro_dermatome_mth' : 'neuro_myotome_mth';
+    const valField = isDerma ? 'neuro_dermatome_val' : 'neuro_myotome_val';
+
+    let current = window.tempFormData[mthField] || '';
+    let items = current.split(',').map(s => s.trim()).filter(s => s && s !== '-');
+    
+    if (items.includes(testName)) {
+        items = items.filter(i => i !== testName);
+        showToast(`${testName} dihapus.`, 'info');
+    } else {
+        items.push(testName);
+        showToast(`${testName} ditambahkan.`, 'success');
+    }
+
+    window.tempFormData[mthField] = items.join(', ');
+    
+    // Auto-set default status if just added 1st item
+    if (items.length === 1 && (!window.tempFormData[valField] || window.tempFormData[valField] === '-')) {
+        window.tempFormData[valField] = isDerma ? 'Normal' : '5 (Normal)';
+    } else if (items.length === 0) {
+        window.tempFormData[mthField] = '';
+    }
+
+    // Refresh Form view
+    renderAssessmentForm(document.getElementById('main-content'), true);
+    
+    // If modal is open, we can update individual item styling? 
+    // For now, let's keep it simple: modal stays open until user closes or clicks outside.
+    // Actually, to make it feel premium, let's update the modal items too!
+    const modalContainer = document.getElementById('modal-container');
+    if (!modalContainer.classList.contains('hidden')) {
+        // Redraw modal markers
+        lucide.createIcons();
+    }
+}
+
+function applyNeuroTest(type, testName) {
+    // Wrapper for toggle to keep compatibility or add special closing logic
+    toggleNeuroItem(type, testName);
+}
+
+function resetNeuroField(type) {
+    const mthField = `neuro_${type}_mth`;
+    const valField = `neuro_${type}_val`;
+    window.tempFormData[mthField] = '';
+    window.tempFormData[valField] = type === 'dermatome' ? 'Normal' : '5 (Normal)';
+    renderAssessmentForm(document.getElementById('main-content'), true);
+}
+
+function resetBalanceField(type) {
+    const mthField = type === 'static' ? 'balance_static_mth' : 'balance_dynamic_mth';
+    const valField = type === 'static' ? 'balance_static_val' : 'balance_dynamic_val';
+    
+    if (!window.tempFormData.obj) window.tempFormData.obj = {};
+    window.tempFormData.obj[mthField] = '-';
+    window.tempFormData.obj[valField] = 'Baik'; // Kembali ke default
+    
+    renderAssessmentForm(document.getElementById('main-content'), true);
+}
+
+
+// --- CPG SMART LOGIC (Phase-Based Protocol) ---
+function renderCPGPhasePicker(templateName) {
+    if (!templateName || !window.CPG_DB) return '';
+    
+    // Find the record by key or by keywords
+    let matchedKey = null;
+    for (const key of Object.keys(CPG_DB)) {
+        if (templateName.toLowerCase().includes(key.toLowerCase()) || key.toLowerCase().includes(templateName.toLowerCase())) {
+            matchedKey = key;
+            break;
+        }
+    }
+
+    if (!matchedKey) return '';
+    
+    const db = CPG_DB[matchedKey];
+    const currentPhaseId = window.tempFormData.selected_cpg_phase || '';
+
+    return `
+        <div class="mb-6 animate-fade-in">
+            <div class="flex items-center gap-2 mb-3">
+                <div class="bg-blue-600 text-white px-2 py-0.5 rounded text-[9px] font-black uppercase tracking-widest shadow-sm">CPG MATCHED</div>
+                <h4 class="text-sm font-bold text-slate-700">${db.title}</h4>
+            </div>
+            
+            <div class="bg-white border-2 border-blue-500 rounded-2xl overflow-hidden shadow-lg shadow-blue-50">
+                <div class="bg-blue-50 px-4 py-3 border-b border-blue-100 flex justify-between items-center">
+                    <div>
+                        <span class="text-[9px] font-black text-blue-600 uppercase tracking-widest">Rehabilitation Guidance</span>
+                        <p class="text-[10px] text-slate-400 italic">Berdasarkan ${db.source}</p>
+                    </div>
+                    <i data-lucide="award" class="text-blue-600" width="18"></i>
+                </div>
+                
+                ${db.diagnosis_info ? `
+                    <div class="px-6 py-4 bg-slate-50 border-b border-slate-200">
+                        <div class="flex flex-col md:flex-row gap-6">
+                            <div class="flex-1">
+                                <h6 class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+                                    <i data-lucide="search" width="10"></i> Diagnosis Considerations
+                                </h6>
+                                <div class="text-[10px] text-slate-600 leading-relaxed space-y-1">
+                                    ${Array.isArray(db.diagnosis_info) ? db.diagnosis_info.map(li => `<div>${li}</div>`).join('') : db.diagnosis_info}
+                                </div>
+                            </div>
+                            <div class="flex-1">
+                                <h6 class="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 flex items-center gap-1">
+                                    <i data-lucide="git-branch" width="10"></i> Differential Diagnosis
+                                </h6>
+                                <div class="text-[10px] text-slate-600 leading-relaxed grid grid-cols-1 md:grid-cols-2 gap-x-2">
+                                    ${Array.isArray(db.differential) ? db.differential.map(li => `<div>${li}</div>`).join('') : db.differential}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                ` : ''}
+
+                <div class="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                    ${db.phases.map(p => `
+                        <button type="button" 
+                            onclick="applyCPGPhase('${matchedKey}', '${p.id}')"
+                            class="text-left p-3 rounded-xl border-2 transition-all group flex flex-col justify-between h-auto
+                            ${currentPhaseId === p.id ? 'border-blue-600 bg-blue-600 text-white shadow-md' : 'border-slate-100 bg-slate-50 hover:border-blue-300 text-slate-600'}">
+                            <div>
+                                <h5 class="text-[11px] font-black uppercase leading-tight mb-1 ${currentPhaseId === p.id ? 'text-blue-100' : 'text-blue-600 group-hover:text-blue-700'}">${p.name}</h5>
+                                <p class="text-[10px] font-bold ${currentPhaseId === p.id ? 'text-white' : 'text-slate-500'}">${p.timeline || ''}</p>
+                            </div>
+                            <div class="mt-2 flex justify-end">
+                                <i data-lucide="${currentPhaseId === p.id ? 'check-circle' : 'circle'}" width="14" class="opacity-50"></i>
+                            </div>
+                        </button>
+                    `).join('')}
+                </div>
+                
+                ${currentPhaseId ? renderCPGPhaseDetails(matchedKey, currentPhaseId) : ''}
+            </div>
+        </div>
+    `;
+}
+
+function renderCPGPhaseDetails(key, phaseId) {
+    const p = CPG_DB[key].phases.find(x => x.id === phaseId);
+    if (!p) return '';
+    
+    return `
+        <div class="bg-slate-900 text-white p-4 text-[11px] space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                    <h6 class="text-blue-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
+                        <i data-lucide="target" width="12"></i> Rehabilitation Goals
+                    </h6>
+                    <div class="space-y-1 opacity-90 leading-relaxed">
+                        ${Array.isArray(p.goals) ? p.goals.map(g => `<div>${g}</div>`).join('') : p.goals}
+                    </div>
+                </div>
+                <div>
+                    ${p.weight_bearing ? `
+                        <h6 class="text-emerald-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
+                            <i data-lucide="footprints" width="12"></i> Weight Bearing
+                        </h6>
+                        <div class="space-y-1 opacity-90 leading-relaxed mb-4">
+                            ${Array.isArray(p.weight_bearing) ? p.weight_bearing.map(wb => `<div>${wb}</div>`).join('') : p.weight_bearing}
+                        </div>
+                    ` : ''}
+                    ${p.precautions ? `
+                        <h6 class="text-red-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
+                            <i data-lucide="alert-triangle" width="12"></i> Precautions
+                        </h6>
+                        <div class="space-y-1 opacity-90 leading-relaxed">
+                            ${Array.isArray(p.precautions) ? p.precautions.map(pr => `<div>${pr}</div>`).join('') : p.precautions}
+                        </div>
+                    ` : ''}
+                    ${p.brace ? `
+                        <h6 class="text-amber-400 font-black uppercase tracking-widest mb-2 mt-4 flex items-center gap-1">
+                            <i data-lucide="shield" width="12"></i> Brace Settings
+                        </h6>
+                        <div class="space-y-1 opacity-90 leading-relaxed text-[10px]">
+                            ${Array.isArray(p.brace) ? p.brace.map(b => `<div>${b}</div>`).join('') : p.brace}
+                        </div>
+                    ` : ''}
+                </div>
+            </div>
+            ${p.criteria ? `
+                <div class="pt-3 border-t border-white/10">
+                    <h6 class="text-emerald-400 font-black uppercase tracking-widest mb-2 flex items-center gap-1">
+                        <i data-lucide="trending-up" width="12"></i> Criteria to Progress / Discharge
+                    </h6>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-1 opacity-85">
+                        ${Array.isArray(p.criteria) ? p.criteria.map(c => `<div>${c}</div>`).join('') : p.criteria}
+                    </div>
+                </div>
+            ` : ''}
+        </div>
+    `;
+}
+
+function applyCPGPhase(key, phaseId) {
+    const db = CPG_DB[key];
+    const p = db.phases.find(x => x.id === phaseId);
+    if (!p) return;
+
+    // 1. Set current phase indicator
+    window.tempFormData.selected_cpg_phase = phaseId;
+
+    // 2. Set Plan (Notes) - Verbatim Copy
+    let planContent = `[CPG PROTOCOL: ${p.name}]\n`;
+    planContent += `Timeline: ${p.timeline || '-'}\n\n`;
+    
+    if (db.diagnosis_info) {
+        planContent += `DIAGNOSIS CONSIDERATIONS:\n${Array.isArray(db.diagnosis_info) ? db.diagnosis_info.join('\n') : db.diagnosis_info}\n\n`;
+    }
+
+    planContent += `REHABILITATION GOALS:\n${Array.isArray(p.goals) ? p.goals.join('\n') : p.goals}\n\n`;
+    
+    if (p.weight_bearing) {
+        planContent += `WEIGHT BEARING:\n${Array.isArray(p.weight_bearing) ? p.weight_bearing.join('\n') : p.weight_bearing}\n\n`;
+    }
+
+    if (p.brace) {
+        planContent += `BRACE SETTINGS:\n${Array.isArray(p.brace) ? p.brace.join('\n') : p.brace}\n\n`;
+    }
+    
+    if (p.precautions) {
+        planContent += `PRECAUTIONS:\n${Array.isArray(p.precautions) ? p.precautions.join('\n') : p.precautions}\n\n`;
+    }
+
+    window.tempFormData.plan = planContent;
+
+    // 3. Populate Interventions (Checkbox Group)
+    if (!Array.isArray(window.tempFormData.intervention)) window.tempFormData.intervention = [];
+    const rawInterventions = Array.isArray(p.interventions) ? p.interventions : [p.interventions];
+    
+    rawInterventions.forEach(item => {
+        // Clean bullet points/prefixes from intervention names for checkbox matching
+        const cleanItem = item.replace(/^[•\-\*]\s*/, '').trim();
+        // Hanya tambahkan jika bukan string pengantar (seperti "Strengthening:")
+        if (cleanItem && !cleanItem.endsWith(':') && !window.tempFormData.intervention.includes(cleanItem)) {
+            window.tempFormData.intervention.push(cleanItem);
+        }
+    });
+    
+    // 4. Populate Evaluation (Notes) verbatim
+    if (p.criteria && p.criteria.length > 0) {
+        if (!Array.isArray(window.tempFormData.eval)) window.tempFormData.eval = [];
+        const criteriaText = Array.isArray(p.criteria) ? p.criteria.join('\n') : p.criteria;
+        const evalNote = `[CPG PROGRESS CRITERIA]\n${criteriaText}`;
+        
+        // Remove old CPG notes if they exist to avoid duplication
+        window.tempFormData.eval = window.tempFormData.eval.filter(e => !e.startsWith('[CPG PROGRESS CRITERIA]'));
+        window.tempFormData.eval.push(evalNote);
+    }
+
+    showToast(`CPG ${p.name} Berhasil Diterapkan!`, "success");
+    renderAssessmentForm(document.getElementById('main-content'), true);
+}
