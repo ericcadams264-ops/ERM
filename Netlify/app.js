@@ -14466,15 +14466,132 @@ function resetBalanceField(type) {
 
 
 // --- CPG SMART LOGIC (Phase-Based Protocol) ---
+// === CPG ALIAS MAPPING ===
+// Menghubungkan nama ICF Template → key CPG_DB
+// Tambahkan entri baru di sini jika ada template baru yang perlu di-link ke CPG
+const CPG_ALIAS_MAP = {
+    // ── ELBOW & UPPER EXTREMITY ──
+    'Tennis Elbow (Lateral Epicondylitis)':         'Medial/Lateral Epicondylalgia',
+    'Medial/Lateral Epicondylalgia':                'Medial/Lateral Epicondylalgia',
+    'TFCC Injury & Repair':                         'Distal Biceps Tendon Repair (Post-Op)',
+    'Carpal Tunnel Release (Post-Op)':              'Distal Biceps Tendon Repair (Post-Op)',
+    'Post ORIF Fracture Humerus':                   'Distal Biceps Tendon Repair (Post-Op)',
+
+    // ── SHOULDER ──
+    'Post-Op Shoulder (Repair/Reconstruction)':     'Distal Biceps Tendon Repair (Post-Op)',
+    'Little League Shoulder (Post-Op)':             'Little League Shoulder',
+    'Little League Shoulder':                       'Little League Shoulder',
+    'Anterior Bankart Repair':                      'Anterior Bankart Repair (Pediatric)',
+    'Posterior Bankart Repair':                     'Posterior Bankart Repair',
+
+    // ── ANKLE & FOOT ──
+    'Ankle Sprain & Chronic Instability (CAI)':     'Lateral Ankle Sprain (Non-Op)',
+    'ATFL Post-Operatif':                           'Brostrom Repair',
+    'Ankle Fracture (Post-Op)':                     'Ankle Fracture (ORIF)',
+    'Ankle Fracture (ORIF)':                        'Ankle Fracture (ORIF)',
+    'Achilles Rupture (Post-Op)':                   'Achilles Rupture Repair',
+    'Achilles Tendinopathy':                        'Achilles Rupture Repair',
+    'TTS & Plantar Fasciitis':                      'Lateral Ankle Sprain (Non-Op)',
+    'Fasclitis Plantaris':                          'Lateral Ankle Sprain (Non-Op)',
+    'Calcaneal Spur & Haglund':                     'Calcaneal Apophysitis (Sever\'s Disease)',
+    'Calf Muscle Tear (Tennis Leg)':                'Lateral Ankle Sprain (Non-Op)',
+    'High Ankle Sprain (Syndesmosis)':              'Lateral Ankle Sprain (Non-Op)',
+    'Ankle ROM Limitation':                         'Lateral Ankle Sprain (Non-Op)',
+    'Toe Fracture':                                 'Lateral Ankle Sprain (Non-Op)',
+    'Pediatric Lateral Ankle Sprain':               'Pediatric Lateral Ankle Sprain',
+
+    // ── HIP & PELVIS ──
+    'Hip Labral Repair (Post-Op)':                  'Hip Labrum Repair for FAI',
+    'Hip Labrum Repair for FAI':                    'Hip Labrum Repair for FAI',
+    'Hip Arthroscopy (FAI)':                        'Hip Arthroscopy (FAI)',
+    'Hip Osteoarthritis':                           'Total Hip Arthroplasty (THA)',
+    'Total Hip Arthroplasty (THA)':                 'Total Hip Arthroplasty (THA)',
+    'Post Reconstruction DDH':                      'Total Hip Arthroplasty (THA)',
+    'Post ORIF Fracture Femur':                     'Total Hip Arthroplasty (THA)',
+    'Sacroiliac (SI) Joint Dysfunction':            'Spinal Instability',
+    'Gluteal Tendinopathy & Piriformis Syndrome':   'Athletic Pubalgia',
+    'Athletic Pubalgia':                            'Athletic Pubalgia',
+    'Snapping Hip Eksternal':                       'Hip Arthroscopy (FAI)',
+    'Hip ROM Limitation':                           'Hip Arthroscopy (FAI)',
+    'Hamstring Strain / Tear':                      'Hamstring Injury',
+    'Hamstring Injury':                             'Hamstring Injury',
+    'Proximal Hamstring Repair':                    'Proximal Hamstring Repair',
+    'Rectus Femoris / Quad Strain':                 'Hamstring Injury',
+
+    // ── KNEE ──
+    'ACLR (ACL Reconstruction) Post-Op':            'ACL Reconstruction',
+    'Ligamentous Injury (ACL/MCL/LCL/PCL)':         'Non-Operative Management of ACL Injuries',
+    'Meniscus Tears (Robekan Meniskus)':             'Arthroscopic Meniscal Repair',
+    'Arthrofibrosis Lutut':                          'High Tibial Osteotomy',
+    'OA Lutut (Osteoarthritis)':                    'Total Knee Arthroplasty (TKA)',
+    'Post-Op Total Knee Replacement (TKR/TKA)':     'Total Knee Arthroplasty (TKA)',
+    'Post-Op TKR (Terlambat)':                      'Total Knee Arthroplasty (TKA)',
+    'Post ORIF Fracture Patella':                   'Patella/Quad Tendon Repairs',
+    'Post ORIF Fracture Tibia':                     'High Tibial Osteotomy',
+    'Post Fraktur Tibia-Fibula':                    'High Tibial Osteotomy',
+    'Patellar Tendinopathy (Jumper\'s Knee)':        'Patellofemoral Pain Syndrome',
+    'Patellar Tendon Rupture (Post-Op)':            'Patella/Quad Tendon Repairs',
+    'Chondromalacia Patella / PFPS':                'Patellofemoral Pain Syndrome',
+    'OA Lutut + ITBS/Pes Anserine':                 'Iliotibial Band Syndrome',
+    'Osgood-Schlatter (Pediatrik)':                 'Osgood-Schlatter Disease',
+
+    // ── SPINE & LUMBAR ──
+    'Mechanical Low Back Pain':                     'Low Back Pain with Mobility Deficits',
+    'Discogenic LBP (HNP Lumbal & Sciatica)':       'Lumbar Spinal Disc Displacement',
+    'Lumbar Instability / Spondylolisthesis':       'Spondylosis/Degenerative Changes of Lumbar Spine',
+    'Conservative Management of Spinal Stenosis':   'Conservative Management of Spinal Stenosis',
+    'Spinal Instability':                           'Spinal Instability',
+    'Spondylolisthesis in the Athlete':             'Spondylolysis/Spondylolisthesis in the Young Athlete',
+    'Mid Thoracal Pain (Hypomobility)':             'Low Back Pain with Mobility Deficits',
+    'Post-Op Spine Weakness':                       'Spinal Instability',
+
+    // ── SPORT ──
+    'Sport Specific Performance / RTS':             'Agility and Plyometric Program',
+    'Concussion Return-to-Sport':                   'Concussion Return-to-Sport',
+
+    // ── PEDIATRI ──
+    'Patellofemoral Pain Syndrome (Pediatric)':     'Patellofemoral Pain Syndrome (Pediatric)',
+    'Osgood-Schlatter Disease':                     'Osgood-Schlatter Disease',
+    'Arthroscopic Meniscal Repair (Pediatric)':     'Arthroscopic Meniscal Repair (Pediatric)',
+    'ACL Reconstruction (Pediatric)':               'ACL Reconstruction (Pediatric)',
+    'Fixation of Osteochondritis Dissecans (OCD)':  'Fixation of Osteochondritis Dissecans (OCD)',
+    'Medial Tibial Stress Fracture (Pediatric)':    'Medial Tibial Stress Fracture (Pediatric)',
+    'Calcaneal Apophysitis (Sever\'s Disease)':      'Calcaneal Apophysitis (Sever\'s Disease)',
+    'Postural Back Pain in the Young Athlete':      'Postural Back Pain in the Young Athlete',
+    'Spondylolysis/Spondylolisthesis in the Young Athlete': 'Spondylolysis/Spondylolisthesis in the Young Athlete',
+
+    // ── CORE / TRAINING ──
+    'Core Muscle Repair':                           'Core Muscle Repair',
+    'Agility and Plyometric Program':               'Agility and Plyometric Program',
+    'PCL Reconstruction':                           'PCL Reconstruction',
+    'MPFL Reconstruction':                          'MPFL Reconstruction',
+    'ACI Femoral Condyle (Post-Op)':               'ACI Femoral Condyle (Post-Op)',
+    'ACI Trochlea Patella (Post-Op)':              'ACI Trochlea Patella (Post-Op)',
+    'Osteochondral Autograft/Allograft Transfer System (OATS) Procedure': 'Osteochondral Autograft/Allograft Transfer System (OATS) Procedure',
+    'Peroneal Tendon Repair':                       'Peroneal Tendon Repair',
+    'Total Ankle Arthroplasty':                     'Total Ankle Arthroplasty',
+    'Brostrom Repair':                              'Brostrom Repair',
+    'UCL Reconstruction':                           'UCL Reconstruction',
+};
+
 function renderCPGPhasePicker(templateName) {
     if (!templateName || !window.CPG_DB) return '';
     
-    // Find the record by key or by keywords
     let matchedKey = null;
-    for (const key of Object.keys(CPG_DB)) {
-        if (templateName.toLowerCase().includes(key.toLowerCase()) || key.toLowerCase().includes(templateName.toLowerCase())) {
-            matchedKey = key;
-            break;
+
+    // 1. Cek alias mapping dulu (prioritas utama)
+    if (CPG_ALIAS_MAP[templateName]) {
+        const aliasTarget = CPG_ALIAS_MAP[templateName];
+        if (CPG_DB[aliasTarget]) matchedKey = aliasTarget;
+    }
+
+    // 2. Fallback: partial string match (case-insensitive)
+    if (!matchedKey) {
+        for (const key of Object.keys(CPG_DB)) {
+            if (templateName.toLowerCase().includes(key.toLowerCase()) || key.toLowerCase().includes(templateName.toLowerCase())) {
+                matchedKey = key;
+                break;
+            }
         }
     }
 
